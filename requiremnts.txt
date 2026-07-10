@@ -1,0 +1,6 @@
+pyserial
+opencv-python
+numpy
+Cython
+freenect
+ultralytics

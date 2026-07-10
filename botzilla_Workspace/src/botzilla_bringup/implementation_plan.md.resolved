@@ -1,0 +1,54 @@
+# BotZilla Simulation Launch Files
+
+Create ROS2 launch files to start the Gazebo simulation and all BotZilla nodes with a single command. The project already has a URDF ([description/botzilla_qbot.urdf](file:///home/kalana/Documents/final-project-botzilla/description/botzilla_qbot.urdf)) and a world file ([worlds/botzilla_arena.world](file:///home/kalana/Documents/final-project-botzilla/worlds/botzilla_arena.world)) — these just need to be wired into proper launch files.
+
+## Proposed Changes
+
+### New Package: `botzilla_bringup`
+
+A dedicated launch package is the ROS2 convention for housing launch files that span multiple packages.
+
+#### [NEW] `botzilla_Workspace/src/botzilla_bringup/`
+
+| File | Purpose |
+|---|---|
+| [package.xml](file:///home/kalana/Documents/final-project-botzilla/botzilla_Workspace/src/botzilla_control/package.xml) | Declares deps on `botzilla_control`, `botzilla_perception`, `ros_gz_sim`, `robot_state_publisher` |
+| [setup.py](file:///home/kalana/Documents/final-project-botzilla/botzilla_Workspace/src/botzilla_control/setup.py) | Installs launch files and URDF/world into `share/` |
+| `launch/simulation.launch.py` | Starts Gazebo with the arena world + spawns robot URDF + YOLO node |
+| `launch/hardware.launch.py` | Starts `kinect_bridge` + `kobuki_base_node` for real robot |
+| `launch/botzilla_autonomy.launch.py` | Combined launch: includes both simulation + hardware (or used standalone for all nodes) |
+
+---
+
+### Key design decisions
+
+- **Simulation launch** uses `ros_gz_sim` (`gz_sim`) to start Gazebo Harmonic (which the URDF's `gz-sim-diff-drive-system` plugin targets) and the `ros_gz_bridge` to bridge `/camera/image_raw` from Gazebo to ROS2 topics that the YOLO node already subscribes to (`/camera/rgb/image_raw`).
+- **Hardware launch** skips Gazebo entirely and just runs the real hardware nodes.
+- The URDF and world files are installed into `share/botzilla_bringup/` so they are findable by `get_package_share_directory()`.
+
+---
+
+## Verification Plan
+
+### After creating files — Build test
+```bash
+cd /home/kalana/Documents/final-project-botzilla/botzilla_Workspace
+colcon build --packages-select botzilla_bringup
+source install/setup.bash
+```
+✅ Build must succeed with no errors.
+
+### Launch file dry-run
+```bash
+ros2 launch botzilla_bringup simulation.launch.py --show-args
+```
+✅ Should print available launch arguments without crashing.
+
+### Manual Verification (requires Gazebo installed)
+```bash
+ros2 launch botzilla_bringup simulation.launch.py
+```
+Confirm in Gazebo that:
+1. The arena world loads (walls, green drop-off zone, red cube)
+2. The BotZilla robot model spawns at origin
+3. `ros2 topic list` shows `/camera/rgb/image_raw` and `/cmd_vel`

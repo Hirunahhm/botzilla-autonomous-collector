@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+
+# ROS 2 Workspace
+botzilla_Workspace/build/
+botzilla_Workspace/install/
+botzilla_Workspace/log/
+
+# IDE / Editor
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+/myenv/
+
+# datasets 
+datasets/Cube-Detection-Dataset*/
+datasets/runs/detect/
+datasets/vids/
+
+# LLM Instructions
+CLAUDE.md

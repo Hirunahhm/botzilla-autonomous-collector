@@ -1,0 +1,162 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="botzilla_world">
+    <!-- A global light source using Fuel URI -->
+    <include>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Sun</uri>
+    </include>
+    <!-- A ground plane using Fuel URI -->
+    <include>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Ground Plane</uri>
+    </include>
+
+    <!-- Placement Zone (0.5m x 0.5m) represented as a visual box -->
+    <model name="drop_off_zone">
+      <static>true</static>
+      <pose>2 2 0.01 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.5 0.5 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 1 0 1</ambient> <!-- Green for the drop zone -->
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- AprilTag marker panel on the wall behind the drop-off zone.
+         The actual OpenCV AprilTag image would need to be projected onto the wall
+         surface. For simulation testing, the apriltag_detector will be bypassed
+         and the DELIVERING state uses open-loop timed navigation. -->
+    <model name="drop_off_wall_panel">
+      <static>true</static>
+      <pose>2.0 2.48 0.25 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.3 0.01 0.3</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient> <!-- White panel = tag location marker -->
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Starting Position Marker (0.5m x 0.5m) -->
+    <model name="starting_area">
+      <static>true</static>
+      <pose>0 0 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.5 0.5 0.001</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient> <!-- Dark gray -->
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Target Cube 1 (Enlarged to 10cm) -->
+    <model name="cube_1">
+      <pose>1.5 1.5 0.05 0 0 0</pose> <!-- Changed from 1 0 0.05 -->
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 1</ambient> <!-- Red cube -->
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- =============== Arena Walls (5m x 5m) =============== -->
+    
+    <!-- North Wall -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>2.5 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- South Wall -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>-2.5 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- East Wall -->
+    <model name="wall_east">
+      <static>true</static>
+      <pose>0 2.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- West Wall -->
+    <model name="wall_west">
+      <static>true</static>
+      <pose>0 -2.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Physics settings for better simulation -->
+    <physics type="ode">
+      <real_time_update_rate>1000.0</real_time_update_rate>
+      <max_step_size>0.001</max_step_size>
+    </physics>
+  </world>
+</sdf>
