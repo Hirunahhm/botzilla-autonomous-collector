@@ -29,7 +29,7 @@ Optimized the real-world bring-up sequence for the Jetson Orin Nano Super:
 
 ## 2. Key Architecture Decisions
 
-We evaluated two sensor fusion architectures for the system's 2D LiDAR + Kinect RGB-D camera:
+I evaluated two sensor fusion architectures for the system's 2D LiDAR + Kinect RGB-D camera:
 
 | Architecture | Setup | Advantages | Role |
 |---|---|---|---|
