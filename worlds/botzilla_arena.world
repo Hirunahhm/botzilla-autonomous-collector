@@ -10,6 +10,25 @@
       <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Ground Plane</uri>
     </include>
 
+    <!-- Warm wood-tone floor finish overlay (visual only; Ground Plane above keeps the physics collision) -->
+    <model name="floor_finish">
+      <static>true</static>
+      <pose>0 0 0.0008 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>7.0 7.0 0.001</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.55 0.42 0.29 1</ambient>
+            <diffuse>0.55 0.42 0.29 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
     <!-- ========================================================= -->
     <!-- Home / Drop-Off Zone at Origin (0.0, 0.0)                 -->
     <!-- ========================================================= -->
@@ -274,7 +293,7 @@
             </box>
           </geometry>
           <material>
-            <ambient>0.6 0.6 0.65 1</ambient>
+            <ambient>0.78 0.80 0.83 1</ambient>
           </material>
         </visual>
       </link>
@@ -299,7 +318,63 @@
             </box>
           </geometry>
           <material>
-            <ambient>0.6 0.6 0.65 1</ambient>
+            <ambient>0.78 0.80 0.83 1</ambient>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ========================================================= -->
+    <!-- Room Furniture (visual/collision clutter for realism)     -->
+    <!-- ========================================================= -->
+
+    <!-- Table (north corridor, between the west and east rooms) -->
+    <model name="table_1">
+      <static>true</static>
+      <pose>-1.0 2.7 0.2 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.8 0.5 0.4</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.8 0.5 0.4</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.45 0.3 0.15 1</ambient>
+            <diffuse>0.45 0.3 0.15 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Bookshelf against the east wall (east room) -->
+    <model name="shelf_1">
+      <static>true</static>
+      <pose>3.2 2.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.3 1.0 1.2</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.3 1.0 1.2</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.35 0.22 0.12 1</ambient>
+            <diffuse>0.35 0.22 0.12 1</diffuse>
           </material>
         </visual>
       </link>
@@ -319,7 +394,7 @@
         </collision>
         <visual name="visual">
           <geometry><box><size>7.0 0.1 0.6</size></box></geometry>
-          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+          <material><ambient>0.87 0.84 0.76 1</ambient></material>
         </visual>
       </link>
     </model>
@@ -334,7 +409,7 @@
         </collision>
         <visual name="visual">
           <geometry><box><size>7.0 0.1 0.6</size></box></geometry>
-          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+          <material><ambient>0.87 0.84 0.76 1</ambient></material>
         </visual>
       </link>
     </model>
@@ -349,7 +424,7 @@
         </collision>
         <visual name="visual">
           <geometry><box><size>0.1 7.0 0.6</size></box></geometry>
-          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+          <material><ambient>0.87 0.84 0.76 1</ambient></material>
         </visual>
       </link>
     </model>
@@ -364,7 +439,7 @@
         </collision>
         <visual name="visual">
           <geometry><box><size>0.1 7.0 0.6</size></box></geometry>
-          <material><ambient>0.7 0.7 0.7 1</ambient></material>
+          <material><ambient>0.87 0.84 0.76 1</ambient></material>
         </visual>
       </link>
     </model>
