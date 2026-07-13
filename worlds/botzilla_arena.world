@@ -1,76 +1,73 @@
 <?xml version="1.0" ?>
 <sdf version="1.6">
   <world name="botzilla_world">
-    <!-- A global light source using Fuel URI -->
+    <!-- Global light source using Fuel URI -->
     <include>
       <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Sun</uri>
     </include>
-    <!-- A ground plane using Fuel URI -->
+    <!-- Ground plane using Fuel URI -->
     <include>
       <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Ground Plane</uri>
     </include>
 
-    <!-- Placement Zone (0.5m x 0.5m) represented as a visual box -->
+    <!-- ========================================================= -->
+    <!-- Home / Drop-Off Zone at Origin (0.0, 0.0)                 -->
+    <!-- ========================================================= -->
     <model name="drop_off_zone">
       <static>true</static>
-      <pose>2 2 0.01 0 0 0</pose>
+      <pose>0.0 0.0 0.0025 0 0 0</pose>
       <link name="link">
         <visual name="visual">
           <geometry>
             <box>
-              <size>0.5 0.5 0.01</size>
+              <size>0.6 0.6 0.005</size>
             </box>
           </geometry>
           <material>
-            <ambient>0 1 0 1</ambient> <!-- Green for the drop zone -->
+            <ambient>0 0.8 0 1</ambient> <!-- Green home zone -->
           </material>
         </visual>
       </link>
     </model>
 
-    <!-- AprilTag marker panel on the wall behind the drop-off zone.
-         The actual OpenCV AprilTag image would need to be projected onto the wall
-         surface. For simulation testing, the apriltag_detector will be bypassed
-         and the DELIVERING state uses open-loop timed navigation. -->
+    <!-- AprilTag / Marker Panel behind home zone -->
     <model name="drop_off_wall_panel">
       <static>true</static>
-      <pose>2.0 2.48 0.25 0 0 0</pose>
+      <pose>0.0 -0.8 0.25 0 0 0</pose>
       <link name="link">
         <visual name="visual">
           <geometry>
             <box>
-              <size>0.3 0.01 0.3</size>
+              <size>0.3 0.02 0.3</size>
             </box>
           </geometry>
           <material>
-            <ambient>1 1 1 1</ambient> <!-- White panel = tag location marker -->
+            <ambient>1 1 1 1</ambient> <!-- White panel reference -->
           </material>
         </visual>
       </link>
     </model>
 
-    <!-- Starting Position Marker (0.5m x 0.5m) -->
-    <model name="starting_area">
-      <static>true</static>
-      <pose>0 0 0.005 0 0 0</pose>
-      <link name="link">
-        <visual name="visual">
-          <geometry>
-            <box>
-              <size>0.5 0.5 0.001</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>0.2 0.2 0.2 1</ambient> <!-- Dark gray -->
-          </material>
-        </visual>
-      </link>
-    </model>
+    <!-- ========================================================= -->
+    <!-- N Collectible Target Cubes (N = 4)                        -->
+    <!-- Scattered across different rooms to test frontier search  -->
+    <!-- ========================================================= -->
 
-    <!-- Target Cube 1 (Enlarged to 10cm) -->
+    <!-- Cube 1: East Room (Upper) -->
     <model name="cube_1">
-      <pose>1.5 1.5 0.05 0 0 0</pose> <!-- Changed from 1 0 0.05 -->
+      <pose>2.2 2.2 0.05 0 0 0</pose>
       <link name="link">
+        <inertial>
+          <mass>0.05</mass>
+          <inertia>
+            <ixx>0.00008</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>0.00008</iyy>
+            <iyz>0</iyz>
+            <izz>0.00008</izz>
+          </inertia>
+        </inertial>
         <collision name="collision">
           <geometry>
             <box>
@@ -86,23 +83,242 @@
           </geometry>
           <material>
             <ambient>1 0 0 1</ambient> <!-- Red cube -->
+            <diffuse>1 0 0 1</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
-    <!-- =============== Arena Walls (5m x 5m) =============== -->
-    
+    <!-- Cube 2: East Room (Lower behind central partition) -->
+    <model name="cube_2">
+      <pose>2.5 -2.0 0.05 0 0 0.4</pose>
+      <link name="link">
+        <inertial>
+          <mass>0.05</mass>
+          <inertia>
+            <ixx>0.00008</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>0.00008</iyy>
+            <iyz>0</iyz>
+            <izz>0.00008</izz>
+          </inertia>
+        </inertial>
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Cube 3: Northwest Room -->
+    <model name="cube_3">
+      <pose>-2.3 2.2 0.05 0 0 -0.3</pose>
+      <link name="link">
+        <inertial>
+          <mass>0.05</mass>
+          <inertia>
+            <ixx>0.00008</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>0.00008</iyy>
+            <iyz>0</iyz>
+            <izz>0.00008</izz>
+          </inertia>
+        </inertial>
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Cube 4: Southwest Room -->
+    <model name="cube_4">
+      <pose>-2.3 -2.0 0.05 0 0 0.8</pose>
+      <link name="link">
+        <inertial>
+          <mass>0.05</mass>
+          <inertia>
+            <ixx>0.00008</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>0.00008</iyy>
+            <iyz>0</iyz>
+            <izz>0.00008</izz>
+          </inertia>
+        </inertial>
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 0.1 0.1</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ========================================================= -->
+    <!-- Multi-Height Obstacles (Testing Sensor Fusion)            -->
+    <!-- ========================================================= -->
+
+    <!-- Normal 2D LiDAR Pillar (Detected by LiDAR /scan at z=12cm) -->
+    <model name="pillar_1">
+      <static>true</static>
+      <pose>-1.8 -1.5 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.6</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.35 0.35 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.4 0.4 0.4 1</ambient>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Low Floor Barrier (Below LiDAR plane z=12cm; caught by Kinect 3D VoxelLayer) -->
+    <model name="low_barrier_1">
+      <static>true</static>
+      <pose>2.2 0.0 0.03 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.4 0.2 0.06</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.4 0.2 0.06</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.5 0.1 1</ambient> <!-- Orange low obstacle -->
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ========================================================= -->
+    <!-- Interior Partitions (Creating Occluded Rooms & Doorways)  -->
+    <!-- ========================================================= -->
+
+    <!-- Central Partition Wall (x = 1.2, from y = -3.5 to y = 1.0) -->
+    <model name="partition_central">
+      <static>true</static>
+      <pose>1.2 -1.25 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.1 4.5 0.6</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.1 4.5 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.65 1</ambient>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- West Partition Wall (y = 0.5, from x = -3.5 to x = -1.3) -->
+    <model name="partition_room_west">
+      <static>true</static>
+      <pose>-2.4 0.5 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>2.2 0.1 0.6</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>2.2 0.1 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.65 1</ambient>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ========================================================= -->
+    <!-- Outer Arena Perimeter Walls (7.0m x 7.0m)                 -->
+    <!-- ========================================================= -->
+
     <!-- North Wall -->
     <model name="wall_north">
       <static>true</static>
-      <pose>2.5 0 0.25 0 0 0</pose>
+      <pose>0 3.5 0.3 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+          <geometry><box><size>7.0 0.1 0.6</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+          <geometry><box><size>7.0 0.1 0.6</size></box></geometry>
           <material><ambient>0.7 0.7 0.7 1</ambient></material>
         </visual>
       </link>
@@ -111,13 +327,13 @@
     <!-- South Wall -->
     <model name="wall_south">
       <static>true</static>
-      <pose>-2.5 0 0.25 0 0 0</pose>
+      <pose>0 -3.5 0.3 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+          <geometry><box><size>7.0 0.1 0.6</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.1 5.0 0.5</size></box></geometry>
+          <geometry><box><size>7.0 0.1 0.6</size></box></geometry>
           <material><ambient>0.7 0.7 0.7 1</ambient></material>
         </visual>
       </link>
@@ -126,13 +342,13 @@
     <!-- East Wall -->
     <model name="wall_east">
       <static>true</static>
-      <pose>0 2.5 0.25 0 0 0</pose>
+      <pose>3.5 0 0.3 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+          <geometry><box><size>0.1 7.0 0.6</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+          <geometry><box><size>0.1 7.0 0.6</size></box></geometry>
           <material><ambient>0.7 0.7 0.7 1</ambient></material>
         </visual>
       </link>
@@ -141,19 +357,19 @@
     <!-- West Wall -->
     <model name="wall_west">
       <static>true</static>
-      <pose>0 -2.5 0.25 0 0 0</pose>
+      <pose>-3.5 0 0.3 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+          <geometry><box><size>0.1 7.0 0.6</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>5.0 0.1 0.5</size></box></geometry>
+          <geometry><box><size>0.1 7.0 0.6</size></box></geometry>
           <material><ambient>0.7 0.7 0.7 1</ambient></material>
         </visual>
       </link>
     </model>
 
-    <!-- Physics settings for better simulation -->
+    <!-- Physics settings for high-precision differential drive & capture -->
     <physics type="ode">
       <real_time_update_rate>1000.0</real_time_update_rate>
       <max_step_size>0.001</max_step_size>

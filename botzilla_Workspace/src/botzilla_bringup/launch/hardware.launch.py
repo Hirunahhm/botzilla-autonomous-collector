@@ -1,29 +1,29 @@
 """
 hardware.launch.py
 
-Launches all nodes needed for running on the real BotZilla robot:
-  1. kinect_bridge  — reads Kinect camera and publishes to ROS2 topics
-  2. kobuki_base_node — listens to /cmd_vel and drives the Kobuki wheels
+Launches all nodes needed for running on the physical BotZilla robot:
+  1. robot_state_publisher — publishes /tf tree from botzilla_qbot.urdf
+  2. kinect_bridge         — reads physical Kinect camera & publishes RGB + Depth
+  3. kobuki_base_node      — listens to /cmd_vel, drives wheels, publishes /odom
 
 Usage:
-  ros2 launch botzilla_bringup hardware.launch.py
-
-Prerequisites:
-  - Kobuki QBot connected via USB (check: ls /dev/ttyUSB*)
-  - Xbox Kinect connected via USB
-  - sudo usermod -a -G dialout $USER  (if permission errors)
+  ros2 launch botzilla_bringup hardware.launch.py serial_port:=/dev/ttyUSB0
 """
 
 import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-_NORESET = os.path.join(os.path.expanduser('~'), 'Desktop/Bozilla-ws/final-project-botzilla/noreset.so')
-
 
 def generate_launch_description():
+    pkg_share = get_package_share_directory('botzilla_bringup')
+    urdf_file = os.path.join(pkg_share, 'description', 'botzilla_qbot.urdf')
+
+    with open(urdf_file, 'r') as f:
+        robot_description = f.read()
 
     # ------------------------------------------------------------------ #
     # Launch arguments
@@ -35,7 +35,21 @@ def generate_launch_description():
     )
 
     # ------------------------------------------------------------------ #
-    # 1. Kinect Bridge — publishes:
+    # 1. Robot State Publisher (publishes /tf tree for hardware sensors)
+    # ------------------------------------------------------------------ #
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description': robot_description,
+            'use_sim_time': False,
+        }],
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2. Kinect Bridge — publishes:
     #      /camera/rgb/image_raw   (sensor_msgs/Image)
     #      /camera/depth/image_raw (sensor_msgs/Image)
     # ------------------------------------------------------------------ #
@@ -45,22 +59,25 @@ def generate_launch_description():
         name='kinect_bridge',
         output='screen',
         parameters=[{'use_sim_time': False}],
-        additional_env={'LD_PRELOAD': _NORESET},
     )
 
     # ------------------------------------------------------------------ #
-    # 2. Kobuki Base Node — subscribes to /cmd_vel and drives motors
+    # 3. Kobuki Base Node — subscribes to /cmd_vel and drives motors
     # ------------------------------------------------------------------ #
     kobuki_base_node = Node(
         package='botzilla_control',
         executable='kobuki_base_node',
         name='kobuki_base_node',
         output='screen',
-        parameters=[{'use_sim_time': False}],
+        parameters=[{
+            'use_sim_time': False,
+            'serial_port': LaunchConfiguration('serial_port')
+        }],
     )
 
     return LaunchDescription([
         serial_port_arg,
+        robot_state_publisher,
         kinect_bridge,
         kobuki_base_node,
     ])

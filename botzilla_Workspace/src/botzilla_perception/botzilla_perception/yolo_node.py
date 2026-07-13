@@ -9,10 +9,23 @@ import numpy as np
 import os
 from ultralytics import YOLO
 
-# Use a path relative to the user home or a specific workspace location
+# Dynamically locate best.pt model path
+from ament_index_python.packages import get_package_share_directory
 import os
-home = os.path.expanduser('~')
-file_path = os.path.join(home, "Desktop/Bozilla-ws/final-project-botzilla/runs/best-fit/best.pt")
+
+def resolve_model_path():
+    # 1. Check current workspace runs/best-fit/best.pt
+    candidates = [
+        os.path.join(os.getcwd(), "runs/best-fit/best.pt"),
+        os.path.join(os.path.expanduser('~'), "Desktop/Projects/sem5/final-project-botzilla/runs/best-fit/best.pt"),
+        os.path.join(os.path.expanduser('~'), "Desktop/Bozilla-ws/final-project-botzilla/runs/best-fit/best.pt"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[1]
+
+file_path = resolve_model_path()
 
 # Kinect minimum sensing range (objects closer become 0 or invalid)
 KINECT_MIN_RANGE_M = 0.55
