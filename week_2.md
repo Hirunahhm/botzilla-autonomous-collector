@@ -1,7 +1,7 @@
 # Week 2 Progress Report: Simulation & Architecture Decisions
 
 This document summarizes the development progress, system configurations, and architectural decisions completed during Week 2 of the Semester 5 Autonomous Multi-Cube Search & Collection Robot project.
-
+ 
 ---
 
 ## 1. Accomplishments & System Upgrades
