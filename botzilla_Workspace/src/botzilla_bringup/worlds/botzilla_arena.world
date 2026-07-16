@@ -1,6 +1,20 @@
 <?xml version="1.0" ?>
 <sdf version="1.6">
   <world name="botzilla_world">
+    <!-- Explicit system plugins: the SDF default (no <plugin> list) only loads
+         Physics/UserCommands/SceneBroadcaster (see ~/.gz/sim/8/server.config) and
+         omits Sensors entirely, so camera/gpu_lidar sensors never render or publish
+         data even though their topics get advertised. Declare all four explicitly. -->
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
     <!-- Global light source using Fuel URI -->
     <include>
       <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Sun</uri>

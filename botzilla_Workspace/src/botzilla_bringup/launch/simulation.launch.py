@@ -142,7 +142,36 @@ def generate_launch_description():
     )
 
     # ------------------------------------------------------------------ #
-    # 5. YOLO Perception Node
+    # 5. Sensor frame bridges — gz sensors publish message headers using
+    #    Gazebo's auto-generated scoped entity name (e.g.
+    #    "botzilla_qbot/base_footprint/gpu_lidar"), which is disconnected
+    #    from the URDF-driven /tf tree robot_state_publisher builds
+    #    (base_link -> laser_frame / camera_link). Both sensors have zero
+    #    pose offset from their URDF parent link, so an identity static
+    #    transform is geometrically exact, not an approximation.
+    # ------------------------------------------------------------------ #
+    lidar_frame_bridge = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='lidar_frame_bridge',
+        arguments=[
+            '--frame-id', 'laser_frame',
+            '--child-frame-id', 'botzilla_qbot/base_footprint/gpu_lidar',
+        ],
+    )
+
+    camera_frame_bridge = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_frame_bridge',
+        arguments=[
+            '--frame-id', 'camera_link',
+            '--child-frame-id', 'botzilla_qbot/base_footprint/rgbd_camera',
+        ],
+    )
+
+    # ------------------------------------------------------------------ #
+    # 6. YOLO Perception Node
     # ------------------------------------------------------------------ #
     yolo_node = Node(
         package='botzilla_perception',
@@ -159,5 +188,7 @@ def generate_launch_description():
         robot_state_publisher,
         spawn_robot,
         gz_bridge,
+        lidar_frame_bridge,
+        camera_frame_bridge,
         yolo_node,
     ])
