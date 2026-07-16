@@ -18,11 +18,15 @@ Sensor facts confirmed from the URDF:
 
 ---
 
-## Milestone 0 — Sensor correctness (prerequisite)
+## Milestone 0 — Sensor correctness (prerequisite) — ✅ DONE
 
-1. Add a `camera_link_optical` frame in `botzilla_qbot.urdf`: a zero-offset child link of `camera_link` rotated `-pi/2 0 -pi/2` (standard ROS optical convention), and point the `rgbd_camera` sensor's frame at it (`optical_frame_id` / gz-sensor equivalent tag).
-2. Rebuild, relaunch the sim, and verify with `gz topic echo -t /camera/points -n 1` and `ros2 topic echo /camera/depth/image_raw --no-arr` that `frame_id` and `encoding` (`32FC1` expected) are correct.
-3. **Validation**: URDF edit + topic inspection only — pass/fail is "frame_id correct, encoding correct."
+1. ~~Add a `camera_link_optical` frame~~ Added `camera_link_optical` as a zero-offset child link of `camera_link` (`camera_optical_joint`, `rpy="-1.570796 0 -1.570796"`), and set `<optical_frame_id>camera_link_optical</optical_frame_id>` inside the `rgbd_camera` sensor's `<camera>` block in `botzilla_qbot.urdf`. Confirmed via `sdformat14`'s `camera.sdf` spec that this element controls the `frame_id` used in the camera/depth/camera_info message headers.
+2. Rebuilt `botzilla_bringup`, relaunched headless, and verified:
+   - `/camera/camera_info`, `/camera/rgb/image_raw`, `/camera/depth/image_raw` all report `frame_id: camera_link_optical`.
+   - Depth encoding is `32FC1` as expected.
+   - `/tf_static` shows the full chain `base_footprint → base_link → camera_link → camera_link_optical` (plus the pre-existing `laser_frame`/`camera_link` → Gazebo-scoped-name bridges).
+   - `tf2_echo base_link camera_link_optical` resolves to translation `(0.150, 0.000, 0.070)` and RPY `(-90°, 0°, -90°)` — exactly matching the URDF joint definition.
+3. **Validation result**: pass. `yolo_node` still crashes on launch (`ModuleNotFoundError: ultralytics`) — pre-existing, unrelated to this change, not yet fixed.
 
 ## Milestone 1 — New `botzilla_navigation` package + RTAB-Map bring-up
 
