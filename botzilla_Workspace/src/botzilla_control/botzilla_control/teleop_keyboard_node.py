@@ -65,7 +65,7 @@ def main(args=None):
 
     try:
         while rclpy.ok():
-            key = get_key(settings)
+            key = get_key(settings, timeout=0.3)
             if key in ('q', '\x03'):
                 break
             elif key == '+':
@@ -79,6 +79,9 @@ def main(args=None):
             elif key in MOVE_BINDINGS:
                 linear_dir, angular_dir = MOVE_BINDINGS[key]
                 node.publish(linear_dir, angular_dir)
+            elif key == '':
+                # Stop the robot when the key is released (no key event received within timeout)
+                node.stop()
     finally:
         node.stop()
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
