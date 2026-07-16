@@ -381,6 +381,209 @@
     </model>
 
     <!-- ========================================================= -->
+    <!-- Static Human Figures (simplified torso+head mannequins)   -->
+    <!-- Sensor-fusion test targets, one per room                  -->
+    <!-- ========================================================= -->
+
+    <!-- Human 1: East room -->
+    <model name="human_1">
+      <static>true</static>
+      <pose>2.0 -0.8 0 0 0 0</pose>
+      <link name="link">
+        <collision name="torso_collision">
+          <pose>0 0 0.6 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.2</length></cylinder></geometry>
+        </collision>
+        <visual name="torso_visual">
+          <pose>0 0 0.6 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>0.2 0.3 0.55 1</ambient><diffuse>0.2 0.3 0.55 1</diffuse></material>
+        </visual>
+        <collision name="head_collision">
+          <pose>0 0 1.32 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+        </collision>
+        <visual name="head_visual">
+          <pose>0 0 1.32 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+          <material><ambient>0.85 0.68 0.55 1</ambient><diffuse>0.85 0.68 0.55 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Human 2: South-center area -->
+    <model name="human_2">
+      <static>true</static>
+      <pose>-1.0 -2.8 0 0 0 0</pose>
+      <link name="link">
+        <collision name="torso_collision">
+          <pose>0 0 0.6 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.2</length></cylinder></geometry>
+        </collision>
+        <visual name="torso_visual">
+          <pose>0 0 0.6 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>0.55 0.15 0.15 1</ambient><diffuse>0.55 0.15 0.15 1</diffuse></material>
+        </visual>
+        <collision name="head_collision">
+          <pose>0 0 1.32 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+        </collision>
+        <visual name="head_visual">
+          <pose>0 0 1.32 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+          <material><ambient>0.85 0.68 0.55 1</ambient><diffuse>0.85 0.68 0.55 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Human 3: Northwest room -->
+    <model name="human_3">
+      <static>true</static>
+      <pose>-2.8 1.5 0 0 0 0</pose>
+      <link name="link">
+        <collision name="torso_collision">
+          <pose>0 0 0.6 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.2</length></cylinder></geometry>
+        </collision>
+        <visual name="torso_visual">
+          <pose>0 0 0.6 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>0.2 0.5 0.25 1</ambient><diffuse>0.2 0.5 0.25 1</diffuse></material>
+        </visual>
+        <collision name="head_collision">
+          <pose>0 0 1.32 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+        </collision>
+        <visual name="head_visual">
+          <pose>0 0 1.32 0 0 0</pose>
+          <geometry><sphere><radius>0.12</radius></sphere></geometry>
+          <material><ambient>0.85 0.68 0.55 1</ambient><diffuse>0.85 0.68 0.55 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ========================================================= -->
+    <!-- Additional Indoor Clutter (chairs, sofa, plant, bin, crates) -->
+    <!-- ========================================================= -->
+
+    <!-- Chair near shelf (east room) -->
+    <model name="chair_1">
+      <static>true</static>
+      <pose>2.8 2.8 0.225 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.4 0.4 0.45</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 0.45</size></box></geometry>
+          <material><ambient>0.3 0.35 0.45 1</ambient><diffuse>0.3 0.35 0.45 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Chair near table (center corridor) -->
+    <model name="chair_2">
+      <static>true</static>
+      <pose>-0.3 2.5 0.225 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.4 0.4 0.45</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 0.45</size></box></geometry>
+          <material><ambient>0.3 0.35 0.45 1</ambient><diffuse>0.3 0.35 0.45 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Sofa (southwest room) -->
+    <model name="sofa_1">
+      <static>true</static>
+      <pose>-2.7 -2.6 0.2 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>1.0 0.45 0.4</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.0 0.45 0.4</size></box></geometry>
+          <material><ambient>0.15 0.35 0.2 1</ambient><diffuse>0.15 0.35 0.2 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Potted plant (southwest room) -->
+    <model name="plant_1">
+      <static>true</static>
+      <pose>-3.0 -0.8 0 0 0 0</pose>
+      <link name="link">
+        <collision name="pot_collision">
+          <pose>0 0 0.125 0 0 0</pose>
+          <geometry><cylinder><radius>0.12</radius><length>0.25</length></cylinder></geometry>
+        </collision>
+        <visual name="pot_visual">
+          <pose>0 0 0.125 0 0 0</pose>
+          <geometry><cylinder><radius>0.12</radius><length>0.25</length></cylinder></geometry>
+          <material><ambient>0.6 0.3 0.15 1</ambient><diffuse>0.6 0.3 0.15 1</diffuse></material>
+        </visual>
+        <collision name="foliage_collision">
+          <pose>0 0 0.45 0 0 0</pose>
+          <geometry><sphere><radius>0.22</radius></sphere></geometry>
+        </collision>
+        <visual name="foliage_visual">
+          <pose>0 0 0.45 0 0 0</pose>
+          <geometry><sphere><radius>0.22</radius></sphere></geometry>
+          <material><ambient>0.15 0.45 0.15 1</ambient><diffuse>0.15 0.45 0.15 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Trash bin (center corridor) -->
+    <model name="trash_bin_1">
+      <static>true</static>
+      <pose>0.7 -1.5 0.2 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.15</radius><length>0.4</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.15</radius><length>0.4</length></cylinder></geometry>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Debris crate (east room) -->
+    <model name="crate_1">
+      <static>true</static>
+      <pose>2.8 -3.0 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.3 0.3 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 0.3 0.3</size></box></geometry>
+          <material><ambient>0.55 0.4 0.2 1</ambient><diffuse>0.55 0.4 0.2 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Debris crate (northwest room) -->
+    <model name="crate_2">
+      <static>true</static>
+      <pose>-1.6 3.0 0.15 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.3 0.3 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 0.3 0.3</size></box></geometry>
+          <material><ambient>0.55 0.4 0.2 1</ambient><diffuse>0.55 0.4 0.2 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ========================================================= -->
     <!-- Outer Arena Perimeter Walls (7.0m x 7.0m)                 -->
     <!-- ========================================================= -->
 
