@@ -55,7 +55,6 @@ def generate_launch_description():
         'Reg/Force3DoF': 'true',   # ground robot, no need for full 6DoF
         'Grid/RangeMax': '10.0',
         'Grid/Sensor': '2',        # 0=laser only, 1=depth only, 2=both laser and depth combined for 3D point cloud
-        'Grid/FromDepth': 'true',  # generate 3D occupancy voxels from RGB-D depth sensor
         'RGBD/NeighborLinkRefining': 'true',
     }
 

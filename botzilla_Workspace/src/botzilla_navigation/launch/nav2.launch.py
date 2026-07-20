@@ -1,0 +1,130 @@
+"""
+nav2.launch.py
+
+Milestone 3 (PHASE_1_IMPLEMENTATION_PLAN.md, Option A): Nav2 goal-following on
+top of the map RTAB-Map builds (rtabmap.launch.py must already be running and
+publishing /map + map->odom TF — this file does not launch SLAM/localization).
+
+A slim, hand-picked subset of nav2_bringup's navigation_launch.py — only the
+nodes actually needed for a single NavigateToPose goal: controller_server,
+planner_server, behavior_server, bt_navigator, velocity_smoother. Skips
+route_server/collision_monitor/docking_server/smoother_server/waypoint_follower,
+which navigation_launch.py always brings up regardless of whether they're
+configured or needed, adding failure surface (e.g. route_server expects a
+routing graph file we don't have) for no benefit at this milestone.
+
+cmd_vel chain: controller_server/behavior_server publish on 'cmd_vel_nav' ->
+velocity_smoother subscribes 'cmd_vel_nav', publishes smoothed output on plain
+'cmd_vel' (its default output topic 'cmd_vel_smoothed' is remapped here since
+we don't run collision_monitor, which normally does that final relay).
+
+Usage:
+  ros2 launch botzilla_navigation nav2.launch.py
+"""
+
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    pkg_share = get_package_share_directory('botzilla_navigation')
+    default_params_file = os.path.join(pkg_share, 'config', 'nav2_params.yaml')
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='true',
+        description='Use simulation (Gazebo) clock',
+    )
+    params_file_arg = DeclareLaunchArgument(
+        'params_file',
+        default_value=default_params_file,
+        description='Full path to the Nav2 parameters file',
+    )
+    autostart_arg = DeclareLaunchArgument(
+        'autostart',
+        default_value='true',
+        description='Automatically bring the lifecycle nodes up to the active state',
+    )
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    params_file = LaunchConfiguration('params_file')
+    autostart = LaunchConfiguration('autostart')
+
+    lifecycle_nodes = [
+        'controller_server',
+        'planner_server',
+        'behavior_server',
+        'bt_navigator',
+        'velocity_smoother',
+    ]
+
+    controller_server = Node(
+        package='nav2_controller',
+        executable='controller_server',
+        name='controller_server',
+        output='screen',
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
+    )
+
+    planner_server = Node(
+        package='nav2_planner',
+        executable='planner_server',
+        name='planner_server',
+        output='screen',
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
+    )
+
+    behavior_server = Node(
+        package='nav2_behaviors',
+        executable='behavior_server',
+        name='behavior_server',
+        output='screen',
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
+    )
+
+    bt_navigator = Node(
+        package='nav2_bt_navigator',
+        executable='bt_navigator',
+        name='bt_navigator',
+        output='screen',
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
+    )
+
+    velocity_smoother = Node(
+        package='nav2_velocity_smoother',
+        executable='velocity_smoother',
+        name='velocity_smoother',
+        output='screen',
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        remappings=[('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'cmd_vel')],
+    )
+
+    lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': autostart,
+            'node_names': lifecycle_nodes,
+        }],
+    )
+
+    return LaunchDescription([
+        use_sim_time_arg,
+        params_file_arg,
+        autostart_arg,
+        controller_server,
+        planner_server,
+        behavior_server,
+        bt_navigator,
+        velocity_smoother,
+        lifecycle_manager,
+    ])
