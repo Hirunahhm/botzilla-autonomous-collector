@@ -51,11 +51,14 @@ def generate_launch_description():
         'qos_image': 1,
         'qos_scan': 1,
         'qos_odom': 1,
-        'Reg/Strategy': '1',       # ICP + Visual (scan-assisted registration)
-        'Reg/Force3DoF': 'true',   # ground robot, no need for full 6DoF
+        'Reg/Strategy': '1',       # ICP + Visual (best obstacle avoidance + loop closure)
+        'Reg/Force3DoF': 'true',   # ground robot: x, y, yaw only
         'Grid/RangeMax': '10.0',
-        'Grid/Sensor': '2',        # 0=laser only, 1=depth only, 2=both laser and depth combined for 3D point cloud
+        'Grid/Sensor': '2',        # both laser + depth for 3D point cloud
         'RGBD/NeighborLinkRefining': 'true',
+        'RGBD/ProximityBySpace': 'true',
+        'RGBD/AngularUpdate': '0.3',
+        'RGBD/LinearUpdate': '0.2',
     }
 
     rtabmap_remappings = [
