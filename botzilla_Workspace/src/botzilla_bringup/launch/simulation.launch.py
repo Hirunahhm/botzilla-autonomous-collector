@@ -130,13 +130,23 @@ def generate_launch_description():
             '/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry',
             # 2D LiDAR Scan (Gazebo → ROS2)
             '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
-            # TF from diff drive plugin
-            '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            # TF from diff drive plugin — DiffDrive publishes odom->base_footprint
+            # on Gazebo's *scoped* per-model topic, not the plain /tf topic
+            # (which nothing publishes to). Bridging the wrong one leaves
+            # odom and base_link as disconnected TF trees.
+            '/model/botzilla_qbot/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            # Simulation clock — required by every node running with
+            # use_sim_time:=true (robot_state_publisher, rtabmap, tf2
+            # listeners); without this their ROS clock stays frozen at
+            # zero and all sim-time TF lookups silently fail.
+            '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
         ],
         remappings=[
             # Remap Gazebo camera topic → topic the YOLO node expects
             ('/camera/image', '/camera/rgb/image_raw'),
             ('/camera/depth_image', '/camera/depth/image_raw'),
+            # Remap the scoped diff-drive TF topic → standard /tf
+            ('/model/botzilla_qbot/tf', '/tf'),
         ],
         output='screen',
     )

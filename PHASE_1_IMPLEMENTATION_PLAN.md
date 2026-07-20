@@ -28,12 +28,19 @@ Sensor facts confirmed from the URDF:
    - `tf2_echo base_link camera_link_optical` resolves to translation `(0.150, 0.000, 0.070)` and RPY `(-90°, 0°, -90°)` — exactly matching the URDF joint definition.
 3. **Validation result**: pass. `yolo_node` still crashes on launch (`ModuleNotFoundError: ultralytics`) — pre-existing, unrelated to this change, not yet fixed.
 
-## Milestone 1 — New `botzilla_navigation` package + RTAB-Map bring-up
+## Milestone 1 — New `botzilla_navigation` package + RTAB-Map bring-up — ✅ DONE
 
-1. `ros2 pkg create botzilla_navigation --build-type ament_python` alongside the existing three packages (`botzilla_control`, `botzilla_perception`, `botzilla_bringup`), matching their conventions. This replaces `PHASE_1_PLAN.md`'s `botzilla_slam`/`botzilla_executor` split — one package for all nav-related launch/config/nodes matches how this repo is actually organized.
-2. Write `rtabmap.launch.py`: launch `rtabmap_slam`'s `rtabmap` node directly (skip `rtabmap_odom`'s visual odometry — the robot already has wheel `/odom` from the diff-drive plugin, cheaper on the Jetson) subscribing to `rgb/image:=/camera/rgb/image_raw`, `depth/image:=/camera/depth/image_raw`, `rgb/camera_info:=/camera/camera_info`, `odom_topic:=/odom`, `scan_topic:=/scan`, `frame_id:=base_link`, `approx_sync:=true`.
-3. Drive around manually with the existing `teleop_keyboard_node` while watching `/map` in Foxglove and rtabmap's terminal log for `"Loop closure detected"` messages.
-4. **Validation**: `/map` populates, `tf2_echo map base_link` resolves with no gaps, loop closures fire on revisiting an area. Run `tegrastats` alongside to log CPU/thermal — this is literally the fallback trigger condition from `PHASE_1_PLAN.md` §2, so capture a baseline number here.
+1. Created `botzilla_navigation` (ament_python), matching existing package conventions. Added `launch/rtabmap.launch.py`: launches `rtabmap_slam`'s `rtabmap` node directly against wheel `/odom` (no `rtabmap_odom` visual odometry — cheaper on the Jetson), subscribing to `/camera/rgb/image_raw`, `/camera/depth/image_raw`, `/camera/camera_info`, `/odom`, `/scan`, with `frame_id:=base_link`, `approx_sync:=true`, ICP-based `Reg/Strategy=1` registration against the laser scan.
+2. **Found and fixed two real infrastructure bugs in `botzilla_bringup/launch/simulation.launch.py`** while getting this to actually produce a map (not RTAB-Map config issues — the sim's ROS bridge itself was incomplete):
+   - **Missing `/clock` bridge**: nothing bridged Gazebo's sim clock to ROS, so every `use_sim_time:=true` node (`robot_state_publisher`, `rtabmap`, TF listeners) had a frozen clock, silently breaking all sim-time TF lookups. Fixed by adding `/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock` to the bridge.
+   - **Wrong TF source topic**: the bridge subscribed to Gazebo's plain `/tf` topic, but the `DiffDrive` plugin actually publishes `odom→base_footprint` on the *scoped* per-model topic `/model/botzilla_qbot/tf`. The plain topic was empty, so `odom` and `base_link` were permanently disconnected TF trees. Fixed by bridging the scoped topic and remapping it to `/tf`.
+3. **Also found (not a code bug, an environment gotcha)**: `pkill -f` unreliably fails to kill `ros2 launch`-spawned process trees in this environment, even with exact-match patterns and an apparently-clean `ps aux` check immediately after. This caused hours of misdiagnosis chasing phantom TF/sync bugs that were actually multiple leftover sim instances silently fighting over the same `/tf`/`/clock`/sensor topics. Saved as a durable memory (`feedback_process_cleanup`) — future cleanup must gather PIDs via `pgrep -fa` and kill+verify each one individually with `kill -0`.
+4. **Validation result — pass**, verified on a genuinely single clean instance:
+   - `botzilla_qbot` confirmed present via `gz model --list`.
+   - `odom → base_link` and full `map → base_link` TF chains resolve correctly (`tf2_echo` showed a real, non-identity pose matching an intentional in-place rotation).
+   - `/info` and `/map` both populate with real data after a small nudge (`ref_id: 20`, occupancy grid 151×161 cells @ 5cm resolution ≈ 7.5m×8m, matching the arena's ~7×7m floor).
+   - `tegrastats` baseline while RTAB-Map + Gazebo were both running: all 6 CPU cores 51–99% busy, CPU/GPU temp ~54.5°C (well below Jetson throttle range), ~6.2W total power draw, ~4GB/7.5GB RAM. No thermal concern for Option A on this hardware.
+   - Not yet done: extended manual driving with `teleop_keyboard_node` + Foxglove to confirm loop-closure detection over a longer traverse — left for an interactive session since it needs a human driving and watching in real time.
 
 ## Milestone 2 — Option B fallback validated in parallel
 
