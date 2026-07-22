@@ -55,6 +55,18 @@ def generate_launch_description():
         'Reg/Force3DoF': 'true',   # ground robot: x, y, yaw only
         'Grid/RangeMax': '10.0',
         'Grid/Sensor': '2',        # both laser + depth for 3D point cloud
+        # Ghost-map hardening (overlapping/smeared occupancy layers during arcs):
+        'Grid/RayTracing': 'true',           # clear free cells along each beam so stale marks
+                                             # from earlier poses don't persist as extra layers
+        'Grid/NormalsSegmentation': 'false', # flat sim floor -> use the deterministic height
+                                             # passthrough instead of normal-based ground
+                                             # segmentation (cheaper, and avoids frame-to-frame
+                                             # normal-estimation flicker that smears the grid
+                                             # during motion). Makes the two height filters
+                                             # below the authoritative ground/obstacle split.
+        'Grid/MaxGroundHeight': '0.05',      # points below 5cm = ground (not obstacle), so the
+                                             # depth grid stops double-painting laser cells
+        'Grid/MaxObstacleHeight': '0.6',     # cap at arena wall height; ignore ceiling/tall noise
         'RGBD/NeighborLinkRefining': 'true',
         'RGBD/ProximityBySpace': 'true',
         'RGBD/AngularUpdate': '0.3',
@@ -65,7 +77,7 @@ def generate_launch_description():
         ('rgb/image', '/camera/rgb/image_raw'),
         ('depth/image', '/camera/depth/image_raw'),
         ('rgb/camera_info', '/camera/camera_info'),
-        ('odom', '/odom'),
+        ('odom', '/odometry/filtered'),
         ('scan', '/scan'),
     ]
 

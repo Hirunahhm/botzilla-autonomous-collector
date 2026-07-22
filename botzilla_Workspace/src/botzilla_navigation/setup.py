@@ -28,6 +28,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'odom_covariance_relay = botzilla_navigation.odom_covariance_relay:main',
         ],
     },
 )

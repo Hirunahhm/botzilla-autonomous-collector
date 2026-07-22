@@ -3,9 +3,11 @@
 # Based on /opt/ros/jazzy/share/rtabmap_demos/params/turtlebot3_rgbd_nav2_params.yaml,
 # the ROS-shipped reference config for pairing Nav2 with rtabmap_ros (not the generic
 # nav2_bringup default, which assumes map_server/AMCL localization instead of rtabmap).
-# Key difference from the generic default: global_costmap has no obstacle_layer — rtabmap's
-# /map is already continuously updated from live sensor data, so a separate scan-based
-# obstacle layer on top of it would be redundant.
+# The global_costmap keeps rtabmap's /map as its static_layer AND adds a live /scan
+# obstacle_layer: relying on rtabmap's /map alone left the planner blind early in a mapping
+# session (the map is incomplete/inconsistent before loop closures land), producing
+# "Failed to create a plan from potential" aborts. The scan obstacle_layer gives NavFn
+# immediate obstacle data regardless of how far along rtabmap's map is.
 #
 # DWB is used instead of the nav2_bringup default (MPPI) to keep controller CPU cost down
 # on the Jetson, since rtabmap + Gazebo already keep all 6 cores busy (see Milestone 1's
@@ -76,13 +78,22 @@ controller_server:
       sim_time: 1.7
       linear_granularity: 0.05
       angular_granularity: 0.025
-      transform_tolerance: 0.2
+      # Raised 0.2 -> 0.5: rtabmap broadcasts map->odom at only ~1Hz (its processing rate,
+      # with ~0.3s internal delay), so a 0.2s tolerance is too tight and the controller
+      # aborted with "Transform data too old when converting from odom to map". 0.5s is the
+      # standard rtabmap+nav2 margin for a slow map->odom source.
+      transform_tolerance: 0.5
       xy_goal_tolerance: 0.15
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
+      # Raised 0.02 -> 0.10 so DWB meaningfully prefers routing *around* residual non-lethal
+      # cost rather than scoring near-obstacle trajectories almost the same as clear ones.
+      # Secondary to the inflation_radius fix; the inflation change is what actually breaks
+      # the rotate-in-place lock (BaseObstacle rejects inscribed-cost trajectories outright,
+      # independent of this scale).
+      BaseObstacle.scale: 0.10
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
@@ -124,7 +135,7 @@ behavior_server:
     local_frame: odom
     global_frame: map
     robot_base_frame: base_link
-    transform_tolerance: 0.1
+    transform_tolerance: 0.5   # match controller: slow ~1Hz rtabmap map->odom
     simulate_ahead_time: 2.0
     max_rotational_vel: 0.4
     min_rotational_vel: 0.2
@@ -153,6 +164,7 @@ local_costmap:
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
+      transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
       rolling_window: true
       width: 3
       height: 3
@@ -162,7 +174,14 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        # Reduced 0.55 -> 0.30: the footprint's circumscribed radius is ~0.275m, so 0.30
+        # keeps a safe margin without painting a wide inscribed-cost band around every
+        # obstacle. At 0.55 the robot sat inside inscribed cost near any wall/pillar, and
+        # DWB's BaseObstacle critic rejects *any* trajectory through inscribed cost as
+        # infeasible -> only in-place rotation survived -> robot span forever with
+        # linear.x=0 (confirmed live: 1856 cmd_vel samples, linear.x=0 in every one).
+        # Arena corridors are >1m wide, so 0.30 stays collision-safe.
+        inflation_radius: 0.30
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -196,17 +215,35 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
+      transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
       resolution: 0.05
       track_unknown_space: true
       footprint: "[[0.26, 0.09], [0.0, 0.17], [-0.17, 0.10], [-0.17, -0.10], [0.0, -0.17], [0.26, -0.09]]"
-      # No obstacle_layer here on purpose — rtabmap's /map is already continuously
-      # updated from live sensor data, unlike a frozen map_server map.
-      plugins: ["static_layer", "inflation_layer"]
+      # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
+      # isn't blind while rtabmap's map is still forming — see header comment).
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        # Reduced 0.55 -> 0.30 to match local_costmap (see the local inflation_layer note):
+        # keeps planner and controller costmaps consistent so DWB doesn't reject the
+        # global planner's route as infeasible.
+        inflation_radius: 0.30
       always_send_full_costmap: True

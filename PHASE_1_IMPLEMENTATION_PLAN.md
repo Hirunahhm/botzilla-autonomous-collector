@@ -60,6 +60,96 @@ Sensor facts confirmed from the URDF:
    - `/local_costmap/costmap` (frame `odom`, rolling window) and `/global_costmap/costmap` (frame `map`) both confirmed publishing real data.
    - **Known rough edge**: even the successful run hit 3 `Failed to make progress` recovery cycles along the way before completing. Works, but DWB/costmap tuning (footprint conservativeness, `inflation_radius: 0.55` relative to this room's scale) has room for improvement — flagged for a future tuning pass, not a blocker for Milestone 4/5.
 
+## Post-Milestone-3 fix — IMU/EKF-induced map ghosting and sideways drift — ✅ FIXED
+
+User-added IMU + `robot_localization` EKF (`botzilla_navigation/config/ekf.yaml`, fused into `simulation.launch.py`, `rtabmap.launch.py` switched to consume `/odometry/filtered` instead of raw `/odom`) — intended to correct real-hardware wheel slip — introduced two new symptoms in sim: RTAB-Map's map fracturing into several overlapping/ghosted layers specifically during arcs (simultaneous forward+turn), and the robot visually appearing to move sideways toward Nav2 goals despite DWB's `vy` limits being zero (physically impossible for this diff-drive robot). Root-caused via direct empirical comparison of raw `/odom` vs `/odometry/filtered` during scripted arc maneuvers — two separate real bugs found and fixed:
+
+1. **Spurious lateral velocity**: `ekf.yaml`'s `odom0_config` fused wheel-odom's x-velocity but left y-velocity unfused, so `vy` was a free-drifting EKF state with no direct measurement constraining it — drifted hardest exactly during arcs (`vx` and yaw-rate both nonzero). Fix: fuse `vy` too — differential-drive odometry always reports zero lateral velocity by construction, so this is a legitimate, always-available "vy=0" measurement, not a workaround.
+2. **Laggy IMU corrupting yaw**: confirmed via repeated scripted tests that Gazebo's IMU sensor's `angular_velocity.z` (and its `orientation` output) lags the true rotation rate by several seconds — e.g. after switching from a rotation command to pure-forward, `/imu` kept reporting ~0.26 rad/s residual for seconds after raw `/odom` had already settled to ~0. Fusing that lag froze/corrupted the EKF's yaw estimate during turns. Root cause noted as a `gz-sim` IMU sensor behavior, not an EKF tuning mistake. Also added a standard Gaussian noise model to the IMU sensor in `botzilla_qbot.urdf` (was previously noiseless, publishing an all-zero covariance matrix — `robot_localization` reads all-zero as "absolute certainty" rather than "unknown," making the filter over-trust individual glitchy readings; a real IMU always has noise). Given wheel odometry in sim has no simulated slip (Gazebo's diff-drive plugin uses an idealized kinematic model) and is therefore already fully accurate, also fused wheel-odom's own yaw and disabled IMU yaw/yaw-rate fusion entirely for now (`imu0_config` all-false) rather than trying to tune the lag away — revisit once real hardware (with real slip) arrives.
+
+**Validation**: after both fixes, `/odometry/filtered`'s position matched raw `/odom` exactly (to ~7 decimal places) and orientation matched to ~4 decimal places following a genuine 6-second arc. Re-ran the full stack with rtabmap on top through several more arcs — zero TF "unconnected trees"/"jump back in time" errors, and rtabmap's own log showed stable Working Memory (no runaway node-count growth indicating map forking).
+
+## Post-Milestone-3 fix #2 — DWB rotate-in-place stall, planner aborts, TF-too-old — ✅ FIXED
+
+Follow-on to the fix above. Symptom reported: Nav2 goals took "too long and the robot never moved — only after giving the goal again it moved." Diagnosed live (not from logs alone) by capturing `/cmd_vel` and reading the local costmap directly. Four distinct root causes, all fixed in `botzilla_navigation/config/nav2_params.yaml` + `launch/rtabmap.launch.py`:
+
+1. **DWB rotate-in-place stall (the main bug)**: captured **1,856** consecutive `/cmd_vel` samples across two goals in which `linear.x` was `0.0` in *every single one* — the robot only ever emitted tiny in-place rotations (`±0.021 rad/s`, exactly `max_vel_theta/(vtheta_samples-1)`). Root cause: `inflation_radius: 0.55` painted a wide **inscribed-cost** band around every obstacle (measured live from `/local_costmap/costmap_raw`: 549 inscribed + 119 lethal cells, ~19% of the 60×60 window). DWB's `BaseObstacle` critic marks any trajectory crossing inscribed cost as **infeasible regardless of its scale**, so all forward trajectories were rejected and only in-place rotation survived. The stack escaped only when `SimpleProgressChecker`'s timeout forced a costmap clear + replan — the same reset the user was triggering manually by resending the goal. Fix: `inflation_radius` `0.55 → 0.30` on both costmaps (footprint circumscribed radius is ~0.275m, arena corridors are >1m, so this stays collision-safe), plus `BaseObstacle.scale` `0.02 → 0.10` so DWB prefers routing *around* residual non-lethal cost.
+2. **Global planner aborts**: `Failed to create a plan from potential when a legal potential was found` → goal ABORTED. The global costmap deliberately had **no obstacle_layer**, relying solely on rtabmap's `/map`, which early in a session is incomplete/inconsistent. Fix: added a live `/scan` `obstacle_layer` to `global_costmap` (plugins now `[static_layer, obstacle_layer, inflation_layer]`) so NavFn always has obstacle data regardless of how far along the map is. Header comment updated to record the new rationale.
+3. **TF-too-old aborts**: `Transform data too old when converting from odom to map` (203ms gap) → `Unable to transform robot pose into global plan's frame`. rtabmap broadcasts `map→odom` at only ~1Hz (its processing rate, ~0.1–0.3s internal delay), so the `transform_tolerance: 0.2` was too tight. Fix: `0.5` across `FollowPath`, `behavior_server`, and both costmaps (standard rtabmap+nav2 margin for a slow `map→odom` source).
+4. **Ghost-map hardening** (on top of the EKF fix above): added `Grid/RayTracing: true` (clear free cells along each beam so stale marks don't persist as extra layers) and `Grid/NormalsSegmentation: false` + `Grid/MaxGroundHeight: 0.05` / `Grid/MaxObstacleHeight: 0.6` — on a flat sim floor the deterministic height passthrough is cheaper than normal-based ground segmentation and avoids frame-to-frame normal-estimation flicker that smears the grid during motion. `Grid/Sensor: 2` (laser+depth) deliberately **kept** to preserve Option A's low-obstacle detection.
+
+**Validation** (full clean end-to-end run, headless):
+- **DWB stall**: two consecutive goals to open coordinates `(0.0,1.8)` and `(1.5,1.5)` both returned `SUCCEEDED` (`error_code: 0`), with `linear.x` reaching the full `0.2 m/s` — versus `0.0` in all 1,856 samples before the fix.
+- **Planner/TF**: **zero** `Failed to make progress`, `Failed to create a plan`, `too old`, or `Unable to transform` errors across both goals. rtabmap delay measured 0.11–0.14s, comfortably inside the new 0.5s tolerance.
+- **Ghost maps**: a scripted left-arc → straight → right-arc pattern produced **0** new TF errors and **0** graph-error loop rejections; Working Memory grew linearly (25→42) then went flat on stop (no forking). Direct `/map` occupancy-grid analysis showed **median wall run = 1.0 cell (5cm)**, 93.4% of walls 1–3 cells thin, only 1.2% thick — crisp single-layer geometry, not the doubled/offset lines that characterize ghosting.
+- **EKF held**: `max |vy| = 0.0006 m/s` (0.6 mm/s) through an arc, versus ±0.15–0.17 m/s before the earlier EKF fix.
+- Gazebo RTF measured 0.41–0.76 (see note below) — degraded but not a correctness issue.
+
+**Known remaining rough edges** (not blocking):
+- **All visual loop closures are rejected** so far — either `Not enough inliers 0/20` or, in one case, a graph-error rejection of a `31↔1` match while the robot was nowhere near its start pose (i.e. rtabmap correctly refusing a false positive from the arena's repetitive walls). The map is therefore a pure odometry chain; it looks clean now because the EKF odometry is accurate, but long-loop global consistency is untested. Revisit `Reg/Strategy` / proximity-detection tuning if drift appears on large loops.
+- **Low Gazebo RTF (~0.4–0.76)**: camera+depth rendering dominates even headless. Nav2's timeouts are all sim-time so this is not a correctness bug, but it makes runs slow. If it hurts iteration, lower the RGB-D `update_rate` (currently 30Hz) or resolution in `botzilla_qbot.urdf`.
+
+## Post-Milestone-3 fix #3 — ghost maps: the ACTUAL root cause (supersedes fix #1) — ✅ FIXED
+
+The ghosting was **not** fixed by fix #1, and fix #1's central premise was wrong. The user
+reported still seeing ghost maps; rendering `/map` to an image showed two overlapping copies
+of the arena rotated ~20–25° apart. Two earlier verification methods had failed to catch this:
+a wall-*thickness* metric (ghosting produces multiple *thin parallel* lines, so thin walls
+never ruled it out) and arc tests too short to accumulate the error.
+
+**Root cause, measured against Gazebo ground truth** (`/world/botzilla_world/dynamic_pose/info`):
+
+| | ground truth | IMU orientation | wheel odom |
+|---|---|---|---|
+| before arc | +180.44° | **+180.44° (err 0.00°)** | +219.62° (err **+39.18°**) |
+| after 9s arc | +180.76° | **+180.76° (err 0.00°)** | +269.91° (err **+89.16°**) |
+
+With the robot wedged against arena geometry, a 9-second rotation command turned it only
+**0.32°** in truth while its wheels spun and wheel odometry invented **+50° of phantom
+rotation**. Fix #1's claim that "Gazebo's diff-drive uses an idealized kinematic model with no
+simulated wheel slip, so wheel yaw is already accurate" is **false** — the plugin derives
+odometry from actual wheel-joint rotation and therefore fully accumulates slip. Fix #1's
+decision to disable IMU fusion removed the only slip-immune heading source, which *caused*
+the ghosting: wrong heading → rtabmap paints the map rotated → overlapping layers. The
+earlier "the gz IMU lags several seconds" finding was also wrong — it came from a test
+contaminated by residual motion (the diff-drive plugin has no command watchdog). Measured
+properly the IMU is exact (0.00° error) and its yaw rate is right (0.4724 vs 0.5 commanded).
+
+**Three real bugs fixed** (`config/ekf.yaml`, new `odom_covariance_relay.py`, `simulation.launch.py`):
+
+1. **Wheel yaw fused instead of IMU yaw** — reversed. `odom0_config` now fuses **velocities
+   only** (`vx`, `vy`; all absolute pose false, since wheel pose is untrustworthy under slip),
+   and `imu0_config` now fuses **yaw + yaw-rate**. This is what the IMU was added for.
+2. **Malformed TF tree silently dropping every wheel velocity measurement** — the URDF makes
+   `base_footprint` the root and parent of `base_link`, but `ekf.yaml` set
+   `base_link_frame: base_link`, so the EKF published `odom→base_link` while
+   robot_state_publisher published `base_footprint→base_link` — giving `base_link` **two
+   parents**. `/odom`'s `child_frame_id` is `base_footprint`, so robot_localization could not
+   transform the twist and discarded it: measured `/odom` `vx=0.2000` while the filter's `vx`
+   stayed pinned at `0.0000` and position never left the origin. Fixed with
+   `base_link_frame: base_footprint`, giving the correct single chain
+   `odom → base_footprint → base_link → {camera, laser, imu}`.
+3. **All-zero odometry covariance** — Gazebo's DiffDrive publishes a zero covariance matrix,
+   which robot_localization reads as infinite certainty and which is numerically degenerate.
+   Added `botzilla_navigation/odom_covariance_relay.py`, which republishes `/odom` as
+   `/odom_cov` with realistic variances (loose on yaw-rate so the IMU dominates heading),
+   wired into `simulation.launch.py`; the EKF consumes `/odom_cov`. (Same class of bug as the
+   IMU's all-zero covariance fixed earlier in the URDF.)
+
+**Validation**: with the robot deliberately rammed into a wall and then commanded to spin
+(maximum slip), wheel odom drifted to **+205.19° (err −154.81°)** while the EKF held
+**+0.00° — exactly ground truth**. During normal motion the EKF also tracked truth to
+**0.00°** across left and right arcs. Wheel velocity fusion now works (`EKF.vx` 0.2006–0.2067
+tracking `odom.vx` 0.2000, position integrating correctly).
+
+**Known limitation (honest scope)**: heading is now slip-immune, but **linear** position still
+drifts under sustained linear slip — wheel speed is the only linear sensor, so if the robot is
+wedged with wheels spinning, that phantom translation integrates (a blind open-loop test that
+repeatedly rammed walls reached ~11 m of position error, and rtabmap stopped adding nodes,
+`WM=1`). Under Nav2 — which actively avoids obstacles — odometry stays sane and rtabmap builds
+normally. Correcting *linear* slip requires an absolute reference, i.e. rtabmap's `map→odom`
+via working loop closures, which remains the open follow-up below.
+
 ## Milestone 4 — Frontier exploration node
 
 1. `frontier_explorer_node.py`: pure-function frontier detection (scan `OccupancyGrid` for free/unknown boundary cells, cluster, pick nearest reachable centroid) + a thin `rclpy` wrapper that feeds centroids to Nav2's `NavigateToPose` action client, replanning on each map update.
