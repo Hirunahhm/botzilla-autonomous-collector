@@ -1,6 +1,6 @@
-# Week 3 Progress Report: Milestone 1 Completion & Multi-Sensor Graph SLAM
+# Week 3 Progress Report: Milestones 1, 3, and 4 Completion
 
-This document summarizes the engineering achievements, remote system configurations, and Milestone 1 verification completed during Week 3 of the Semester 5 Autonomous Multi-Cube Search & Collection Robot project.
+This document summarizes the engineering achievements, remote system configurations, and the successful completion of **Milestones 1, 3, and 4** for the Semester 5 Autonomous Multi-Cube Search & Collection Robot project.
 
 ---
 
@@ -37,8 +37,12 @@ Created and tuned `botzilla_navigation/launch/rtabmap.launch.py` to process and 
 'RGBD/NeighborLinkRefining': 'true'
 ```
 
-### B. EKF Odometry Stabilization & Map Ghosting Resolution (`ekf.yaml` & `botzilla_qbot.urdf`)
-During extended curved navigation and arc maneuvers, we observed severe **Map Ghosting** (also known in SLAM literature as **Map Duplication / Pose Graph Forking**), where walls and obstacles appeared duplicated in overlapping, rotated layers. Through empirical investigation and multi-sensor debugging, we identified and resolved two distinct underlying causes:
+### B. Overcoming "Ghost Maps" (EKF Odometry Stabilization)
+
+> [!SUCCESS]
+> **Ghost Maps Resolved!** During extended curved navigation, we observed severe **Map Ghosting** (Map Duplication), where walls appeared duplicated in rotated layers. We successfully overcame this by implementing a dual-sensor EKF fusion architecture to anchor the robot's heading and prevent drift.
+
+Through empirical investigation and multi-sensor debugging, we identified and resolved two distinct underlying causes:
 
 1. **Spurious Lateral Velocity ($V_y$) Drift**:
    * **Issue**: Differential drive odometry (`/odom`) kinematically constrains lateral velocity to zero ($v_y = 0$). However, `ekf.yaml` initially left $v_y$ unmeasured (`odom0_config: false` for $v_y$). During curved arc motions, process noise allowed $v_y$ to drift into a non-zero state, making the robot estimate slide sideways and corrupting scan registration.
@@ -110,14 +114,30 @@ We validated the complete autonomous navigation loop:
 
 ---
 
-## 5. Next Steps (Milestones 4 & 5 Roadmap)
+## 5. Milestone 4 Accomplishments: Autonomous Frontier Exploration (`frontier_explorer_node.py`)
 
-With **Milestone 1 (Multi-Sensor SLAM)**, **Odometry EKF Stabilization**, and **Milestone 3 (Nav2 Autonomous Navigation)** fully accomplished and verified, our next objectives focus on autonomy execution:
+We successfully completed **Milestone 4**, achieving full autonomous map exploration without human teleoperation.
 
-1. **Milestone 4 — Frontier Exploration Node (`frontier_explorer_node.py`)**:
-   * Implement automated frontier detection (scanning `/map` for free/unknown boundary cells, clustering centroids, and picking the nearest reachable target).
-   * Wrap the detector in an `rclpy` node that continuously dispatches `NavigateToPose` action goals to explore the arena autonomously without human teleoperation.
-2. **Milestone 5 — Unified Autonomy Executor (`executor_node.py`)**:
-   * Integrate our existing vision (`yolo_node` / `/detected_cube`) and precision alignment (`apriltag_node` / `/drop_off_pose`) into a unified state machine:
-     $$\text{Autonomous Frontier Search} \longrightarrow \text{Cube Detection & Preemption} \longrightarrow \text{Target Alignment & Capture} \longrightarrow \text{Nav2 Transit to Drop-Off} \longrightarrow \text{Release & Resume Search}$$
-   * Conduct the full Phase 1 multi-cube search, collection, and delivery verification run in simulation.
+### A. Frontier Detection Algorithm
+Implemented a pure-function frontier detector (`frontier_detection.py`) that actively scans the live `/map` `OccupancyGrid`:
+* **Edge Detection**: Identifies boundary cells between known free space and unknown territory.
+* **Clustering**: Groups adjacent frontier cells into distinct spatial clusters.
+* **Target Selection**: Filters out clusters that are too small (noise) and selects the nearest reachable centroid to dispatch as a navigation target.
+
+### B. Failed-Target Blacklist & Exponential Backoff
+To prevent the robot from getting permanently stuck trying to reach physically unreachable frontiers (like tight doorways):
+* Added an intelligent **Failed-Target Blacklist**. If Nav2 aborts a goal, the explorer node memorizes the coordinate.
+* Implemented **Exponential Backoff**: Repeated failures at the same location exponentially increase its cooldown penalty (from 6 minutes up to 1 hour).
+* This forces the robot to naturally "give up" on bad spots and successfully explore the rest of the arena.
+
+---
+
+## 6. Next Steps: The Final Objective (Milestone 5)
+
+With **Milestones 1, 3, and 4** fully completed and odometry stabilized, only **Milestone 5** remains to achieve our Phase 1 success criterion.
+
+### Milestone 5 — Unified Autonomy Executor (`executor_node.py`)
+* Integrate our existing vision (`yolo_node`) and precision alignment (`apriltag_node`) into a master state machine.
+* **The Final Behavior Loop**:
+  $$\text{Autonomous Frontier Search} \longrightarrow \text{Cube Detection Preemption} \longrightarrow \text{Target Alignment & Capture} \longrightarrow \text{Transit to Drop-Off} \longrightarrow \text{Release & Resume}$$
+* Conduct the end-to-end Phase 1 multi-cube collection run in simulation!
