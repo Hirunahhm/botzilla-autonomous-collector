@@ -24,6 +24,25 @@ the map. The timer always re-evaluates against the most recently received map, s
 transient startup failure self-heals on the next tick instead of stalling exploration
 permanently.
 
+Failed-target cooldown: a target whose Nav2 goal doesn't SUCCEED (ABORTED/CANCELED/timed
+out) is blacklisted for a cooldown period — observed live that a frontier just inside a
+tight doorway can fail the exact same way every time (repeated "Failed to make progress"),
+and since nothing about the map changes when a goal merely fails, the unfiltered nearest-
+frontier selection would just re-target the identical unreachable spot forever.
+
+The cooldown uses exponential backoff, not a flat duration: a single Nav2 attempt on a
+genuinely bad target was observed live to take ~300s to abort (multiple internal recovery
+cycles before giving up). A flat cooldown shorter than that doesn't work — with two
+persistently-bad frontiers A and B and a 90s flat cooldown, A fails and is banned for 90s,
+B is tried and takes ~300s to also fail, and by then A's 90s ban has long since expired —
+so the two just ping-pong forever, never giving the OTHER known-good frontiers a turn (this
+exact failure mode was observed live before this fix). BLACKLIST_COOLDOWN_BASE_S is set
+comfortably above that ~300s single-attempt latency, and repeated failures at the same
+spot (tracked persistently across cooldown expiries, not just within one active window)
+double the cooldown each time, up to BLACKLIST_COOLDOWN_MAX_S — so a truly unreachable
+frontier gets pushed out far enough to let the rest of the map be explored, while a
+one-off failure doesn't get penalized as harshly.
+
 Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
@@ -58,6 +77,15 @@ MIN_TARGET_DISTANCE_M = 0.3
 # sent. Independent of /map's own publish rate — see module docstring.
 EVAL_PERIOD_S = 2.0
 
+# A target within this radius of a recently-failed target is treated as the same spot and
+# excluded until its cooldown expires (see module docstring).
+BLACKLIST_RADIUS_M = 0.5
+
+# Exponential backoff: cooldown = min(BASE * 2^(failure_count - 1), MAX). BASE is set well
+# above the ~300s single-attempt failure latency observed live (see module docstring).
+BLACKLIST_COOLDOWN_BASE_S = 360.0
+BLACKLIST_COOLDOWN_MAX_S = 3600.0
+
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
 
@@ -75,6 +103,9 @@ class FrontierExplorerNode(Node):
         self._state = State.IDLE
         self._goal_handle = None
         self._latest_map = None
+        self._current_target = None
+        self._blacklist = []  # list of (x, y, expiry_time: rclpy.time.Time) — active bans
+        self._failure_history = []  # list of [x, y, count] — persists across cooldowns
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -130,13 +161,20 @@ class FrontierExplorerNode(Node):
             for (r, c, _size) in clusters
         ]
 
-        target = select_target(frontiers_world, robot_x, robot_y)
-
-        if target is None:
+        if not frontiers_world:
             self._state = State.EXPLORATION_COMPLETE
             self._complete_pub.publish(Bool(data=True))
             self.get_logger().info('No frontiers remain — exploration complete.')
             return
+
+        candidates = self._filter_blacklisted(frontiers_world)
+        if not candidates:
+            self.get_logger().debug(
+                'All known frontiers are on cooldown after recent failures, waiting.'
+            )
+            return
+
+        target = select_target(candidates, robot_x, robot_y)
 
         if distance(robot_x, robot_y, target[0], target[1]) < MIN_TARGET_DISTANCE_M:
             self.get_logger().debug('Nearest frontier is too close, waiting for next map update.')
@@ -146,6 +184,37 @@ class FrontierExplorerNode(Node):
             f'{len(clusters)} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f})'
         )
         self._send_goal(target[0], target[1])
+
+    def _filter_blacklisted(self, frontiers_world):
+        now = self.get_clock().now()
+        self._blacklist = [b for b in self._blacklist if b[2] > now]
+
+        def is_blacklisted(x, y):
+            return any(
+                distance(x, y, bx, by) < BLACKLIST_RADIUS_M
+                for (bx, by, _exp) in self._blacklist
+            )
+
+        return [(x, y) for (x, y) in frontiers_world if not is_blacklisted(x, y)]
+
+    def _blacklist_target(self, x, y):
+        for entry in self._failure_history:
+            if distance(x, y, entry[0], entry[1]) < BLACKLIST_RADIUS_M:
+                entry[2] += 1
+                count = entry[2]
+                break
+        else:
+            count = 1
+            self._failure_history.append([x, y, count])
+
+        cooldown = min(
+            BLACKLIST_COOLDOWN_BASE_S * (2 ** (count - 1)), BLACKLIST_COOLDOWN_MAX_S
+        )
+        expiry = self.get_clock().now() + Duration(seconds=cooldown)
+        self._blacklist.append((x, y, expiry))
+        self.get_logger().info(
+            f'Blacklisting ({x:.2f}, {y:.2f}) for {cooldown:.0f}s (failure #{count}).'
+        )
 
     # ------------------------------------------------------------------ #
     # Robot pose via TF (map -> base_link)
@@ -179,6 +248,7 @@ class FrontierExplorerNode(Node):
         goal.pose.pose.orientation.w = 1.0
 
         self._state = State.NAVIGATING
+        self._current_target = (x, y)
         send_future = self._nav_client.send_goal_async(goal, feedback_callback=self._feedback_cb)
         send_future.add_done_callback(self._goal_response_cb)
 
@@ -204,6 +274,12 @@ class FrontierExplorerNode(Node):
             GoalStatus.STATUS_CANCELED: 'CANCELED',
         }.get(result.status, f'status={result.status}')
         self.get_logger().info(f'Nav2 goal finished: {status_name}')
+
+        if result.status != GoalStatus.STATUS_SUCCEEDED and self._current_target is not None:
+            x, y = self._current_target
+            self._blacklist_target(x, y)
+
+        self._current_target = None
         self._goal_handle = None
         self._state = State.IDLE
 
