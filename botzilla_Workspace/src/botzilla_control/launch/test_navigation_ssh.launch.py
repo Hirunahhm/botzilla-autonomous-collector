@@ -41,7 +41,7 @@ from launch_ros.actions import Node
 
 _NORESET = os.path.join(
     os.path.expanduser('~'),
-    'Desktop/Bozilla-ws/final-project-botzilla/noreset.so'
+    'Desktop/Projects/sem5/final-project-botzilla/noreset.so'
 )
 
 
