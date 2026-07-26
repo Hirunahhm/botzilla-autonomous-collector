@@ -23,7 +23,8 @@ setup(
             'kinect_bridge = botzilla_perception.kinect_bridge:main',
             'yolo_node = botzilla_perception.yolo_node:main',
             'apriltag_node = botzilla_perception.apriltag_node:main',
-            'red_color_follower = botzilla_perception.red_color_follower:main'
+            'red_color_follower = botzilla_perception.red_color_follower:main',
+            'rplidar_node = botzilla_perception.rplidar_node:main'
         ],
     },
 )
