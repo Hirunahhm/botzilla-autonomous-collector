@@ -1,0 +1,49 @@
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: false
+    frequency: 50.0
+    two_d_mode: true
+    publish_tf: true
+    odom_frame: odom
+    # base_footprint, NOT base_link — see config/ekf.yaml's comment for why (the
+    # URDF makes base_footprint the parent of base_link; publishing odom directly
+    # to base_link would give base_link two parents, an invalid TF tree).
+    base_link_frame: base_footprint
+    world_frame: odom
+
+    # --- Wheel odometry: VELOCITIES ONLY, never absolute pose. ---
+    # Same reasoning as config/ekf.yaml: wheel odometry accumulates slip error,
+    # so only vx/vy are fused, never x/y/yaw. /odom_cov is odom_covariance_relay's
+    # output — kobuki_base_node's raw /odom has zero covariance by default, which
+    # robot_localization reads as "infinitely certain" and silently never fuses.
+    odom0: /odom_cov
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false,
+                   false, false, false,
+                   false, false, false]
+
+    # --- IMU: yaw RATE only, not absolute yaw. ---
+    #
+    # This diverges from config/ekf.yaml (sim), which fuses both absolute yaw and
+    # yaw rate from Gazebo's simulated IMU — that IMU reports true, non-integrated
+    # orientation, verified against ground truth (see config/ekf.yaml's comment).
+    #
+    # The real Kobuki's onboard gyro (KobukiDriver.gyro_velocity_data) has no such
+    # absolute-heading register — it is a rate gyro only (deg/s), read directly off
+    # the serial feedback packet. kobuki_base_node publishes it with
+    # orientation_covariance[0] = -1 (sensor_msgs/Imu's "no orientation estimate"
+    # sentinel) precisely because fabricating an absolute orientation would mean
+    # self-integrating the same rate signal we're handing the EKF — circular, and
+    # it would reintroduce the kind of drift this fusion exists to avoid. Fusing
+    # the rate alone lets the EKF's own state propagation integrate heading with
+    # proper uncertainty growth, instead of trusting a fake "ground truth" quaternion.
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_relative: true
+    imu0_differential: false
+    imu0_remove_gravitational_acceleration: false

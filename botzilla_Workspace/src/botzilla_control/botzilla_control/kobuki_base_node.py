@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 import math
 
 from .KobukiDriver import Kobuki
@@ -11,6 +12,15 @@ from .KobukiDriver import Kobuki
 # ≈ 11724 ticks per metre.  Tune TICKS_PER_M if measured distance doesn't match.
 TICKS_PER_M  = 11724.41
 WHEEL_BASE_M = 0.230    # 23 cm — must match cmd_vel_callback below
+
+# ── IMU ──────────────────────────────────────────────────────────────────────
+# The onboard gyro is rate-only (no absolute-heading register), unlike Gazebo's
+# simulated IMU — so orientation is left unset (orientation_covariance[0] = -1,
+# the sensor_msgs/Imu convention for "no orientation estimate available").
+# Only angular_velocity.z (yaw rate) is populated; that's what the hardware EKF
+# config (ekf_hardware.yaml) fuses, letting the filter integrate heading itself
+# rather than trusting a fabricated absolute orientation.
+YAW_RATE_VARIANCE = 0.02   # rad/s, moderate confidence — tune against measured noise
 
 
 class KobukiBaseNode(Node):
@@ -33,8 +43,12 @@ class KobukiBaseNode(Node):
         self._prev_R = None     # previous raw 16-bit right tick
         self.create_timer(0.02, self._odom_update)   # 50 Hz
 
+        # IMU publisher
+        self._imu_pub = self.create_publisher(Imu, 'imu', 10)
+        self.create_timer(0.02, self._imu_update)     # 50 Hz
+
         self.get_logger().info(
-            'Kobuki Base Node started. /cmd_vel → motors | encoders → /odom')
+            'Kobuki Base Node started. /cmd_vel → motors | encoders → /odom, gyro → /imu')
 
     # ── Odometry ────────────────────────────────────────────────────────────
 
@@ -76,6 +90,37 @@ class KobukiBaseNode(Node):
         msg.pose.pose.orientation.z = math.sin(self._ot / 2.0)
         msg.pose.pose.orientation.w = math.cos(self._ot / 2.0)
         self._odom_pub.publish(msg)
+
+    # ── IMU (rate gyro only — see YAW_RATE_VARIANCE comment above) ───────────
+
+    def _imu_update(self):
+        try:
+            gyro = self.robot.gyro_velocity_data()
+            z_samples = gyro['angular velocity of z: ']
+            if not z_samples:
+                return
+            yaw_rate_dps = z_samples[-1]
+        except Exception:
+            return   # __gyro not populated yet
+
+        msg = Imu()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'imu_link'
+
+        # No absolute orientation available from this sensor: element 0 of the
+        # covariance is the sensor_msgs/Imu sentinel for "whole field invalid" —
+        # unlike a per-axis covariance, -1 here must NOT be set on
+        # angular_velocity_covariance below, since z *is* valid data.
+        msg.orientation_covariance[0] = -1.0
+        # No accelerometer data available from this driver.
+        msg.linear_acceleration_covariance[0] = -1.0
+
+        msg.angular_velocity.z = math.radians(yaw_rate_dps)
+        msg.angular_velocity_covariance[0] = 1e6   # x: not fused, large variance (not -1 —
+        msg.angular_velocity_covariance[4] = 1e6   # y: that would invalidate z too)
+        msg.angular_velocity_covariance[8] = YAW_RATE_VARIANCE
+
+        self._imu_pub.publish(msg)
 
     # ── Velocity command ─────────────────────────────────────────────────────
 

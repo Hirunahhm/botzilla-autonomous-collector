@@ -48,8 +48,17 @@ def generate_launch_description():
         'subscribe_rgb': True,
         'subscribe_scan': True,
         'approx_sync': True,
-        'qos_image': 1,
-        'qos_scan': 1,
+        # 1=Reliable, 2=BestEffort. Image/camera_info/scan must be BestEffort here to
+        # match the hardware sensor nodes, which all publish with
+        # rclpy.qos.qos_profile_sensor_data (BestEffort) — a Reliable subscriber cannot
+        # receive from a BestEffort publisher at all (QoS incompatibility, not just a
+        # warning), so this was silently dropping every rgb/depth/scan frame on hardware.
+        # This was never an issue in sim, where ros_gz_bridge's default topic QoS is
+        # Reliable. /odometry/filtered (odom) is unaffected — robot_localization
+        # publishes with the default Reliable QoS, matching qos_odom=1 below.
+        'qos_image': 2,
+        'qos_camera_info': 2,
+        'qos_scan': 2,
         'qos_odom': 1,
         'Reg/Strategy': '1',       # ICP + Visual (best obstacle avoidance + loop closure)
         'Reg/Force3DoF': 'true',   # ground robot: x, y, yaw only

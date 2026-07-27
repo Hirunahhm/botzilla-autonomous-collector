@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from rclpy.qos import qos_profile_sensor_data
 import freenect
 import numpy as np
@@ -12,12 +12,37 @@ import threading
 # connection causes a USB device reset, the Pi 5 assigns a new bus address,
 # and libfreenect cannot reopen the device at the old address (ENODEV).
 
+# Kinect v1's well-known factory-default RGB intrinsics (uncalibrated for this
+# specific unit, but close enough for RTAB-Map's RGB-D registration — these are
+# the same defaults used across the ROS/OpenNI ecosystem for 640x480 Kinect v1).
+KINECT_FX = 525.0
+KINECT_FY = 525.0
+KINECT_CX = 319.5
+KINECT_CY = 239.5
+
+
+def _build_camera_info():
+    info = CameraInfo()
+    info.height = 480
+    info.width = 640
+    info.distortion_model = 'plumb_bob'
+    info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+    info.k = [KINECT_FX, 0.0, KINECT_CX, 0.0, KINECT_FY, KINECT_CY, 0.0, 0.0, 1.0]
+    info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    info.p = [KINECT_FX, 0.0, KINECT_CX, 0.0, 0.0, KINECT_FY, KINECT_CY, 0.0, 0.0, 0.0, 1.0, 0.0]
+    return info
+
+
 class KinectBridge(Node):
     def __init__(self):
         super().__init__('kinect_bridge')
 
         self.publisher_rgb = self.create_publisher(Image, '/camera/rgb/image_raw', qos_profile_sensor_data)
         self.publisher_depth = self.create_publisher(Image, '/camera/depth/image_raw', qos_profile_sensor_data)
+        self.publisher_camera_info = self.create_publisher(
+            CameraInfo, '/camera/camera_info', qos_profile_sensor_data
+        )
+        self._camera_info_msg = _build_camera_info()
 
         self.latest_rgb = None
         self.latest_depth = None
@@ -81,14 +106,27 @@ class KinectBridge(Node):
     # --- ROS THREAD (Consumer) ---
 
     def publish_frames(self):
-        if self.new_rgb_available and self.publisher_rgb.get_subscription_count() > 0:
-            msg = Image()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'camera_color_optical_frame'
-            msg.height, msg.width, msg.step = 480, 640, 640 * 3
-            msg.encoding = 'rgb8'
-            msg.data = self.latest_rgb
-            self.publisher_rgb.publish(msg)
+        if self.new_rgb_available:
+            stamp = self.get_clock().now().to_msg()
+
+            # camera_info is gated on its own subscriber count, independent of
+            # whether the image topic itself currently has one — a consumer
+            # (e.g. RTAB-Map's synced RGB-D subscriber) may only be watching
+            # camera_info at the instant this runs.
+            if self.publisher_camera_info.get_subscription_count() > 0:
+                self._camera_info_msg.header.stamp = stamp
+                self._camera_info_msg.header.frame_id = 'camera_color_optical_frame'
+                self.publisher_camera_info.publish(self._camera_info_msg)
+
+            if self.publisher_rgb.get_subscription_count() > 0:
+                msg = Image()
+                msg.header.stamp = stamp
+                msg.header.frame_id = 'camera_color_optical_frame'
+                msg.height, msg.width, msg.step = 480, 640, 640 * 3
+                msg.encoding = 'rgb8'
+                msg.data = self.latest_rgb
+                self.publisher_rgb.publish(msg)
+
             self.new_rgb_available = False
 
         if self.new_depth_available and self.publisher_depth.get_subscription_count() > 0:
