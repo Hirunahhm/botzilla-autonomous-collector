@@ -12,6 +12,7 @@ odometry with RGB-D + laser scan data for mapping and loop closure.
 Usage:
   ros2 launch botzilla_navigation rtabmap.launch.py
   ros2 launch botzilla_navigation rtabmap.launch.py delete_db_on_start:=false
+  ros2 launch botzilla_navigation rtabmap.launch.py use_sim_time:=false depth_topic:=/camera/depth/image_meters
 """
 
 from launch import LaunchDescription
@@ -31,9 +32,20 @@ def generate_launch_description():
         default_value='true',
         description='Start mapping from an empty database each launch (set false to keep building the same map across runs)',
     )
+    depth_topic_arg = DeclareLaunchArgument(
+        'depth_topic',
+        default_value='/camera/depth/image_raw',
+        description=(
+            "Depth image topic. Sim's ros_gz_bridge publishes proper metric depth "
+            "directly on /camera/depth/image_raw (the default). On hardware, "
+            "kinect_bridge's own /camera/depth/image_raw is a mono8 preview built for "
+            "yolo_node, not real depth — pass /camera/depth/image_meters instead."
+        ),
+    )
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     delete_db_on_start = LaunchConfiguration('delete_db_on_start')
+    depth_topic = LaunchConfiguration('depth_topic')
 
     rtabmap_args = PythonExpression([
         "'--delete_db_on_start' if '", delete_db_on_start, "' == 'true' else ''"
@@ -84,7 +96,7 @@ def generate_launch_description():
 
     rtabmap_remappings = [
         ('rgb/image', '/camera/rgb/image_raw'),
-        ('depth/image', '/camera/depth/image_raw'),
+        ('depth/image', depth_topic),
         ('rgb/camera_info', '/camera/camera_info'),
         ('odom', '/odometry/filtered'),
         ('scan', '/scan'),
@@ -103,5 +115,6 @@ def generate_launch_description():
     return LaunchDescription([
         use_sim_time_arg,
         delete_db_on_start_arg,
+        depth_topic_arg,
         rtabmap_node,
     ])

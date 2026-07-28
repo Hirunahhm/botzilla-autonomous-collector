@@ -22,6 +22,16 @@ WHEEL_BASE_M = 0.230    # 23 cm — must match cmd_vel_callback below
 # rather than trusting a fabricated absolute orientation.
 YAW_RATE_VARIANCE = 0.02   # rad/s, moderate confidence — tune against measured noise
 
+# Stationary gyro bias calibration: the raw z-axis rate has a small, roughly
+# constant offset (measured ~0.039 rad/s on this unit) even at rest. With no
+# absolute-yaw source to anchor it, ekf_hardware.yaml's yaw-rate-only fusion
+# integrates that offset without bound — the filter's yaw state (and the map
+# frame RTAB-Map registers against) slowly spins in place even when the robot
+# never moves, which also shows up as smeared/ghosted map layers. Average the
+# first GYRO_CALIB_SAMPLES readings at startup (robot must be stationary while
+# the node launches) and subtract that average from every sample after.
+GYRO_CALIB_SAMPLES = 100   # 50 Hz updates -> 2 s of calibration
+
 
 class KobukiBaseNode(Node):
     def __init__(self):
@@ -45,6 +55,9 @@ class KobukiBaseNode(Node):
 
         # IMU publisher
         self._imu_pub = self.create_publisher(Imu, 'imu', 10)
+        self._gyro_bias_dps = 0.0
+        self._gyro_calib_readings = []
+        self._gyro_calibrated = False
         self.create_timer(0.02, self._imu_update)     # 50 Hz
 
         self.get_logger().info(
@@ -102,6 +115,17 @@ class KobukiBaseNode(Node):
             yaw_rate_dps = z_samples[-1]
         except Exception:
             return   # __gyro not populated yet
+
+        if not self._gyro_calibrated:
+            self._gyro_calib_readings.append(yaw_rate_dps)
+            if len(self._gyro_calib_readings) >= GYRO_CALIB_SAMPLES:
+                self._gyro_bias_dps = sum(self._gyro_calib_readings) / len(self._gyro_calib_readings)
+                self._gyro_calibrated = True
+                self.get_logger().info(
+                    f'Gyro bias calibrated: {self._gyro_bias_dps:.4f} deg/s (robot must have been stationary)')
+            return   # don't publish uncorrected samples during calibration
+
+        yaw_rate_dps -= self._gyro_bias_dps
 
         msg = Imu()
         msg.header.stamp = self.get_clock().now().to_msg()

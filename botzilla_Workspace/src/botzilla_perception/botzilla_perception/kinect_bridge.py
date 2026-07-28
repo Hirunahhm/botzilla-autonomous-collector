@@ -20,6 +20,23 @@ KINECT_FY = 525.0
 KINECT_CX = 319.5
 KINECT_CY = 239.5
 
+# Standard Kinect v1 disparity -> depth(meters) formula, matching yolo_node.py's
+# get_depth_at() exactly (see that function's comment for the same constants) — that
+# function reverses kinect_bridge's separate mono8-rescaled depth stream to recover
+# this formula's input; here we apply it directly to the raw 11-bit disparity value,
+# no rescale/reverse round-trip needed, since this publisher is built straight from it.
+KINECT_DISPARITY_A = -0.0030711016
+KINECT_DISPARITY_B = 3.3309495161
+KINECT_NO_DATA_THRESHOLD = 2040  # Kinect reports 2047 for pixels with no valid depth
+
+# Must match botzilla_qbot.urdf's <link name="camera_link_optical"/> exactly — the
+# URDF defines only one optical frame (RGB and depth treated as co-located, no
+# separate depth-camera offset joint), and nothing under this name existed until
+# RTAB-Map's TF lookups exposed it: 'camera_color_optical_frame'/
+# 'camera_depth_optical_frame' (the previous values here) don't exist anywhere in
+# the URDF, so any TF-based consumer would silently fail every lookup.
+CAMERA_OPTICAL_FRAME = 'camera_link_optical'
+
 
 def _build_camera_info():
     info = CameraInfo()
@@ -33,12 +50,34 @@ def _build_camera_info():
     return info
 
 
+def _disparity_to_meters(data):
+    """Convert a raw 11-bit Kinect disparity array into metric depth (32FC1, meters).
+
+    Invalid/no-data pixels (including non-finite results from the formula's pole) are
+    set to 0.0 — the standard ROS depth-image convention for "no return", matching
+    what depth_image_proc/RTAB-Map expect.
+    """
+    raw = data.astype(np.float32)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        depth_m = 1.0 / (raw * KINECT_DISPARITY_A + KINECT_DISPARITY_B)
+    invalid = (raw >= KINECT_NO_DATA_THRESHOLD) | ~np.isfinite(depth_m) | (depth_m < 0)
+    depth_m[invalid] = 0.0
+    return depth_m
+
+
 class KinectBridge(Node):
     def __init__(self):
         super().__init__('kinect_bridge')
 
         self.publisher_rgb = self.create_publisher(Image, '/camera/rgb/image_raw', qos_profile_sensor_data)
+        # mono8, 0-255 rescaled from the raw 11-bit disparity — kept exactly as-is for
+        # yolo_node.py's get_depth_at(), which reverses this specific scaling.
         self.publisher_depth = self.create_publisher(Image, '/camera/depth/image_raw', qos_profile_sensor_data)
+        # 32FC1, real metric depth — for RTAB-Map/SLAM consumers, which need actual
+        # depth values, not a compact rescaled preview image.
+        self.publisher_depth_meters = self.create_publisher(
+            Image, '/camera/depth/image_meters', qos_profile_sensor_data
+        )
         self.publisher_camera_info = self.create_publisher(
             CameraInfo, '/camera/camera_info', qos_profile_sensor_data
         )
@@ -46,6 +85,7 @@ class KinectBridge(Node):
 
         self.latest_rgb = None
         self.latest_depth = None
+        self.latest_depth_meters = None
         self.new_rgb_available = False
         self.new_depth_available = False
         self._frames_received = 0
@@ -73,6 +113,7 @@ class KinectBridge(Node):
             return
         scaled = (data.astype(np.float32) / 2047.0 * 255.0).astype(np.uint8)
         self.latest_depth = scaled.tobytes()
+        self.latest_depth_meters = _disparity_to_meters(data).tobytes()
         self.new_depth_available = True
 
     def run_camera_loop(self):
@@ -115,13 +156,13 @@ class KinectBridge(Node):
             # camera_info at the instant this runs.
             if self.publisher_camera_info.get_subscription_count() > 0:
                 self._camera_info_msg.header.stamp = stamp
-                self._camera_info_msg.header.frame_id = 'camera_color_optical_frame'
+                self._camera_info_msg.header.frame_id = CAMERA_OPTICAL_FRAME
                 self.publisher_camera_info.publish(self._camera_info_msg)
 
             if self.publisher_rgb.get_subscription_count() > 0:
                 msg = Image()
                 msg.header.stamp = stamp
-                msg.header.frame_id = 'camera_color_optical_frame'
+                msg.header.frame_id = CAMERA_OPTICAL_FRAME
                 msg.height, msg.width, msg.step = 480, 640, 640 * 3
                 msg.encoding = 'rgb8'
                 msg.data = self.latest_rgb
@@ -129,14 +170,27 @@ class KinectBridge(Node):
 
             self.new_rgb_available = False
 
-        if self.new_depth_available and self.publisher_depth.get_subscription_count() > 0:
-            msg = Image()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'camera_depth_optical_frame'
-            msg.height, msg.width, msg.step = 480, 640, 640
-            msg.encoding = 'mono8'
-            msg.data = self.latest_depth
-            self.publisher_depth.publish(msg)
+        if self.new_depth_available:
+            stamp = self.get_clock().now().to_msg()
+
+            if self.publisher_depth.get_subscription_count() > 0:
+                msg = Image()
+                msg.header.stamp = stamp
+                msg.header.frame_id = CAMERA_OPTICAL_FRAME
+                msg.height, msg.width, msg.step = 480, 640, 640
+                msg.encoding = 'mono8'
+                msg.data = self.latest_depth
+                self.publisher_depth.publish(msg)
+
+            if self.publisher_depth_meters.get_subscription_count() > 0:
+                msg = Image()
+                msg.header.stamp = stamp
+                msg.header.frame_id = CAMERA_OPTICAL_FRAME
+                msg.height, msg.width, msg.step = 480, 640, 640 * 4
+                msg.encoding = '32FC1'
+                msg.data = self.latest_depth_meters
+                self.publisher_depth_meters.publish(msg)
+
             self.new_depth_available = False
 
 
