@@ -22,15 +22,25 @@ WHEEL_BASE_M = 0.230    # 23 cm — must match cmd_vel_callback below
 # rather than trusting a fabricated absolute orientation.
 YAW_RATE_VARIANCE = 0.02   # rad/s, moderate confidence — tune against measured noise
 
-# Stationary gyro bias calibration: the raw z-axis rate has a small, roughly
-# constant offset (measured ~0.039 rad/s on this unit) even at rest. With no
-# absolute-yaw source to anchor it, ekf_hardware.yaml's yaw-rate-only fusion
-# integrates that offset without bound — the filter's yaw state (and the map
-# frame RTAB-Map registers against) slowly spins in place even when the robot
-# never moves, which also shows up as smeared/ghosted map layers. Average the
-# first GYRO_CALIB_SAMPLES readings at startup (robot must be stationary while
-# the node launches) and subtract that average from every sample after.
+# Stationary gyro bias calibration: the raw z-axis rate has a small offset even
+# at rest. With no absolute-yaw source to anchor it, ekf_hardware.yaml's
+# yaw-rate-only fusion integrates that offset without bound — the filter's yaw
+# state (and the map frame RTAB-Map registers against) slowly spins in place
+# even when the robot never moves, which also shows up as smeared/ghosted map
+# layers. Average the first GYRO_CALIB_SAMPLES readings at startup (robot must
+# be stationary while the node launches) to get an initial bias estimate.
 GYRO_CALIB_SAMPLES = 100   # 50 Hz updates -> 2 s of calibration
+
+# The offset isn't a fixed constant — it's bias *instability*, common on cheap
+# MEMS gyros: it wanders slowly even at rest (confirmed on this unit: ~0.01
+# rad/s of residual drift remained after the one-shot startup calibration
+# above). So keep tracking it: whenever wheel encoders show no real motion,
+# slowly adapt the bias estimate toward the current raw reading (EMA). Frozen
+# (not updated) while the robot is actually moving, since a real yaw rate
+# would otherwise get absorbed into the "bias" and get subtracted back out.
+GYRO_BIAS_EMA_ALPHA = 0.005          # slow adaptation — time-averages over ~tens of seconds
+STATIONARY_D_THRESHOLD_M = 0.0005    # per 20ms odom tick (~2.5cm/s) — below encoder noise floor at rest
+STATIONARY_DTHETA_THRESHOLD_RAD = 0.001   # per 20ms odom tick
 
 
 class KobukiBaseNode(Node):
@@ -51,6 +61,8 @@ class KobukiBaseNode(Node):
         self._ot = 0.0          # heading (rad, CCW+)
         self._prev_L = None     # previous raw 16-bit left  tick
         self._prev_R = None     # previous raw 16-bit right tick
+        self._prev_odom_time = None   # rclpy.time.Time of the previous tick, for real dt
+        self._stationary = True   # updated each odom tick; read by _imu_update for bias tracking
         self.create_timer(0.02, self._odom_update)   # 50 Hz
 
         # IMU publisher
@@ -79,29 +91,44 @@ class KobukiBaseNode(Node):
 
         L = enc['Left_encoder']
         R = enc['Right_encoder']
+        now = self.get_clock().now()
 
         if self._prev_L is None:
             self._prev_L, self._prev_R = L, R
+            self._prev_odom_time = now
             return
 
         dl = self._tick_diff(L, self._prev_L) / TICKS_PER_M
         dr = self._tick_diff(R, self._prev_R) / TICKS_PER_M
         self._prev_L, self._prev_R = L, R
 
+        dt = (now - self._prev_odom_time).nanoseconds / 1e9
+        self._prev_odom_time = now
+        if dt <= 0.0:
+            return   # clock didn't advance (or went backwards) — skip this tick
+
         d      = (dl + dr) / 2.0
         dtheta = (dr - dl) / WHEEL_BASE_M
+        self._stationary = abs(d) < STATIONARY_D_THRESHOLD_M and abs(dtheta) < STATIONARY_DTHETA_THRESHOLD_RAD
         self._ox += d * math.cos(self._ot + dtheta / 2.0)
         self._oy += d * math.sin(self._ot + dtheta / 2.0)
         self._ot += dtheta
 
         msg = Odometry()
-        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.stamp    = now.to_msg()
         msg.header.frame_id = 'odom'
         msg.child_frame_id  = 'base_link'
         msg.pose.pose.position.x    = self._ox
         msg.pose.pose.position.y    = self._oy
         msg.pose.pose.orientation.z = math.sin(self._ot / 2.0)
         msg.pose.pose.orientation.w = math.cos(self._ot / 2.0)
+        # robot_localization's ekf_hardware.yaml fuses ONLY these velocities from this
+        # source (never the pose above — wheel odometry pose drifts under slip). Without
+        # them the EKF fuses "measured velocity = 0" on every update regardless of real
+        # motion, which is why /odometry/filtered was previously observed pinned at the
+        # origin even during confirmed real motion.
+        msg.twist.twist.linear.x  = d / dt
+        msg.twist.twist.angular.z = dtheta / dt
         self._odom_pub.publish(msg)
 
     # ── IMU (rate gyro only — see YAW_RATE_VARIANCE comment above) ───────────
@@ -124,6 +151,9 @@ class KobukiBaseNode(Node):
                 self.get_logger().info(
                     f'Gyro bias calibrated: {self._gyro_bias_dps:.4f} deg/s (robot must have been stationary)')
             return   # don't publish uncorrected samples during calibration
+
+        if self._stationary:
+            self._gyro_bias_dps += GYRO_BIAS_EMA_ALPHA * (yaw_rate_dps - self._gyro_bias_dps)
 
         yaw_rate_dps -= self._gyro_bias_dps
 
