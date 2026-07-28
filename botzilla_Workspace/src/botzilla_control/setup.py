@@ -32,6 +32,7 @@ setup(
             'nav_test_node = botzilla_control.nav_test_node:main',
             'final_test_node = botzilla_control.final_test_node:main',
             'teleop_keyboard_node = botzilla_control.teleop_keyboard_node:main',
+            'rotation_test_node = botzilla_control.rotation_test_node:main',
         ],
     },
 )

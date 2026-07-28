@@ -34,10 +34,19 @@ GYRO_CALIB_SAMPLES = 100   # 50 Hz updates -> 2 s of calibration
 # The offset isn't a fixed constant — it's bias *instability*, common on cheap
 # MEMS gyros: it wanders slowly even at rest (confirmed on this unit: ~0.01
 # rad/s of residual drift remained after the one-shot startup calibration
-# above). So keep tracking it: whenever wheel encoders show no real motion,
+# above). So keep tracking it: whenever the robot is confirmed stationary,
 # slowly adapt the bias estimate toward the current raw reading (EMA). Frozen
 # (not updated) while the robot is actually moving, since a real yaw rate
 # would otherwise get absorbed into the "bias" and get subtracted back out.
+#
+# "Confirmed stationary" requires BOTH wheel encoders showing no motion AND the
+# last /cmd_vel commanding zero. Encoders alone are not enough: an in-place
+# rotation via skid-steering causes bursty, stick-slip wheel motion, so
+# individual 20ms ticks can read as near-zero encoder motion even mid-turn —
+# without the cmd_vel gate, those false-stationary ticks feed the real turn
+# rate into the bias estimate and silently subtract a chunk of it back out,
+# which is what caused /odometry/filtered to badly under-report an actual
+# ~138 deg commanded turn (measured ~9 deg) during hardware testing.
 GYRO_BIAS_EMA_ALPHA = 0.005          # slow adaptation — time-averages over ~tens of seconds
 STATIONARY_D_THRESHOLD_M = 0.0005    # per 20ms odom tick (~2.5cm/s) — below encoder noise floor at rest
 STATIONARY_DTHETA_THRESHOLD_RAD = 0.001   # per 20ms odom tick
@@ -63,6 +72,7 @@ class KobukiBaseNode(Node):
         self._prev_R = None     # previous raw 16-bit right tick
         self._prev_odom_time = None   # rclpy.time.Time of the previous tick, for real dt
         self._stationary = True   # updated each odom tick; read by _imu_update for bias tracking
+        self._cmd_vel_zero = True   # updated in cmd_vel_callback; see GYRO_BIAS_EMA_ALPHA comment
         self.create_timer(0.02, self._odom_update)   # 50 Hz
 
         # IMU publisher
@@ -152,7 +162,7 @@ class KobukiBaseNode(Node):
                     f'Gyro bias calibrated: {self._gyro_bias_dps:.4f} deg/s (robot must have been stationary)')
             return   # don't publish uncorrected samples during calibration
 
-        if self._stationary:
+        if self._stationary and self._cmd_vel_zero:
             self._gyro_bias_dps += GYRO_BIAS_EMA_ALPHA * (yaw_rate_dps - self._gyro_bias_dps)
 
         yaw_rate_dps -= self._gyro_bias_dps
@@ -184,7 +194,8 @@ class KobukiBaseNode(Node):
         """
         linear_x = msg.linear.x   # Forward/Backward speed (m/s)
         angular_z = msg.angular.z # Turning speed (rad/s)
-        
+        self._cmd_vel_zero = (linear_x == 0.0 and angular_z == 0.0)
+
         wheel_base = 0.230 # 23 cm wheel separation for Kobuki
         
         # Calculate left and right wheel speeds in mm/s
