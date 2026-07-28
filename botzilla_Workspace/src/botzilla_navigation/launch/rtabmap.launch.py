@@ -92,6 +92,21 @@ def generate_launch_description():
         'RGBD/ProximityBySpace': 'true',
         'RGBD/AngularUpdate': '0.3',
         'RGBD/LinearUpdate': '0.2',
+        # Turn-triggered ghost-map fix: RTAB-Map only processes one keyframe/second
+        # (Rate=1.00s fixed), so a turn at even a modest ~0.3 rad/s puts ~17 degrees
+        # between consecutive keyframes. Confirmed on hardware via --udebug logging
+        # (rtabmap_debug.launch.py) that this legitimately exceeds ICP's default
+        # sanity bounds during a real, correct turn — not a registration failure:
+        #   "libpointmatcher has failed: limit out of bounds: rot: 0.18/0.78 tr: 0.24/0.2"
+        #   "Cannot compute transform (cor=15 corrRatio=0.062/0.100 maxLaserScans=243)"
+        # -> "Odometry refining rejected", falling back to the raw unrefined odometry
+        # link between those two nodes instead of a properly ICP-registered one, which
+        # is what produced the wall duplication/ghosting after a turn. Widening these
+        # bounds lets legitimate large-turn corrections through without disabling the
+        # sanity check outright (it still rejects truly wild/divergent ICP results).
+        'Icp/MaxTranslation': '0.5',        # was default 0.2 — observed correction 0.244
+        'Icp/MaxRotation': '1.57',          # was default 0.78 (~45 deg) — now ~90 deg
+        'Icp/CorrespondenceRatio': '0.05',  # was default 0.1 — observed ratio 0.062
     }
 
     rtabmap_remappings = [
