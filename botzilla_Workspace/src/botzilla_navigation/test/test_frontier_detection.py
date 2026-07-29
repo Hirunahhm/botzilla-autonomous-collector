@@ -52,10 +52,38 @@ def test_single_frontier_cluster():
     clusters = find_frontiers(data, w, h, min_cluster_size=1)
     # Every free cell in row 2 borders an unknown cell in row 1 -> one connected cluster.
     assert len(clusters) == 1
-    centroid_row, centroid_col, size = clusters[0]
+    target_row, target_col, size = clusters[0]
     assert size == 4
-    assert centroid_row == 2.0
-    assert centroid_col == 1.5  # mean of 0,1,2,3
+    # Mean of the cluster is (2.0, 1.5); the nearest actual member cell to that mean
+    # is (2, 1) (tied with (2, 2), first one wins) — never a non-member/fractional point.
+    assert target_row == 2
+    assert target_col == 1
+
+
+def test_frontier_target_is_always_a_member_cell_for_l_shaped_cluster():
+    """Regression test: an L-shaped cluster's raw mean lands outside the cluster.
+
+    Before this fix, find_frontiers() returned the mean of all member cells as the
+    target. Here the 5 frontier cells trace an L down column 0 then across row 2:
+    (0,0),(1,0),(2,0),(2,1),(2,2). Their mean is (1.4, 0.6) — not a member of the
+    cluster at all, and it lands almost exactly on cell (1,1), which is UNKNOWN space
+    (not even free). Nav2 would be handed that as a goal every time this cluster shape
+    recurred, and exploration would stall on that spot. The target must always be one
+    of the cluster's own (free, in-cluster) member cells.
+    """
+    rows = [
+        [FREE, UNK, OCC, OCC],
+        [FREE, UNK, OCC, OCC],
+        [FREE, FREE, FREE, UNK],
+        [UNK, OCC, OCC, OCC],
+    ]
+    data, w, h = grid(rows, 4)
+    clusters = find_frontiers(data, w, h, min_cluster_size=1)
+    assert len(clusters) == 1
+    target_row, target_col, size = clusters[0]
+    member_cells = {(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)}
+    assert size == 5
+    assert (target_row, target_col) in member_cells
 
 
 def test_two_disconnected_clusters_not_merged():

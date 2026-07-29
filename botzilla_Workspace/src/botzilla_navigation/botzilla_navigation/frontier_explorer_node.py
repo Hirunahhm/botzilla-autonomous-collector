@@ -11,9 +11,33 @@ active). An in-flight Nav2 goal is never preempted for a newly-found target. Thi
 deliberate choice, not the literal "replan on every map update" a naive reading might
 suggest: this project's own Nav2 debugging (see PHASE_1_IMPLEMENTATION_PLAN.md's "DWB
 rotate-in-place stall" fix) found that repeatedly preempting/resending goals starves real
-progress, especially under the arena's low Gazebo real-time factor. Nav2's own recovery
-behaviors already handle a stuck/failed goal; this node's only job is deciding whether one
-is active.
+progress, especially under the arena's low Gazebo real-time factor.
+
+Reachability pre-check: before committing to a full NavigateToPose attempt (which can run
+for a long time — see "Stall watchdog" below), this node first asks Nav2's planner
+directly via ComputePathToPose whether ANY path to the target exists at all. That call
+typically resolves in well under a second. A target with NO_VALID_PATH (behind a wall the
+planner already knows about, outside the map, etc.) is skipped and blacklisted immediately
+instead of spending a full navigation attempt — and the stall/exponential-backoff cost —
+finding out the same thing the slow way. This does not replace the stall watchdog: a path
+existing at plan time doesn't guarantee the local controller can still execute it a moment
+later (dynamic obstacles, costmap changes mid-transit), so a real NavigateToPose attempt
+can still stall and still needs its own watchdog.
+
+Stall watchdog: this node does NOT rely solely on Nav2's own recovery behaviors to give
+up on a bad goal. A genuinely-unreachable target was observed live taking Nav2 ~300s to
+internally exhaust its recovery cycles and report ABORTED — for that entire time this
+node would otherwise sit doing nothing, which looks indistinguishable from "exploration
+is stuck" from the outside. But a FLAT timeout is the wrong tool here: a legitimate goal
+on the far side of a large arena can genuinely take a while, and canceling it early would
+throw away real progress. So the watchdog tracks the NavigateToPose feedback's
+distance_remaining and only intervenes when it stops decreasing (NO_PROGRESS_TIMEOUT_S of
+no meaningful improvement) — a robot that is actually driving toward its goal is never
+touched, however long that takes. GOAL_ABS_TIMEOUT_S is a separate, much longer backstop
+for the degenerate case where feedback never arrives at all, so the watchdog isn't fully
+dependent on the feedback channel working. Either trigger cancels the goal itself and
+treats it like any other non-SUCCEEDED result (blacklist + return to IDLE, see
+_result_cb).
 
 Evaluation is driven by a periodic timer (EVAL_PERIOD_S), not directly by /map arrival.
 /map only republishes when rtabmap's map actually changes, which itself only happens when
@@ -31,21 +55,27 @@ and since nothing about the map changes when a goal merely fails, the unfiltered
 frontier selection would just re-target the identical unreachable spot forever.
 
 The cooldown uses exponential backoff, not a flat duration: a single Nav2 attempt on a
-genuinely bad target was observed live to take ~300s to abort (multiple internal recovery
-cycles before giving up). A flat cooldown shorter than that doesn't work — with two
-persistently-bad frontiers A and B and a 90s flat cooldown, A fails and is banned for 90s,
-B is tried and takes ~300s to also fail, and by then A's 90s ban has long since expired —
-so the two just ping-pong forever, never giving the OTHER known-good frontiers a turn (this
-exact failure mode was observed live before this fix). BLACKLIST_COOLDOWN_BASE_S is set
-comfortably above that ~300s single-attempt latency, and repeated failures at the same
-spot (tracked persistently across cooldown expiries, not just within one active window)
-double the cooldown each time, up to BLACKLIST_COOLDOWN_MAX_S — so a truly unreachable
-frontier gets pushed out far enough to let the rest of the map be explored, while a
-one-off failure doesn't get penalized as harshly.
+genuinely bad target was observed live to take ~300s to abort on Nav2's own recovery
+timeline (multiple internal recovery cycles before giving up) before this node's own
+stall watchdog existed. BLACKLIST_COOLDOWN_BASE_S is sized against that ~300s figure
+rather than the (much shorter, in the common case) no-progress timeout, since a target
+can still fail via Nav2's own ABORTED before the watchdog ever gets a chance to fire, and
+the cooldown has to survive either path. A flat cooldown shorter than that doesn't work —
+with two persistently-bad frontiers A and B and a 90s flat cooldown, A fails and is banned
+for 90s, B is tried and takes up to ~300s to also fail, and by then A's 90s ban has long
+since expired — so the two just ping-pong forever, never giving the OTHER known-good
+frontiers a turn (this exact failure mode was observed live before this fix). Repeated
+failures at the same spot
+(tracked persistently across cooldown expiries, not just within one active window) double
+the cooldown each time, up to BLACKLIST_COOLDOWN_MAX_S — so a truly unreachable frontier
+gets pushed out far enough to let the rest of the map be explored, while a one-off failure
+doesn't get penalized as harshly.
 
 Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
+
+import math
 
 from action_msgs.msg import GoalStatus
 from botzilla_navigation.frontier_detection import (
@@ -54,7 +84,7 @@ from botzilla_navigation.frontier_detection import (
     grid_to_world,
     select_target,
 )
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.action import ActionClient
@@ -77,6 +107,17 @@ MIN_TARGET_DISTANCE_M = 0.3
 # sent. Independent of /map's own publish rate — see module docstring.
 EVAL_PERIOD_S = 2.0
 
+# Cancel the active goal if NavigateToPose's own distance_remaining feedback hasn't
+# improved by at least PROGRESS_EPSILON_M in this long — see module docstring's "Stall
+# watchdog" section. A goal making real progress, however slowly, is never touched.
+NO_PROGRESS_TIMEOUT_S = 30.0
+PROGRESS_EPSILON_M = 0.15
+
+# Absolute backstop regardless of the progress signal, for the degenerate case where
+# feedback never arrives at all. Set well above the ~300s worst-case Nav2-internal abort
+# latency observed live, so it only ever fires if the progress watchdog itself is broken.
+GOAL_ABS_TIMEOUT_S = 420.0
+
 # A target within this radius of a recently-failed target is treated as the same spot and
 # excluded until its cooldown expires (see module docstring).
 BLACKLIST_RADIUS_M = 0.5
@@ -92,6 +133,7 @@ ROBOT_FRAME = 'base_link'
 
 class State:
     IDLE = 'IDLE'
+    CHECKING_PATH = 'CHECKING_PATH'
     NAVIGATING = 'NAVIGATING'
     EXPLORATION_COMPLETE = 'EXPLORATION_COMPLETE'
 
@@ -104,6 +146,11 @@ class FrontierExplorerNode(Node):
         self._goal_handle = None
         self._latest_map = None
         self._current_target = None
+        self._pending_yaw = None  # yaw computed for the target currently under path-check
+        self._goal_start_time = None  # rclpy.time.Time when the active goal was sent
+        self._cancel_requested = False  # avoid re-issuing cancel_goal_async every tick
+        self._last_progress_distance = None  # smallest distance_remaining seen so far
+        self._last_progress_time = None  # rclpy.time.Time it was last improved
         self._blacklist = []  # list of (x, y, expiry_time: rclpy.time.Time) — active bans
         self._failure_history = []  # list of [x, y, count] — persists across cooldowns
 
@@ -120,6 +167,7 @@ class FrontierExplorerNode(Node):
         self._complete_pub = self.create_publisher(Bool, '/exploration_complete', complete_qos)
 
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
         self.create_timer(EVAL_PERIOD_S, self._evaluate)
 
@@ -138,9 +186,16 @@ class FrontierExplorerNode(Node):
     # ------------------------------------------------------------------ #
 
     def _evaluate(self):
-        if self._state != State.IDLE:
-            # Never preempt an in-flight goal, and nothing to do once exploration
-            # is complete — see module docstring.
+        if self._state == State.NAVIGATING:
+            # Never preempt an in-flight goal with a new target — see module
+            # docstring — but do enforce the stall watchdog against it.
+            self._check_stall()
+            return
+        if self._state == State.CHECKING_PATH:
+            # Reachability pre-check in flight for the current target; wait for its
+            # callback rather than picking a second candidate concurrently.
+            return
+        if self._state == State.EXPLORATION_COMPLETE:
             return
         if self._latest_map is None:
             return
@@ -183,7 +238,8 @@ class FrontierExplorerNode(Node):
         self.get_logger().info(
             f'{len(clusters)} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f})'
         )
-        self._send_goal(target[0], target[1])
+        yaw = math.atan2(target[1] - robot_y, target[0] - robot_x)
+        self._check_reachability(target[0], target[1], yaw)
 
     def _filter_blacklisted(self, frontiers_world):
         now = self.get_clock().now()
@@ -196,6 +252,42 @@ class FrontierExplorerNode(Node):
             )
 
         return [(x, y) for (x, y) in frontiers_world if not is_blacklisted(x, y)]
+
+    def _check_stall(self):
+        """Cancel the active goal if it stops making progress, or hits the absolute cap.
+
+        See module docstring's "Stall watchdog" section — this exists so a single bad
+        target can't leave exploration looking stuck for minutes while Nav2 works
+        through its own recovery cycles on its own timeline. A goal whose
+        distance_remaining keeps shrinking, however slowly, is never touched by the
+        no-progress check — only GOAL_ABS_TIMEOUT_S could ever cancel it, and only if
+        feedback stops arriving entirely.
+        """
+        if self._goal_start_time is None or self._cancel_requested:
+            return
+        now = self.get_clock().now()
+        elapsed_total_s = (now - self._goal_start_time).nanoseconds / 1e9
+        progress_since = self._last_progress_time or self._goal_start_time
+        elapsed_no_progress_s = (now - progress_since).nanoseconds / 1e9
+
+        stalled = elapsed_no_progress_s >= NO_PROGRESS_TIMEOUT_S
+        timed_out = elapsed_total_s >= GOAL_ABS_TIMEOUT_S
+        if not (stalled or timed_out):
+            return
+        if self._goal_handle is None:
+            # Goal accepted-callback hasn't landed yet; nothing to cancel yet, keep
+            # waiting rather than risk canceling a goal handle we don't have.
+            return
+        reason = (
+            f'no progress for {elapsed_no_progress_s:.0f}s' if stalled
+            else f'absolute {GOAL_ABS_TIMEOUT_S:.0f}s cap reached with no feedback'
+        )
+        self.get_logger().warn(
+            f'Goal to {self._current_target} stalled ({reason}); canceling instead of '
+            f'waiting on Nav2 to give up.'
+        )
+        self._goal_handle.cancel_goal_async()
+        self._cancel_requested = True
 
     def _blacklist_target(self, x, y):
         for entry in self._failure_history:
@@ -232,10 +324,71 @@ class FrontierExplorerNode(Node):
         return t.transform.translation.x, t.transform.translation.y
 
     # ------------------------------------------------------------------ #
+    # Nav2 ComputePathToPose action client — reachability pre-check
+    # ------------------------------------------------------------------ #
+
+    def _check_reachability(self, x, y, yaw):
+        if not self._path_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn('compute_path_to_pose action server not available yet.')
+            return
+
+        goal = ComputePathToPose.Goal()
+        goal.goal.header.frame_id = MAP_FRAME
+        goal.goal.header.stamp = self.get_clock().now().to_msg()
+        goal.goal.pose.position.x = x
+        goal.goal.pose.position.y = y
+        goal.goal.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.goal.pose.orientation.w = math.cos(yaw / 2.0)
+        goal.use_start = False  # plan from the robot's current pose
+
+        self._state = State.CHECKING_PATH
+        self._current_target = (x, y)
+        self._pending_yaw = yaw
+        send_future = self._path_client.send_goal_async(goal)
+        send_future.add_done_callback(self._path_goal_response_cb)
+
+    def _path_goal_response_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn(
+                'compute_path_to_pose goal rejected; will retry from scratch next tick.'
+            )
+            self._current_target = None
+            self._pending_yaw = None
+            self._state = State.IDLE
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._path_result_cb)
+
+    def _path_result_cb(self, future):
+        result = future.result()
+        reachable = (
+            result.status == GoalStatus.STATUS_SUCCEEDED
+            and result.result.error_code == ComputePathToPose.Result.NONE
+            and len(result.result.path.poses) > 0
+        )
+        x, y = self._current_target
+        if not reachable:
+            self.get_logger().info(
+                f'Target ({x:.2f}, {y:.2f}) has no valid path '
+                f'(error_code={result.result.error_code}); skipping without spending a '
+                f'full Nav2 attempt on it.'
+            )
+            self._blacklist_target(x, y)
+            self._current_target = None
+            self._pending_yaw = None
+            self._state = State.IDLE
+            return
+
+        yaw = self._pending_yaw
+        self._pending_yaw = None
+        self._send_goal(x, y, yaw)
+
+    # ------------------------------------------------------------------ #
     # Nav2 NavigateToPose action client
     # ------------------------------------------------------------------ #
 
-    def _send_goal(self, x, y):
+    def _send_goal(self, x, y, yaw):
         if not self._nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn('navigate_to_pose action server not available yet.')
             return
@@ -245,22 +398,40 @@ class FrontierExplorerNode(Node):
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
-        goal.pose.pose.orientation.w = 1.0
+        # Face the direction of approach (robot -> target) instead of a fixed heading,
+        # so Nav2 doesn't have to finish with an unnecessary rotate-in-place right at
+        # the frontier edge — the same maneuver that motivated the DWB rotate-in-place
+        # fix elsewhere in this project (see PHASE_1_IMPLEMENTATION_PLAN.md).
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self._state = State.NAVIGATING
         self._current_target = (x, y)
+        self._goal_start_time = self.get_clock().now()
+        self._cancel_requested = False
+        self._last_progress_distance = None
+        self._last_progress_time = None
         send_future = self._nav_client.send_goal_async(goal, feedback_callback=self._feedback_cb)
         send_future.add_done_callback(self._goal_response_cb)
 
     def _feedback_cb(self, feedback_msg):
         remaining = feedback_msg.feedback.distance_remaining
         self.get_logger().debug(f'distance_remaining={remaining:.2f}m', throttle_duration_sec=2.0)
+        if (
+            self._last_progress_distance is None
+            or remaining < self._last_progress_distance - PROGRESS_EPSILON_M
+        ):
+            self._last_progress_distance = remaining
+            self._last_progress_time = self.get_clock().now()
 
     def _goal_response_cb(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warn('Nav2 rejected the frontier goal.')
             self._state = State.IDLE
+            self._goal_start_time = None
+            self._last_progress_distance = None
+            self._last_progress_time = None
             return
         self._goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
@@ -281,6 +452,10 @@ class FrontierExplorerNode(Node):
 
         self._current_target = None
         self._goal_handle = None
+        self._goal_start_time = None
+        self._cancel_requested = False
+        self._last_progress_distance = None
+        self._last_progress_time = None
         self._state = State.IDLE
 
 

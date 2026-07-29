@@ -30,9 +30,17 @@ def _is_unknown(value):
 def find_frontiers(data, width, height, min_cluster_size=4):
     """Find frontier clusters: connected groups of free cells that border unknown space.
 
-    Returns a list of (centroid_row, centroid_col, cell_count) tuples, one per cluster,
-    in grid-cell coordinates (not world coordinates — see grid_to_world). Clusters smaller
-    than min_cluster_size are discarded as noise (isolated frontier cells at map edges).
+    Returns a list of (row, col, cell_count) tuples, one per cluster, in grid-cell
+    coordinates (not world coordinates — see grid_to_world). Clusters smaller than
+    min_cluster_size are discarded as noise (isolated frontier cells at map edges).
+
+    row/col is the cluster's actual member cell nearest its centroid, NOT the raw mean
+    position. The mean of a non-convex cluster (an L-shape, a cluster that wraps a
+    corner or a pillar) can land outside the cluster entirely — sometimes on a
+    non-free or unknown cell — which sends Nav2 an unreachable goal every time that
+    cluster shape recurs, and exploration stalls on that spot until it blacklists.
+    Snapping to the nearest real member cell guarantees the target is always an
+    actual free, in-cluster cell.
     """
     def idx(r, c):
         return r * width + c
@@ -73,7 +81,10 @@ def find_frontiers(data, width, height, min_cluster_size=4):
             if len(cells) >= min_cluster_size:
                 mean_r = sum(p[0] for p in cells) / len(cells)
                 mean_c = sum(p[1] for p in cells) / len(cells)
-                clusters.append((mean_r, mean_c, len(cells)))
+                target_r, target_c = min(
+                    cells, key=lambda p: (p[0] - mean_r) ** 2 + (p[1] - mean_c) ** 2
+                )
+                clusters.append((target_r, target_c, len(cells)))
 
     return clusters
 
