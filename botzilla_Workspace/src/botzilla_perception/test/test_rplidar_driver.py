@@ -88,13 +88,35 @@ def _point(angle_deg, distance_mm, valid=True):
 
 
 def test_bin_scan_points_places_points_in_correct_bins():
+    # The RPLIDAR's angle_deg increases CLOCKWISE; a LaserScan bin index increases
+    # COUNTER-CLOCKWISE (REP-103), so the angle is negated when binning.
+    # 4 bins => 90 deg each. RPLIDAR 10 deg CW  == bearing -10 deg == 350 deg CCW -> bin 3.
+    #                        RPLIDAR 100 deg CW == bearing -100 deg == 260 deg CCW -> bin 2.
     points = [_point(10.0, 1000.0), _point(100.0, 2000.0)]
     ranges, intensities = bin_scan_points(
         points, num_samples=4, range_min_m=0.05, range_max_m=25.0,
     )
-    assert ranges == [1.0, 2.0, float('inf'), float('inf')]
-    assert intensities[0] == 10.0
-    assert intensities[1] == 10.0
+    assert ranges == [float('inf'), float('inf'), 2.0, 1.0]
+    assert intensities[3] == 10.0
+    assert intensities[2] == 10.0
+
+
+def test_bin_scan_points_is_not_mirrored():
+    """Regression test: a point to the robot's RIGHT must land in the lower half.
+
+    Binning the RPLIDAR's clockwise angle directly published a mirror image of the
+    room. That is invisible while stationary, but during a turn the mirrored pattern
+    rotates WITH the robot instead of against it, so walls sweep at twice the turn
+    rate and the occupancy grid fills with rotated duplicate walls.
+    """
+    n = 360  # 1 deg per bin, so bin index == bearing in degrees CCW
+    # RPLIDAR 90 deg (clockwise) is physically to the robot's RIGHT.
+    # In ROS that is bearing -90 deg == 270 deg CCW.
+    ranges, _ = bin_scan_points(
+        [_point(90.0, 1000.0)], num_samples=n, range_min_m=0.05, range_max_m=25.0,
+    )
+    assert ranges[270] == 1.0, 'point to the right must bin at 270 deg CCW'
+    assert ranges[90] == float('inf'), 'binning at +90 deg would mean a mirrored scan'
 
 
 def test_bin_scan_points_ignores_invalid_points():
@@ -116,9 +138,10 @@ def test_bin_scan_points_ignores_out_of_range():
 
 
 def test_bin_scan_points_closest_point_wins_within_a_bin():
+    # Both 10 and 20 deg CW fall in the same 90 deg bin (bin 3, see binning test above).
     points = [_point(10.0, 1500.0), _point(20.0, 1200.0)]
     ranges, _ = bin_scan_points(points, num_samples=4, range_min_m=0.05, range_max_m=25.0)
-    assert ranges[0] == 1.2
+    assert ranges[3] == 1.2
 
 
 def test_bin_scan_points_empty_input_returns_all_inf():

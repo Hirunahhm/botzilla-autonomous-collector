@@ -85,11 +85,10 @@ def generate_launch_description():
         'RGBD/ProximityBySpace': 'true',
         'RGBD/AngularUpdate': '0.3',
         'RGBD/LinearUpdate': '0.2',
-        # See rtabmap.launch.py's comment — same turn-triggered ghost-map fix, kept in
-        # sync here since this file is what captured the evidence for it.
-        'Icp/MaxTranslation': '0.5',
-        'Icp/MaxRotation': '1.57',
-        'Icp/CorrespondenceRatio': '0.05',
+        # Kept in sync with rtabmap.launch.py — see its comment for why the ICP bounds
+        # are back at their defaults (the poor correspondence that motivated widening
+        # them was a symptom of the sensor timestamp bug, now fixed at the source).
+        'Rtabmap/DetectionRate': '2',
     }
 
     rtabmap_remappings = [

@@ -16,12 +16,18 @@ unit was separately verified fault-free on a laptop, ruling out both a bad devic
 Jetson USB power problem — the fault is isolated to that package's scan-start sequence.
 """
 from collections import namedtuple
+import math
 import time
 
 import serial
 
 DEFAULT_PORT = '/dev/ttyUSB0'
 DEFAULT_BAUD = 460800
+
+# Longest gap between complete scan packets tolerated before iter_scans() gives up and
+# raises, so the caller can reconnect (which resyncs via CMD_STOP + buffer flush).
+# The C1 streams ~3300 packets/s when healthy, so seconds of silence is never normal.
+DATA_TIMEOUT_S = 5.0
 
 CMD_STOP = bytes([0xA5, 0x25])
 CMD_SCAN = bytes([0xA5, 0x20])
@@ -90,10 +96,20 @@ def bin_scan_points(points, num_samples, range_min_m, range_max_m):
     """
     Bin ScanPoints spanning ~one revolution into a fixed-size (ranges, intensities) pair.
 
-    Bin i covers the angle range [i, i+1) * 360/num_samples degrees. A bin with no
-    valid in-range point is left as float('inf') (REP-117: no obstacle detected),
-    matching what Nav2/RTAB-Map expect from sensor_msgs/LaserScan. When multiple
-    points land in the same bin, the closest one wins.
+    Bin i corresponds to bearing +i * 360/num_samples degrees COUNTER-CLOCKWISE, which
+    is what a LaserScan published with angle_min=0 and a positive angle_increment means
+    under REP-103. A bin with no valid in-range point is left as float('inf')
+    (REP-117: no obstacle detected), matching what Nav2/RTAB-Map expect from
+    sensor_msgs/LaserScan. When multiple points land in the same bin, the closest wins.
+
+    The RPLIDAR reports angle_deg increasing CLOCKWISE, so it is negated here. Binning
+    it directly (the original behaviour) published a mirror image of the room: harmless
+    while stationary, but during a turn the mirrored pattern rotates the SAME way as the
+    robot instead of opposite to it, so after the TF rotation is applied the walls sweep
+    at twice the turn rate. Measured on this hardware before the fix: transforming two
+    scans 20.2 deg apart into the odom frame left a -42.0 deg residual, i.e. -2x the
+    rotation, which is the signature of a sign-flipped scan angle. That is what drew the
+    rotating "fan" of duplicated walls in the occupancy grid.
     """
     ranges = [float('inf')] * num_samples
     intensities = [0.0] * num_samples
@@ -105,7 +121,9 @@ def bin_scan_points(points, num_samples, range_min_m, range_max_m):
         distance_m = p.distance_mm / 1000.0
         if distance_m < range_min_m or distance_m > range_max_m:
             continue
-        i = int(p.angle_deg / bin_width_deg) % num_samples
+        # floor(), not int(): int() truncates toward zero, which would fold negative
+        # angles onto the wrong bin either side of 0.
+        i = int(math.floor(-p.angle_deg / bin_width_deg)) % num_samples
         if distance_m < ranges[i]:
             ranges[i] = distance_m
             intensities[i] = float(p.quality)
@@ -173,17 +191,32 @@ class RPLidar:
         self._ser.dtr = True
 
     def iter_scans(self):
-        """Start scanning; yield ScanPoints until stop_scan() is called."""
+        """Start scanning; yield ScanPoints until stop_scan() is called.
+
+        Raises RPLidarError if no complete packet arrives for DATA_TIMEOUT_S. Without
+        that check a device which accepted CMD_SCAN but then stopped streaming (motor
+        not spinning, or the link left mid-stream by an unclean shutdown) makes this
+        loop spin on read timeouts forever: no data, no exception, so the caller's
+        reconnect path never runs and the node hangs silently with /scan simply absent.
+        """
         self._ser.reset_input_buffer()
         self._ser.write(CMD_SCAN)
         self._ser.flush()
         self._read_descriptor()
         self._scanning = True
 
+        last_packet_at = time.monotonic()
         while self._scanning:
             packet = self._ser.read(5)
             if len(packet) < 5:
+                stalled_for = time.monotonic() - last_packet_at
+                if stalled_for > DATA_TIMEOUT_S:
+                    raise RPLidarError(
+                        f'no scan data for {stalled_for:.1f}s after CMD_SCAN — '
+                        f'device stalled or stream desynchronised'
+                    )
                 continue
+            last_packet_at = time.monotonic()
             yield parse_scan_point(packet)
 
     def stop_scan(self):

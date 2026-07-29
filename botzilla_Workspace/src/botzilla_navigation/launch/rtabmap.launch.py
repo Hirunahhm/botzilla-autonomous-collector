@@ -19,6 +19,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -43,9 +44,23 @@ def generate_launch_description():
         ),
     )
 
+    grid_sensor_arg = DeclareLaunchArgument(
+        'grid_sensor',
+        default_value='2',
+        description=(
+            'Which sensor builds the occupancy grid: 0=laser scan only, 1=depth camera '
+            'only, 2=both. Exposed as an argument so the depth camera can be isolated '
+            'from the grid without editing this file — the depth contribution is a '
+            'prime suspect whenever obstacles appear to sweep around with the robot, '
+            'since with Grid/NormalsSegmentation=false the ground/obstacle split is '
+            'purely by height and a camera pose error paints the floor as a wall.'
+        ),
+    )
+
     use_sim_time = LaunchConfiguration('use_sim_time')
     delete_db_on_start = LaunchConfiguration('delete_db_on_start')
     depth_topic = LaunchConfiguration('depth_topic')
+    grid_sensor = LaunchConfiguration('grid_sensor')
 
     rtabmap_args = PythonExpression([
         "'--delete_db_on_start' if '", delete_db_on_start, "' == 'true' else ''"
@@ -75,7 +90,9 @@ def generate_launch_description():
         'Reg/Strategy': '1',       # ICP + Visual (best obstacle avoidance + loop closure)
         'Reg/Force3DoF': 'true',   # ground robot: x, y, yaw only
         'Grid/RangeMax': '10.0',
-        'Grid/Sensor': '2',        # both laser + depth for 3D point cloud
+        # value_type=str is required: RTAB-Map's own parameters are all strings, but a
+        # bare LaunchConfiguration substitution would be auto-typed as an integer here.
+        'Grid/Sensor': ParameterValue(grid_sensor, value_type=str),
         # Ghost-map hardening (overlapping/smeared occupancy layers during arcs):
         'Grid/RayTracing': 'true',           # clear free cells along each beam so stale marks
                                              # from earlier poses don't persist as extra layers
@@ -92,21 +109,28 @@ def generate_launch_description():
         'RGBD/ProximityBySpace': 'true',
         'RGBD/AngularUpdate': '0.3',
         'RGBD/LinearUpdate': '0.2',
-        # Turn-triggered ghost-map fix: RTAB-Map only processes one keyframe/second
-        # (Rate=1.00s fixed), so a turn at even a modest ~0.3 rad/s puts ~17 degrees
-        # between consecutive keyframes. Confirmed on hardware via --udebug logging
-        # (rtabmap_debug.launch.py) that this legitimately exceeds ICP's default
-        # sanity bounds during a real, correct turn — not a registration failure:
-        #   "libpointmatcher has failed: limit out of bounds: rot: 0.18/0.78 tr: 0.24/0.2"
-        #   "Cannot compute transform (cor=15 corrRatio=0.062/0.100 maxLaserScans=243)"
-        # -> "Odometry refining rejected", falling back to the raw unrefined odometry
-        # link between those two nodes instead of a properly ICP-registered one, which
-        # is what produced the wall duplication/ghosting after a turn. Widening these
-        # bounds lets legitimate large-turn corrections through without disabling the
-        # sanity check outright (it still rejects truly wild/divergent ICP results).
-        'Icp/MaxTranslation': '0.5',        # was default 0.2 — observed correction 0.244
-        'Icp/MaxRotation': '1.57',          # was default 0.78 (~45 deg) — now ~90 deg
-        'Icp/CorrespondenceRatio': '0.05',  # was default 0.1 — observed ratio 0.062
+        # Ghosting during turns traced (by measurement, not guesswork) to sensor
+        # timestamping, NOT to registration tuning: rplidar_node and kinect_bridge both
+        # stamped messages at publish time rather than capture time, so every scan
+        # claimed to be ~115ms newer than its own data. Consumers resolved TF at that
+        # later time and transformed the scan by a pose the robot only reached
+        # afterwards — during a 0.4 rad/s turn that is ~2.7 deg, ~24cm of wall
+        # displacement at 5m, drawn as a second wall. Both nodes now stamp at capture.
+        #
+        # ICP bounds are deliberately left at their defaults. They were widened here
+        # earlier in response to "Cannot compute transform (corrRatio=0.062/0.100)" —
+        # but that poor correspondence was itself a symptom of the timestamp bug
+        # misaligning consecutive scans. Loosening them treated the symptom and made
+        # things worse: it let a spurious neighbor-link "correction" through with
+        # falsely high confidence (odometry said ~0.0002m of motion, ICP claimed 0.163m
+        # at variance=0.00016), which propagated straight into a bad map correction.
+        # The defaults' rejection is the safe failure mode — it falls back to raw
+        # odometry rather than corrupting the graph.
+        #
+        # Halving the inter-keyframe interval is kept: it genuinely reduces how far the
+        # robot moves between processed frames, so the correct alignment stays the clear
+        # ICP minimum rather than one of several plausible ones in a symmetric room.
+        'Rtabmap/DetectionRate': '2',  # was default 1 (Hz)
     }
 
     rtabmap_remappings = [
@@ -131,5 +155,6 @@ def generate_launch_description():
         use_sim_time_arg,
         delete_db_on_start_arg,
         depth_topic_arg,
+        grid_sensor_arg,
         rtabmap_node,
     ])

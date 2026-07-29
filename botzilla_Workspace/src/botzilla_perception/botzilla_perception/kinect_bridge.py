@@ -86,6 +86,14 @@ class KinectBridge(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_depth_meters = None
+        # Capture time of the frame currently held in latest_*. Recorded in the freenect
+        # callback (when the frame actually arrives), NOT in publish_frames() — stamping
+        # at publish time puts the frame up to a full timer period (33ms) in the future
+        # relative to its own data, so TF-consuming nodes transform it by a pose the
+        # robot only reached afterwards. During a turn that smears the cloud in the map,
+        # the same way the lidar's publish-time stamping did (see rplidar_node.py).
+        self.latest_rgb_stamp = None
+        self.latest_depth_stamp = None
         self.new_rgb_available = False
         self.new_depth_available = False
         self._frames_received = 0
@@ -100,6 +108,7 @@ class KinectBridge(Node):
 
     def video_cb(self, dev, data, timestamp):
         self.latest_rgb = data.tobytes()
+        self.latest_rgb_stamp = self.get_clock().now()
         self.new_rgb_available = True
         self._frames_received += 1
 
@@ -114,6 +123,7 @@ class KinectBridge(Node):
         scaled = (data.astype(np.float32) / 2047.0 * 255.0).astype(np.uint8)
         self.latest_depth = scaled.tobytes()
         self.latest_depth_meters = _disparity_to_meters(data).tobytes()
+        self.latest_depth_stamp = self.get_clock().now()
         self.new_depth_available = True
 
     def run_camera_loop(self):
@@ -148,7 +158,9 @@ class KinectBridge(Node):
 
     def publish_frames(self):
         if self.new_rgb_available:
-            stamp = self.get_clock().now().to_msg()
+            if self.latest_rgb_stamp is None:
+                return
+            stamp = self.latest_rgb_stamp.to_msg()
 
             # camera_info is gated on its own subscriber count, independent of
             # whether the image topic itself currently has one — a consumer
@@ -171,7 +183,9 @@ class KinectBridge(Node):
             self.new_rgb_available = False
 
         if self.new_depth_available:
-            stamp = self.get_clock().now().to_msg()
+            if self.latest_depth_stamp is None:
+                return
+            stamp = self.latest_depth_stamp.to_msg()
 
             if self.publisher_depth.get_subscription_count() > 0:
                 msg = Image()
