@@ -20,7 +20,7 @@
 
 bt_navigator:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom
@@ -33,7 +33,7 @@ bt_navigator:
 
 controller_server:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
@@ -106,18 +106,27 @@ controller_server:
 
 planner_server:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     expected_planner_frequency: 20.0
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner::NavfnPlanner"
       tolerance: 0.5
       use_astar: false
-      allow_unknown: true
+      # true -> false: NavFn treated UNKNOWN cells as traversable and produced
+      # confident paths straight through never-sensed territory. During frontier
+      # exploration every target sits ~half-surrounded by unknown (measured: a
+      # 5x5 window around three live targets held 6/12/11 unknown cells), so the
+      # planner routed through the unexplored side, the robot drove in, hit
+      # something the map didn't know about, and the no-progress watchdog
+      # cancelled 32s later. 5 consecutive targets were blacklisted this way.
+      # With false, an unreachable-through-known-space target is rejected
+      # instantly by the explorer's compute_path_to_pose pre-check instead.
+      allow_unknown: false
 
 behavior_server:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
     local_footprint_topic: local_costmap/published_footprint
@@ -141,33 +150,27 @@ behavior_server:
     min_rotational_vel: 0.2
     rotational_acc_lim: 0.8
 
-velocity_smoother:
-  ros__parameters:
-    use_sim_time: True
-    smoothing_frequency: 20.0
-    scale_velocities: False
-    feedback: "OPEN_LOOP"
-    max_velocity: [0.2, 0.0, 0.4]
-    min_velocity: [0.0, 0.0, -0.4]
-    max_accel: [0.4, 0.0, 0.8]
-    max_decel: [-0.4, 0.0, -0.8]
-    odom_topic: "odom"
-    odom_duration: 0.1
-    deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 1.0
+# velocity_smoother was removed from nav2.launch.py — see that file's docstring.
+# It silently stopped republishing cmd_vel_nav -> cmd_vel on hardware while
+# reporting itself active, stalling every goal. controller_server now publishes
+# straight to /cmd_vel; DWB's own acc_lim_*/max_vel_* above bound the output.
 
 local_costmap:
   local_costmap:
     ros__parameters:
-      use_sim_time: True
+      use_sim_time: False
       update_frequency: 5.0
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
       transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
       rolling_window: true
-      width: 3
-      height: 3
+      # 3x3 -> 5x5: with a 3m window (1.5m each side) DWB rejected 52% of its
+      # sampled trajectories as "BaseObstacle/Trajectory Goes Off Grid" — the
+      # window was too small for the trajectories it samples, so legal paths
+      # were discarded for leaving the map rather than for hitting anything.
+      width: 5
+      height: 5
       resolution: 0.05
       footprint: "[[0.26, 0.09], [0.0, 0.17], [-0.17, 0.10], [-0.17, -0.10], [0.0, -0.17], [0.26, -0.09]]"
       plugins: ["voxel_layer", "inflation_layer"]
@@ -191,7 +194,14 @@ local_costmap:
         z_voxels: 16
         max_obstacle_height: 2.0
         mark_threshold: 0
-        observation_sources: scan
+        # Two sources: the RPLIDAR sees one horizontal plane only, so anything
+        # above or below it (desk edges, table tops, low sills) was invisible to
+        # DWB and the robot drove into it. The depth cloud fills that gap.
+        # NOTE: Grid/Sensor on rtabmap.launch.py does NOT affect this — that
+        # parameter only changes rtabmap's /map, which feeds the *global*
+        # costmap's static_layer. This voxel_layer is the only obstacle input
+        # the local controller has.
+        observation_sources: scan pointcloud
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -202,6 +212,25 @@ local_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+        pointcloud:
+          # Sim: bridged from Gazebo's rgbd_camera (simulation.launch.py).
+          # Hardware: needs a depth_image_proc point-cloud node — kinect_bridge
+          # publishes depth as an Image, not a PointCloud2. Not wired up yet.
+          topic: /camera/points
+          data_type: "PointCloud2"
+          clearing: True
+          marking: True
+          # Floor points would otherwise be marked as obstacles and box the robot
+          # in; 0.08 clears the floor, 0.60 matches rtabmap's Grid/MaxObstacleHeight.
+          min_obstacle_height: 0.08
+          max_obstacle_height: 0.60
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          # Kinect returns nothing usable closer than ~0.55m on hardware
+          # (KINECT_MIN_RANGE_M in kinect_bridge.py / yolo_node.py); the sim
+          # camera's near clip is 0.1. 0.30 is a compromise — revisit on hardware.
+          obstacle_min_range: 0.30
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
@@ -210,7 +239,7 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
-      use_sim_time: True
+      use_sim_time: False
       update_frequency: 1.0
       publish_frequency: 1.0
       global_frame: map

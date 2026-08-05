@@ -7,18 +7,23 @@ publishing /map + map->odom TF — this file does not launch SLAM/localization).
 
 A slim, hand-picked subset of nav2_bringup's navigation_launch.py — only the
 nodes actually needed for a single NavigateToPose goal: controller_server,
-planner_server, behavior_server, bt_navigator, velocity_smoother. Skips
+planner_server, behavior_server, bt_navigator. Skips
 route_server/collision_monitor/docking_server/smoother_server/waypoint_follower,
 which navigation_launch.py always brings up regardless of whether they're
 configured or needed, adding failure surface (e.g. route_server expects a
 routing graph file we don't have) for no benefit at this milestone.
 
-cmd_vel chain: controller_server/behavior_server publish on 'cmd_vel_nav' ->
-velocity_smoother subscribes 'cmd_vel_nav', publishes smoothed output on plain
-'cmd_vel' (its default output topic 'cmd_vel_smoothed' is remapped here since
-we don't run collision_monitor, which normally does that final relay).
+cmd_vel chain: controller_server/behavior_server publish directly on plain
+'cmd_vel', which kobuki_base_node consumes. velocity_smoother used to sit in
+between ('cmd_vel_nav' -> 'cmd_vel') but was removed: on hardware it silently
+stopped republishing anything — controller_server kept publishing to
+'cmd_vel_nav' while '/cmd_vel' had no publisher at all, with the node reporting
+lifecycle state active and logging no error, so every navigation goal stalled.
+The smoother is optional (DWB's own accel limits in nav2_params.yaml already
+bound the output); if smoothing is wanted later, do it in a node we own and can
+instrument rather than reintroducing a silent failure point.
 
-Usage:
+Usage (hardware is the default; pass use_sim_time:=true for Gazebo):
   ros2 launch botzilla_navigation nav2.launch.py
 """
 
@@ -36,8 +41,12 @@ def generate_launch_description():
 
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
-        default_value='true',
-        description='Use simulation (Gazebo) clock',
+        default_value='false',
+        description=(
+            'Use simulation (Gazebo) clock. Defaults false: on hardware nothing publishes '
+            '/clock, so a stray true freezes ROS time and every wall-timer-driven Nav2 node '
+            'silently stops firing with no error logged.'
+        ),
     )
     params_file_arg = DeclareLaunchArgument(
         'params_file',
@@ -59,7 +68,6 @@ def generate_launch_description():
         'planner_server',
         'behavior_server',
         'bt_navigator',
-        'velocity_smoother',
     ]
 
     controller_server = Node(
@@ -68,7 +76,6 @@ def generate_launch_description():
         name='controller_server',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
 
     planner_server = Node(
@@ -85,7 +92,6 @@ def generate_launch_description():
         name='behavior_server',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
 
     bt_navigator = Node(
@@ -94,15 +100,6 @@ def generate_launch_description():
         name='bt_navigator',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-    )
-
-    velocity_smoother = Node(
-        package='nav2_velocity_smoother',
-        executable='velocity_smoother',
-        name='velocity_smoother',
-        output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-        remappings=[('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'cmd_vel')],
     )
 
     lifecycle_manager = Node(
@@ -125,6 +122,5 @@ def generate_launch_description():
         planner_server,
         behavior_server,
         bt_navigator,
-        velocity_smoother,
         lifecycle_manager,
     ])
