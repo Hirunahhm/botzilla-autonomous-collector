@@ -116,6 +116,11 @@ def generate_launch_description():
             '/camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
             # Depth image
             '/camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+            # Depth point cloud — the rgbd_camera sensor publishes this natively.
+            # Bridged so local_costmap's voxel_layer can mark obstacles the 2D
+            # lidar plane misses entirely (desk edges, table legs, anything above
+            # or below the single scan plane). See nav2_params.yaml voxel_layer.
+            '/camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
             # Camera info
             '/camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
             # cmd_vel (ROS2 → Gazebo)
