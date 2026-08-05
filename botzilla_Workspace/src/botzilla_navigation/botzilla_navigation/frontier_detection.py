@@ -18,6 +18,17 @@ import math
 
 OCCUPIED_THRESHOLD = 65
 
+# 8-connectivity: two frontier cells touching only diagonally (e.g. tracing around a
+# corner or a pillar) still count as adjacent, both for "does this free cell border
+# unknown space" and for clustering. With 4-connectivity only, a diagonal-only pair
+# gets split into two separate 1-cell clusters and both can be silently discarded as
+# noise (min_cluster_size) even though combined they'd clear it.
+_NEIGHBORS_8 = (
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1),           (0, 1),
+    (1, -1),  (1, 0),  (1, 1),
+)
+
 
 def _is_free(value):
     return 0 <= value < OCCUPIED_THRESHOLD
@@ -51,7 +62,7 @@ def find_frontiers(data, width, height, min_cluster_size=4):
             i = idx(r, c)
             if not _is_free(data[i]):
                 continue
-            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            for dr, dc in _NEIGHBORS_8:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < height and 0 <= nc < width and _is_unknown(data[idx(nr, nc)]):
                     frontier_mask[i] = True
@@ -64,14 +75,14 @@ def find_frontiers(data, width, height, min_cluster_size=4):
             i = idx(r, c)
             if not frontier_mask[i] or visited[i]:
                 continue
-            # Flood-fill this cluster (4-connectivity).
+            # Flood-fill this cluster (8-connectivity).
             stack = [(r, c)]
             visited[i] = True
             cells = []
             while stack:
                 cr, cc = stack.pop()
                 cells.append((cr, cc))
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                for dr, dc in _NEIGHBORS_8:
                     nr, nc = cr + dr, cc + dc
                     if 0 <= nr < height and 0 <= nc < width:
                         ni = idx(nr, nc)

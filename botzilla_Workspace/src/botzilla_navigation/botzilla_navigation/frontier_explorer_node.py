@@ -39,6 +39,21 @@ dependent on the feedback channel working. Either trigger cancels the goal itsel
 treats it like any other non-SUCCEEDED result (blacklist + return to IDLE, see
 _result_cb).
 
+Both action clients (compute_path_to_pose and navigate_to_pose) go through the same
+unaccepted-goal gap: their done-callback is normally near-instant, but if the action
+server dies or is unresponsive mid-handshake (observed live on this hardware — Nav2's
+servers took 90+s to even become responsive under CPU load), that callback may never
+fire at all, leaving no goal_handle to cancel and no feedback channel to watch. Both
+_check_stall (NAVIGATING) and _check_path_stall (CHECKING_PATH) bound this case
+directly against elapsed time since the request was sent, independent of ever getting a
+handle. Giving up this way opens a narrow race: the real done-callback can still land
+afterward, past the point this node already moved on to a different target. A per-attempt
+epoch counter (_goal_epoch / _path_epoch) lets _goal_response_cb / _path_goal_response_cb
+recognize a callback that belongs to an attempt this node already abandoned; if that
+stale response turns out to have been accepted after all, it's canceled as an orphan
+instead of silently overwriting newer state or leaving the robot executing a goal this
+node no longer tracks or can blacklist.
+
 Evaluation is driven by a periodic timer (EVAL_PERIOD_S), not directly by /map arrival.
 /map only republishes when rtabmap's map actually changes, which itself only happens when
 the robot moves — so reacting solely to new messages creates a deadlock if the very first
@@ -116,7 +131,16 @@ PROGRESS_EPSILON_M = 0.15
 # Absolute backstop regardless of the progress signal, for the degenerate case where
 # feedback never arrives at all. Set well above the ~300s worst-case Nav2-internal abort
 # latency observed live, so it only ever fires if the progress watchdog itself is broken.
+# Also used to bound a NavigateToPose goal that never gets accepted/rejected at all (no
+# goal_handle ever arrives) — see module docstring.
 GOAL_ABS_TIMEOUT_S = 420.0
+
+# How long to wait for a compute_path_to_pose response before giving up on the
+# reachability check directly. Reachability checks normally resolve in well under a
+# second (see module docstring) — this is a generous backstop against the exchange
+# itself hanging (the planner's action server unresponsive under CPU load), not a
+# tolerance for legitimately slow planning, hence far shorter than GOAL_ABS_TIMEOUT_S.
+PATH_CHECK_TIMEOUT_S = 15.0
 
 # A target within this radius of a recently-failed target is treated as the same spot and
 # excluded until its cooldown expires (see module docstring).
@@ -147,7 +171,10 @@ class FrontierExplorerNode(Node):
         self._latest_map = None
         self._current_target = None
         self._pending_yaw = None  # yaw computed for the target currently under path-check
+        self._path_check_start_time = None  # rclpy.time.Time the path-check was sent
+        self._path_epoch = 0  # bumped per path-check attempt; guards stale callbacks
         self._goal_start_time = None  # rclpy.time.Time when the active goal was sent
+        self._goal_epoch = 0  # bumped per NavigateToPose attempt; guards stale callbacks
         self._cancel_requested = False  # avoid re-issuing cancel_goal_async every tick
         self._last_progress_distance = None  # smallest distance_remaining seen so far
         self._last_progress_time = None  # rclpy.time.Time it was last improved
@@ -186,6 +213,12 @@ class FrontierExplorerNode(Node):
     # ------------------------------------------------------------------ #
 
     def _evaluate(self):
+        self.get_logger().info(
+            f'[heartbeat] state={self._state} target={self._current_target} '
+            f'blacklist_active={len(self._blacklist)} '
+            f'blacklist_known={len(self._failure_history)}',
+            throttle_duration_sec=5.0,
+        )
         if self._state == State.NAVIGATING:
             # Never preempt an in-flight goal with a new target — see module
             # docstring — but do enforce the stall watchdog against it.
@@ -193,11 +226,15 @@ class FrontierExplorerNode(Node):
             return
         if self._state == State.CHECKING_PATH:
             # Reachability pre-check in flight for the current target; wait for its
-            # callback rather than picking a second candidate concurrently.
+            # callback rather than picking a second candidate concurrently, but bound
+            # how long we wait — see _check_path_stall.
+            self._check_path_stall()
             return
         if self._state == State.EXPLORATION_COMPLETE:
             return
         if self._latest_map is None:
+            self.get_logger().info('Still waiting for the first /map message.',
+                                    throttle_duration_sec=5.0)
             return
 
         msg = self._latest_map
@@ -209,6 +246,11 @@ class FrontierExplorerNode(Node):
 
         clusters = find_frontiers(
             msg.data, msg.info.width, msg.info.height, MIN_FRONTIER_CLUSTER_SIZE
+        )
+        self.get_logger().info(
+            f'/map is {msg.info.width}x{msg.info.height} @ {msg.info.resolution:.3f}m/cell, '
+            f'{len(clusters)} frontier cluster(s) found this tick.',
+            throttle_duration_sec=5.0,
         )
         frontiers_world = [
             grid_to_world(r, c, msg.info.resolution,
@@ -267,16 +309,36 @@ class FrontierExplorerNode(Node):
             return
         now = self.get_clock().now()
         elapsed_total_s = (now - self._goal_start_time).nanoseconds / 1e9
+
+        if self._goal_handle is None:
+            # send_goal_async's done-callback hasn't landed yet. Normally near-
+            # instant, but if the action server dies or is unresponsive mid-handshake
+            # it may never land at all — there's no goal_handle to cancel in that
+            # case, so the only way out is to give up on this attempt directly rather
+            # than wait on a callback that may never fire. See module docstring.
+            if elapsed_total_s < GOAL_ABS_TIMEOUT_S:
+                return
+            self.get_logger().warn(
+                f'Goal to {self._current_target} was never accepted or rejected '
+                f'within {GOAL_ABS_TIMEOUT_S:.0f}s; giving up on it directly.'
+            )
+            self._goal_epoch += 1  # invalidate a late-arriving response, see docstring
+            if self._current_target is not None:
+                x, y = self._current_target
+                self._blacklist_target(x, y)
+            self._current_target = None
+            self._goal_start_time = None
+            self._last_progress_distance = None
+            self._last_progress_time = None
+            self._state = State.IDLE
+            return
+
         progress_since = self._last_progress_time or self._goal_start_time
         elapsed_no_progress_s = (now - progress_since).nanoseconds / 1e9
 
         stalled = elapsed_no_progress_s >= NO_PROGRESS_TIMEOUT_S
         timed_out = elapsed_total_s >= GOAL_ABS_TIMEOUT_S
         if not (stalled or timed_out):
-            return
-        if self._goal_handle is None:
-            # Goal accepted-callback hasn't landed yet; nothing to cancel yet, keep
-            # waiting rather than risk canceling a goal handle we don't have.
             return
         reason = (
             f'no progress for {elapsed_no_progress_s:.0f}s' if stalled
@@ -288,6 +350,32 @@ class FrontierExplorerNode(Node):
         )
         self._goal_handle.cancel_goal_async()
         self._cancel_requested = True
+
+    def _check_path_stall(self):
+        """Give up on a reachability check that never resolves at all.
+
+        The compute_path_to_pose equivalent of _check_stall's unaccepted-goal branch
+        — see module docstring. Reachability checks normally resolve in well under a
+        second, so PATH_CHECK_TIMEOUT_S is a generous but much shorter backstop than
+        GOAL_ABS_TIMEOUT_S.
+        """
+        if self._path_check_start_time is None:
+            return
+        elapsed_s = (self.get_clock().now() - self._path_check_start_time).nanoseconds / 1e9
+        if elapsed_s < PATH_CHECK_TIMEOUT_S:
+            return
+        self.get_logger().warn(
+            f'Reachability check for {self._current_target} did not resolve within '
+            f'{PATH_CHECK_TIMEOUT_S:.0f}s; giving up on it directly.'
+        )
+        self._path_epoch += 1  # invalidate a late-arriving response, see docstring
+        if self._current_target is not None:
+            x, y = self._current_target
+            self._blacklist_target(x, y)
+        self._current_target = None
+        self._pending_yaw = None
+        self._path_check_start_time = None
+        self._state = State.IDLE
 
     def _blacklist_target(self, x, y):
         for entry in self._failure_history:
@@ -331,6 +419,7 @@ class FrontierExplorerNode(Node):
         if not self._path_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn('compute_path_to_pose action server not available yet.')
             return
+        self.get_logger().info(f'Sending compute_path_to_pose check for ({x:.2f}, {y:.2f}).')
 
         goal = ComputePathToPose.Goal()
         goal.goal.header.frame_id = MAP_FRAME
@@ -344,23 +433,43 @@ class FrontierExplorerNode(Node):
         self._state = State.CHECKING_PATH
         self._current_target = (x, y)
         self._pending_yaw = yaw
+        self._path_check_start_time = self.get_clock().now()
+        self._path_epoch += 1
+        epoch = self._path_epoch
         send_future = self._path_client.send_goal_async(goal)
-        send_future.add_done_callback(self._path_goal_response_cb)
+        send_future.add_done_callback(
+            lambda future, epoch=epoch: self._path_goal_response_cb(future, epoch)
+        )
 
-    def _path_goal_response_cb(self, future):
+    def _path_goal_response_cb(self, future, epoch):
         goal_handle = future.result()
+        if epoch != self._path_epoch:
+            # This attempt was already given up on by _check_path_stall and
+            # superseded by a newer one — see module docstring. If it turns out to
+            # have been accepted after all, cancel it rather than leave an orphan
+            # planning request running.
+            if goal_handle.accepted:
+                goal_handle.cancel_goal_async()
+            return
         if not goal_handle.accepted:
             self.get_logger().warn(
                 'compute_path_to_pose goal rejected; will retry from scratch next tick.'
             )
             self._current_target = None
             self._pending_yaw = None
+            self._path_check_start_time = None
             self._state = State.IDLE
             return
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._path_result_cb)
+        result_future.add_done_callback(
+            lambda future, epoch=epoch: self._path_result_cb(future, epoch)
+        )
 
-    def _path_result_cb(self, future):
+    def _path_result_cb(self, future, epoch):
+        if epoch != self._path_epoch:
+            # Superseded by a newer attempt; _check_path_stall already gave up on
+            # this one and moved on. See module docstring.
+            return
         result = future.result()
         reachable = (
             result.status == GoalStatus.STATUS_SUCCEEDED
@@ -368,6 +477,12 @@ class FrontierExplorerNode(Node):
             and len(result.result.path.poses) > 0
         )
         x, y = self._current_target
+        self._path_check_start_time = None
+        if reachable:
+            self.get_logger().info(
+                f'Path to ({x:.2f}, {y:.2f}) confirmed '
+                f'({len(result.result.path.poses)} waypoints); sending NavigateToPose.'
+            )
         if not reachable:
             self.get_logger().info(
                 f'Target ({x:.2f}, {y:.2f}) has no valid path '
@@ -391,7 +506,13 @@ class FrontierExplorerNode(Node):
     def _send_goal(self, x, y, yaw):
         if not self._nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn('navigate_to_pose action server not available yet.')
+            # Reset state — without this the node would be stuck in CHECKING_PATH
+            # forever when called from _path_result_cb, since _evaluate() unconditionally
+            # no-ops on that state and nothing else would ever pull it back out.
+            self._current_target = None
+            self._state = State.IDLE
             return
+        self.get_logger().info(f'Sending NavigateToPose goal to ({x:.2f}, {y:.2f}).')
 
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = MAP_FRAME
@@ -411,8 +532,12 @@ class FrontierExplorerNode(Node):
         self._cancel_requested = False
         self._last_progress_distance = None
         self._last_progress_time = None
+        self._goal_epoch += 1
+        epoch = self._goal_epoch
         send_future = self._nav_client.send_goal_async(goal, feedback_callback=self._feedback_cb)
-        send_future.add_done_callback(self._goal_response_cb)
+        send_future.add_done_callback(
+            lambda future, epoch=epoch: self._goal_response_cb(future, epoch)
+        )
 
     def _feedback_cb(self, feedback_msg):
         remaining = feedback_msg.feedback.distance_remaining
@@ -424,11 +549,25 @@ class FrontierExplorerNode(Node):
             self._last_progress_distance = remaining
             self._last_progress_time = self.get_clock().now()
 
-    def _goal_response_cb(self, future):
+    def _goal_response_cb(self, future, epoch):
         goal_handle = future.result()
+        if epoch != self._goal_epoch:
+            # This attempt was already given up on by _check_stall (never accepted
+            # within GOAL_ABS_TIMEOUT_S) and superseded by a newer one — see module
+            # docstring. If it turns out to have been accepted after all, cancel the
+            # orphan instead of leaving the robot navigating to a target this node no
+            # longer tracks or can blacklist.
+            if goal_handle.accepted:
+                self.get_logger().warn(
+                    'A stale Nav2 goal was accepted after this node gave up on it; '
+                    'canceling the orphan.'
+                )
+                goal_handle.cancel_goal_async()
+            return
         if not goal_handle.accepted:
             self.get_logger().warn('Nav2 rejected the frontier goal.')
             self._state = State.IDLE
+            self._current_target = None
             self._goal_start_time = None
             self._last_progress_distance = None
             self._last_progress_time = None

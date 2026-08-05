@@ -152,6 +152,67 @@ IDLE ──(no frontiers remain)──> EXPLORATION_COMPLETE
 arrival — `/map` only republishes when the map actually changes, which only happens when
 the robot moves, so a callback-driven design can deadlock on a transient startup failure.
 
+## Round 2: code-review follow-up (deadlocks, watchdog gap, 8-connectivity)
+
+A code review of the round-1 changes above found two real bugs and two minor issues, all
+confirmed against the code and fixed.
+
+### Bug: `_send_goal` could strand the node in `CHECKING_PATH` forever
+
+`_path_result_cb` calls `_send_goal(x, y, yaw)` on a successful reachability check, while
+`self._state` is still `CHECKING_PATH`. `_send_goal`'s own `wait_for_server` early-return
+didn't reset state or `_current_target` — and since `_evaluate()` unconditionally no-ops
+on `CHECKING_PATH`, nothing could ever pull the node back out. Not just theoretical: this
+project's own hardware testing has directly observed Nav2's action servers take 90+
+seconds to become responsive under CPU load (see the CPU-pressure investigation the same
+session), which is exactly the condition that trips this. Fixed by resetting `state=IDLE`
+and clearing `_current_target` in that branch.
+
+### Bug: unaccepted goals evaded both stall timeouts
+
+`_check_stall` required `self._goal_handle is not None` before doing anything — including
+the `GOAL_ABS_TIMEOUT_S` backstop that the module docstring explicitly promises covers
+"the degenerate case where feedback never arrives at all." But `_goal_handle` is only set
+inside the action's done-callback; if that callback never fires (server dies or is
+unresponsive mid-handshake), the guard blocked the backstop from ever firing, and
+`NAVIGATING` became a genuine permanent state — contradicting the docstring's own claim.
+
+Fixed by giving `_check_stall` a branch for `_goal_handle is None` that bounds the
+"never accepted" case directly against `_goal_start_time` and `GOAL_ABS_TIMEOUT_S`,
+independent of ever getting a handle. The same gap existed for the reachability
+pre-check's `compute_path_to_pose` client too (unflagged by the review, found while
+implementing the fix), covered by a new `_check_path_stall()` called from `_evaluate()`'s
+`CHECKING_PATH` branch, bounded by a much shorter `PATH_CHECK_TIMEOUT_S = 15.0` — path
+checks normally resolve in well under a second, so 15s is already a generous multiple,
+unlike `GOAL_ABS_TIMEOUT_S` (420s) which has to tolerate an actual multi-minute drive.
+
+**Giving up this way opens a race**: the real done-callback can still land later, after
+the node has already moved on to a different target. A per-attempt epoch counter
+(`_goal_epoch` / `_path_epoch`, bumped each time `_send_goal` / `_check_reachability`
+starts a new attempt) lets `_goal_response_cb` / `_path_goal_response_cb` recognize a
+callback belonging to an attempt already abandoned. If that stale response turns out to
+have been accepted after all, it's canceled as an orphan instead of silently overwriting
+newer state — or worse, leaving the robot physically executing a goal this node no longer
+tracks or can blacklist.
+
+### Minor: 4-connectivity only
+
+`frontier_detection.py` used the same 4-neighbor tuple for both "does this free cell
+border unknown space" and the clustering flood-fill. Two frontier cells touching only
+diagonally landed in separate clusters, and if each was under `min_cluster_size` alone,
+both got silently discarded even though combined they'd clear it. Fixed by switching both
+loops to a shared `_NEIGHBORS_8` tuple. All 9 existing unit tests passed unchanged (none
+of their grids had diagonal-only adjacency to begin with); two new regression tests cover
+the diagonal-merge case directly:
+`test_diagonal_frontier_cells_merge_via_8_connectivity` and
+`test_frontier_classification_uses_8_connectivity_too`.
+
+### Minor: inconsistent cleanup on goal rejection
+
+`_path_goal_response_cb`'s rejection branch cleared `_current_target`;
+`_goal_response_cb`'s didn't. Harmless in practice (overwritten before next read), fixed
+for consistency.
+
 ## What was NOT changed
 
 - **Target selection is still pure nearest-by-distance** (`select_target` in
@@ -175,9 +236,16 @@ colcon test-result --verbose
 ```
 
 Unit tests are pure Python (no ROS imports), so they run without sourcing a ROS
-environment. `colcon test` shows 18 flake8 warnings + pep257 failures, all pre-existing and
-in files untouched by this work (`odom_covariance_relay.py`, `nav2.launch.py`,
-`rtabmap.launch.py`, `rtabmap_debug.launch.py`, `setup.py`).
+environment — 11 passing after round 2 (9 + 2 new 8-connectivity regression tests).
+`colcon test` shows 18 flake8 warnings + pep257 failures, all pre-existing and in files
+untouched by this work (`odom_covariance_relay.py`, `nav2.launch.py`, `rtabmap.launch.py`,
+`rtabmap_debug.launch.py`, `setup.py`).
+
+Round 2 (the deadlock/watchdog/epoch fixes in `frontier_explorer_node.py`) has no pure
+unit test coverage — the state machine's rclpy Node lifecycle, action clients, and
+timer-driven `_evaluate()` aren't exercised by the ROS-independent test file, so these
+fixes are verified by code review + build/lint only, not by a test that actually drives
+the deadlock scenario. Worth adding actual node-level tests if this class of bug recurs.
 
 **Not yet done:** a full unattended hardware/sim exploration run to confirm the "stuck in
 places" symptom is actually gone in practice, not just fixed in isolated unit tests. That's

@@ -108,6 +108,41 @@ def test_small_cluster_filtered_by_min_size():
     assert find_frontiers(data, w, h, min_cluster_size=2) == []
 
 
+def test_diagonal_frontier_cells_merge_via_8_connectivity():
+    """Regression test: two frontier cells touching only diagonally must merge.
+
+    Before this fix, find_frontiers() only connected frontier cells 4-connectively, so
+    two genuinely-adjacent (diagonal) frontier cells near a corner would each form
+    their own 1-cell cluster and both get silently discarded as noise once
+    min_cluster_size > 1, even though combined they'd clear it.
+    """
+    rows = [
+        [FREE, UNK],
+        [UNK, FREE],
+    ]
+    data, w, h = grid(rows, 2)
+    clusters = find_frontiers(data, w, h, min_cluster_size=2)
+    assert len(clusters) == 1
+    _row, _col, size = clusters[0]
+    assert size == 2
+
+
+def test_frontier_classification_uses_8_connectivity_too():
+    """A free cell touching unknown space only diagonally must count as a frontier.
+
+    Matches the same 8-connectivity used for clustering — see
+    test_diagonal_frontier_cells_merge_via_8_connectivity.
+    """
+    rows = [
+        [UNK, OCC],
+        [OCC, FREE],
+    ]
+    data, w, h = grid(rows, 2)
+    clusters = find_frontiers(data, w, h, min_cluster_size=1)
+    assert len(clusters) == 1
+    assert clusters[0][:2] == (1, 1)
+
+
 def test_grid_to_world_and_back():
     resolution = 0.05
     origin_x, origin_y = -2.0, -3.0
