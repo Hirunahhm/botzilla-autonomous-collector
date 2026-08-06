@@ -168,6 +168,11 @@ class FrontierExplorerNode(Node):
 
         self._state = State.IDLE
         self._goal_handle = None
+        # Set False by executor_node via /exploration_enabled when it takes the robot
+        # over to chase a detected cube. Exploration must yield the base immediately —
+        # both this node and the executor publish motion, and two controllers fighting
+        # over cmd_vel is worse than either alone.
+        self._enabled = True
         self._latest_map = None
         self._current_target = None
         self._pending_yaw = None  # yaw computed for the target currently under path-check
@@ -189,6 +194,12 @@ class FrontierExplorerNode(Node):
         map_qos.reliability = QoSReliabilityPolicy.RELIABLE
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
 
+        # Latched so the executor's current enable/disable state is picked up even if
+        # this node restarts mid-mission.
+        enable_qos = QoSProfile(depth=1)
+        enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(Bool, '/exploration_enabled', self._enabled_cb, enable_qos)
+
         complete_qos = QoSProfile(depth=1)
         complete_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self._complete_pub = self.create_publisher(Bool, '/exploration_complete', complete_qos)
@@ -209,6 +220,37 @@ class FrontierExplorerNode(Node):
         self._latest_map = msg
 
     # ------------------------------------------------------------------ #
+    # /exploration_enabled — executor_node hands the robot back and forth
+    # ------------------------------------------------------------------ #
+
+    def _enabled_cb(self, msg: Bool):
+        if msg.data == self._enabled:
+            return
+        self._enabled = msg.data
+        if self._enabled:
+            self.get_logger().info('Exploration ENABLED — resuming frontier search.')
+            return
+
+        self.get_logger().info('Exploration DISABLED — yielding the base to executor_node.')
+        # Actively cancel rather than just going idle: an in-flight NavigateToPose goal
+        # keeps Nav2 publishing cmd_vel, which would fight the executor's own commands
+        # all the way through cube approach and capture.
+        if self._goal_handle is not None and not self._cancel_requested:
+            self._goal_handle.cancel_goal_async()
+            self._cancel_requested = True
+        # Invalidate any in-flight attempt so its late callback can't resurrect state
+        # after we've handed control over.
+        self._goal_epoch += 1
+        self._path_epoch += 1
+        self._current_target = None
+        self._goal_start_time = None
+        self._path_check_start_time = None
+        self._last_progress_distance = None
+        self._last_progress_time = None
+        if self._state != State.EXPLORATION_COMPLETE:
+            self._state = State.IDLE
+
+    # ------------------------------------------------------------------ #
     # Periodic evaluation — drives the whole state machine
     # ------------------------------------------------------------------ #
 
@@ -219,6 +261,15 @@ class FrontierExplorerNode(Node):
             f'blacklist_known={len(self._failure_history)}',
             throttle_duration_sec=5.0,
         )
+        if not self._enabled:
+            # executor_node owns the base right now (chasing/capturing/delivering a
+            # cube). Do nothing at all — not even a reachability check, since accepting
+            # a goal here would put Nav2 back on cmd_vel behind the executor's back.
+            self.get_logger().info(
+                'Paused (exploration disabled by executor_node).',
+                throttle_duration_sec=10.0,
+            )
+            return
         if self._state == State.NAVIGATING:
             # Never preempt an in-flight goal with a new target — see module
             # docstring — but do enforce the stall watchdog against it.
@@ -233,8 +284,9 @@ class FrontierExplorerNode(Node):
         if self._state == State.EXPLORATION_COMPLETE:
             return
         if self._latest_map is None:
-            self.get_logger().info('Still waiting for the first /map message.',
-                                    throttle_duration_sec=5.0)
+            self.get_logger().info(
+                'Still waiting for the first /map message.', throttle_duration_sec=5.0
+            )
             return
 
         msg = self._latest_map

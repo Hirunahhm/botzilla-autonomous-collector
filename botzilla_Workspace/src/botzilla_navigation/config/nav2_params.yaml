@@ -111,7 +111,16 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner::NavfnPlanner"
-      tolerance: 0.5
+      # 0.5 -> 0.1. With tolerance 0.5, an unreachable goal did not fail: NavFn
+      # silently substituted "nearest reachable cell within 0.5 m", which was often
+      # where the robot already stood. follow_path then completed in ~0.1 s without
+      # moving and reported SUCCEEDED. Measured live: robot pinned at (-2.571,-0.021)
+      # for 8 s while 4 consecutive goals to a target 0.527 m away all "succeeded" in
+      # 0.07-0.18 s each. The frontier was never cleared, so the explorer re-selected
+      # it forever. Frontier cells sit against walls by definition, so with
+      # robot_radius 0.275 many are genuinely unreachable — they must fail honestly
+      # and get blacklisted rather than loop.
+      tolerance: 0.1
       use_astar: false
       # true -> false: NavFn treated UNKNOWN cells as traversable and produced
       # confident paths straight through never-sensed territory. During frontier
@@ -172,7 +181,17 @@ local_costmap:
       width: 5
       height: 5
       resolution: 0.05
-      footprint: "[[0.26, 0.09], [0.0, 0.17], [-0.17, 0.10], [-0.17, -0.10], [0.0, -0.17], [0.26, -0.09]]"
+      # Circular footprint instead of the true polygon. With the polygon, the
+      # costmap derived inscribed=0.157m / circumscribed=0.275m, and NavFn (a
+      # POINT planner) only hard-refuses gaps narrower than 2*inscribed=0.314m
+      # — while the robot actually sweeps up to 0.550m. Every gap in that band
+      # was a path the planner promised and DWB could not execute, giving a 25%
+      # goal success rate (2/8) with the rest hitting "Failed to make progress".
+      # A circle makes inscribed == circumscribed == 0.275m, so the costmap
+      # blocks within 0.275m of any obstacle and NavFn cannot route through a
+      # gap under 0.55m. Conservative (won't attempt tight-but-passable spots)
+      # but costs no CPU, which matters on this board.
+      robot_radius: 0.275
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -247,7 +266,9 @@ global_costmap:
       transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
       resolution: 0.05
       track_unknown_space: true
-      footprint: "[[0.26, 0.09], [0.0, 0.17], [-0.17, 0.10], [-0.17, -0.10], [0.0, -0.17], [0.26, -0.09]]"
+      # Circular footprint — must match local_costmap or the planner and
+      # controller disagree about what fits. See the local_costmap note.
+      robot_radius: 0.275
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]

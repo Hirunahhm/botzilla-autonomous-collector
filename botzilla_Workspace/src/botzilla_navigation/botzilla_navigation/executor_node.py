@@ -1,0 +1,494 @@
+"""
+executor_node.py — Milestone 5 unified mission executor.
+
+Replaces brain_node.py's role. Explores an unknown arena, collects cubes, and
+delivers each one back to the pose the robot started from.
+
+Mission loop
+------------
+    STARTUP     latch HOME = map->base_link once TF is available
+    EXPLORING   frontier_explorer_node drives; interrupt on a real cube detection
+    TARGETING   rotate in place to centre the cube (P-control on detected_cube.x)
+    APPROACHING drive in, holding centre, until the cube enters the depth blind spot
+    CAPTURING   keep pushing while the cube is still seen, then a short blind push
+    DELIVERING  NavigateToPose(HOME)
+    DETACHING   reverse to release the cube
+                -> back to EXPLORING for the next one
+
+Why HOME comes from TF and not odom
+-----------------------------------
+final_test_node.py's NAV_HOME drives to odom (0, 0), which is free because odom
+starts at zero by definition — but odom drifts, and this project has already lost
+time to exactly that (see docs/ghost_map_investigation.md: wheel slip corrupting
+the map until the EKF was made to fuse IMU yaw). After a long exploration run,
+odom (0, 0) can be metres from the true start. Latching map->base_link instead
+means SLAM loop closure keeps HOME honest, and Nav2 plans a real route back
+rather than dead-reckoning.
+
+Who owns cmd_vel
+----------------
+Only one controller may drive the base at a time. This node publishes cmd_vel
+*only* in TARGETING / APPROACHING / CAPTURING / DETACHING. During EXPLORING and
+DELIVERING, Nav2 is driving and this node stays silent; it hands exploration
+on and off via the latched /exploration_enabled topic, and frontier_explorer_node
+cancels its in-flight goal when disabled.
+
+Usage
+-----
+    ros2 launch botzilla_navigation executor.launch.py
+requires simulation.launch.py (or hardware.launch.py), rtabmap.launch.py,
+nav2.launch.py and a source of /detected_cube (yolo_node) already running.
+"""
+
+import math
+
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import Point, Twist
+from nav2_msgs.action import NavigateToPose
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool, String
+import tf2_ros
+from tf2_ros import TransformException
+
+# ── Cube collection ──────────────────────────────────────────────────────────
+# Values carried over from final_test_node.py, which is the version proven on
+# hardware. NOTE: they were tuned against YOLO at ~0.75 fps on a Pi 5. On the
+# Jetson (GPU container) inference is far faster, so EXTRA_PUSH_S covers much
+# less ground than it used to — re-measure before trusting it.
+KP_ANGULAR = 1.2            # P-gain for centring the cube
+MAX_ANGULAR = 0.35          # rad/s clamp; prevents overshoot between slow frames
+ALIGNMENT_THRESHOLD = 0.03  # normalized; below this we consider the cube centred
+APPROACH_SPEED = 0.15       # m/s while driving toward the cube
+CAPTURE_SPEED = 0.12        # m/s during the final push
+# Ignore detections beyond this, so one noisy frame can't send the robot chasing a
+# cube across the arena. Raised 1.0 -> 1.5 after hardware measurement: a cube sitting
+# a normal distance in front of the robot ranged at 1.09 m and was silently dropped by
+# the old gate while YOLO was reporting it confidently every frame. 1.0 came from
+# final_test_node's scripted small-arena search and is too tight for open exploration.
+# 1.5 still rejects far-field noise, which in a measured frame topped out at 0.138
+# confidence versus 0.797 for the real cube.
+CUBE_MAX_RANGE_M = 1.5
+# No detection for this long -> give up and resume exploring.
+CUBE_LOST_TIMEOUT_S = 5.0
+# In CAPTURING, how long without a detection counts as "the cube has genuinely left
+# the frame" rather than just a dropped frame.
+CAPTURE_GRACE_S = 2.0
+# Blind push after the cube leaves frame, to seat it between the arms. The depth
+# blind spot is ~0.55 m, so the cube stops being reported well before it is captured.
+EXTRA_PUSH_S = 0.1
+# Consecutive z == 0.0 readings before believing the blind-spot signal.
+BLIND_SPOT_FRAMES = 2
+
+# ── Detach ───────────────────────────────────────────────────────────────────
+DETACH_SPEED = -0.10        # m/s, reverse
+DETACH_TIME_S = 1.8
+
+# ── Delivery ─────────────────────────────────────────────────────────────────
+# Generous: the route home can span the whole arena and Nav2 may run recoveries.
+DELIVERY_TIMEOUT_S = 300.0
+HOME_TF_WAIT_S = 60.0       # how long to wait at STARTUP for map->base_link
+
+CONTROL_PERIOD_S = 0.1      # 10 Hz
+MAP_FRAME = 'map'
+ROBOT_FRAME = 'base_link'
+
+
+class State:
+    STARTUP = 'STARTUP'
+    EXPLORING = 'EXPLORING'
+    TARGETING = 'TARGETING'
+    APPROACHING = 'APPROACHING'
+    CAPTURING = 'CAPTURING'
+    DELIVERING = 'DELIVERING'
+    DETACHING = 'DETACHING'
+
+
+class ExecutorNode(Node):
+    def __init__(self):
+        super().__init__('executor_node')
+
+        self._state = State.STARTUP
+        self._home = None            # (x, y, yaw) in MAP_FRAME, latched at STARTUP
+        self._target_cube = None     # geometry_msgs/Point: x=norm offset, z=metres
+        self._cube_last_seen = None  # rclpy.time.Time
+        self._cube_lost_time = None  # when the cube left frame during CAPTURING
+        self._blind_spot_frames = 0
+        self._phase_start = self.get_clock().now()
+        self._startup_start = self.get_clock().now()
+        self._cubes_delivered = 0
+
+        self._nav_goal_handle = None
+        self._nav_result = None      # None while in flight; GoalStatus once finished
+        self._nav_sent_time = None
+
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        self._cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        # Latched: frontier_explorer_node must see the current value even if it
+        # starts after us, otherwise it would happily explore while we chase a cube.
+        enable_qos = QoSProfile(depth=1)
+        enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self._explore_pub = self.create_publisher(
+            Bool, '/exploration_enabled', enable_qos
+        )
+        self._status_pub = self.create_publisher(String, '/mission/status', 10)
+
+        self.create_subscription(Point, 'detected_cube', self._cube_cb, 10)
+
+        self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # Hold exploration off until HOME is latched — otherwise the robot could
+        # drive away before we ever record where it started, and HOME would be
+        # wherever it happened to be when TF finally came up.
+        self._publish_exploration_enabled(False)
+
+        self.create_timer(CONTROL_PERIOD_S, self._control_loop)
+        self.get_logger().info(
+            'executor_node started — waiting for map->base_link to latch HOME.'
+        )
+
+    # ------------------------------------------------------------------ #
+    # Subscriptions
+    # ------------------------------------------------------------------ #
+
+    def _cube_cb(self, msg: Point):
+        """Cache the latest cube detection, and react to it where relevant."""
+        # Only chase cubes while hunting. During DELIVERING/DETACHING the robot is
+        # already carrying one, and a detection of the cube it is holding (or of the
+        # next one) must not derail the delivery.
+        if self._state in (State.STARTUP, State.DELIVERING, State.DETACHING):
+            return
+
+        # z == 0.0 is the blind-spot sentinel from yolo_node, not a real distance, so
+        # it must bypass the range gate — it is precisely the signal that the cube is
+        # close enough to capture.
+        if msg.z > CUBE_MAX_RANGE_M:
+            return
+
+        self._target_cube = msg
+        self._cube_last_seen = self.get_clock().now()
+
+        if self._state == State.EXPLORING:
+            self.get_logger().info(
+                f'Cube detected (x={msg.x:+.2f}, z={msg.z:.2f}m) — '
+                f'suspending exploration to collect it.'
+            )
+            self._publish_exploration_enabled(False)
+            self._transition(State.TARGETING)
+
+        elif self._state == State.APPROACHING:
+            # Debounced: a single spurious z==0.0 frame should not trigger the blind
+            # push, which is irreversible in the sense that the cube is then unseeable.
+            if msg.z == 0.0:
+                self._blind_spot_frames += 1
+                if self._blind_spot_frames >= BLIND_SPOT_FRAMES:
+                    self._transition(State.CAPTURING, 'Blind spot confirmed.')
+            else:
+                self._blind_spot_frames = 0
+
+    # ------------------------------------------------------------------ #
+    # Main loop
+    # ------------------------------------------------------------------ #
+
+    def _control_loop(self):
+        cmd = Twist()
+        now = self.get_clock().now()
+
+        if self._state == State.STARTUP:
+            self._do_startup(now)
+
+        elif self._state == State.EXPLORING:
+            # frontier_explorer_node + Nav2 own the base here. Publish nothing.
+            self.get_logger().info(
+                f'EXPLORING — delivered {self._cubes_delivered} cube(s) so far.',
+                throttle_duration_sec=15.0,
+            )
+            self._publish_status()
+            return
+
+        elif self._state == State.TARGETING:
+            self._do_targeting(cmd, now)
+
+        elif self._state == State.APPROACHING:
+            self._do_approaching(cmd, now)
+
+        elif self._state == State.CAPTURING:
+            self._do_capturing(cmd, now)
+
+        elif self._state == State.DELIVERING:
+            # Nav2 owns the base here. Publish nothing.
+            self._do_delivering(now)
+            self._publish_status()
+            return
+
+        elif self._state == State.DETACHING:
+            self._do_detaching(cmd, now)
+
+        self._cmd_pub.publish(cmd)
+        self._publish_status()
+
+    # ------------------------------------------------------------------ #
+    # States
+    # ------------------------------------------------------------------ #
+
+    def _do_startup(self, now):
+        """Latch HOME from TF, then release exploration."""
+        pose = self._get_robot_pose()
+        if pose is None:
+            waited = (now - self._startup_start).nanoseconds / 1e9
+            if waited > HOME_TF_WAIT_S:
+                self.get_logger().error(
+                    f'No {MAP_FRAME}->{ROBOT_FRAME} transform after {waited:.0f}s. '
+                    f'Is SLAM (rtabmap.launch.py) running? Still waiting.',
+                    throttle_duration_sec=15.0,
+                )
+            else:
+                self.get_logger().info(
+                    f'Waiting for {MAP_FRAME}->{ROBOT_FRAME} to latch HOME '
+                    f'({waited:.0f}s)...',
+                    throttle_duration_sec=5.0,
+                )
+            return
+
+        self._home = pose
+        self.get_logger().info(
+            f'HOME latched at x={pose[0]:.3f} y={pose[1]:.3f} '
+            f'yaw={math.degrees(pose[2]):.1f}deg in "{MAP_FRAME}". '
+            f'Every collected cube will be delivered here.'
+        )
+        self._publish_exploration_enabled(True)
+        self._transition(State.EXPLORING, 'HOME latched.')
+
+    def _do_targeting(self, cmd, now):
+        """Rotate in place until the cube is centred."""
+        if self._cube_timed_out(now):
+            self._resume_exploring('Cube lost while targeting.')
+            return
+        if self._target_cube is None:
+            return
+
+        error_x = self._target_cube.x
+        if abs(error_x) > ALIGNMENT_THRESHOLD:
+            cmd.angular.z = self._clamp_angular(-KP_ANGULAR * error_x)
+        else:
+            self._transition(
+                State.APPROACHING, f'Centred (x={error_x:+.3f}). Driving in.'
+            )
+
+    def _do_approaching(self, cmd, now):
+        """Drive toward the cube, holding it centred. Exit is via _cube_cb."""
+        if self._cube_timed_out(now):
+            self._resume_exploring('Cube lost while approaching.')
+            return
+        if self._target_cube is None:
+            return
+        cmd.angular.z = self._clamp_angular(-KP_ANGULAR * 0.5 * self._target_cube.x)
+        cmd.linear.x = APPROACH_SPEED
+
+    def _do_capturing(self, cmd, now):
+        """Push until the cube leaves the frame, then a short blind push more.
+
+        The depth blind spot (~0.55 m) means the cube stops being reported well
+        before it is actually between the arms, so the last thing to trust is the
+        moment detections stop — then drive EXTRA_PUSH_S beyond it.
+        """
+        since_seen = (now - self._cube_last_seen).nanoseconds / 1e9
+
+        if since_seen < CAPTURE_GRACE_S:
+            self._cube_lost_time = None
+            cmd.linear.x = CAPTURE_SPEED
+            if self._target_cube is not None:
+                cmd.angular.z = self._clamp_angular(
+                    -KP_ANGULAR * 0.3 * self._target_cube.x
+                )
+            return
+
+        if self._cube_lost_time is None:
+            self._cube_lost_time = now
+            self.get_logger().info('Cube left the frame — final blind push.')
+
+        if (now - self._cube_lost_time).nanoseconds / 1e9 < EXTRA_PUSH_S:
+            cmd.linear.x = CAPTURE_SPEED
+            return
+
+        if self._home is None:
+            # Should be impossible: STARTUP gates everything on HOME being latched.
+            self.get_logger().error('Cube captured but HOME was never latched!')
+            self._resume_exploring('No HOME to deliver to.')
+            return
+
+        self.get_logger().info('Cube captured — delivering to HOME.')
+        self._transition(State.DELIVERING)
+        self._send_home_goal()
+
+    def _do_delivering(self, now):
+        """Wait on the NavigateToPose(HOME) goal."""
+        if self._nav_result is not None:
+            status = self._nav_result
+            self._nav_result = None
+            self._nav_goal_handle = None
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self._transition(State.DETACHING, 'Arrived HOME.')
+            else:
+                # Releasing here is deliberate. The robot is somewhere short of HOME,
+                # but dropping the cube and carrying on beats wedging the whole
+                # mission on one failed route — and the cube stays findable.
+                self.get_logger().warn(
+                    f'Delivery goal ended with status {status} instead of SUCCEEDED. '
+                    f'Releasing the cube here and resuming exploration.'
+                )
+                self._transition(State.DETACHING, 'Delivery failed; releasing anyway.')
+            return
+
+        if self._nav_sent_time is None:
+            return
+        elapsed = (now - self._nav_sent_time).nanoseconds / 1e9
+        if elapsed > DELIVERY_TIMEOUT_S:
+            self.get_logger().warn(
+                f'Delivery exceeded {DELIVERY_TIMEOUT_S:.0f}s; giving up on the route '
+                f'and releasing the cube here.'
+            )
+            if self._nav_goal_handle is not None:
+                self._nav_goal_handle.cancel_goal_async()
+                self._nav_goal_handle = None
+            self._nav_sent_time = None
+            self._transition(State.DETACHING, 'Delivery timed out.')
+        else:
+            self.get_logger().info(
+                f'DELIVERING to HOME ({elapsed:.0f}s elapsed)...',
+                throttle_duration_sec=10.0,
+            )
+
+    def _do_detaching(self, cmd, now):
+        """Reverse to leave the cube behind."""
+        if (now - self._phase_start).nanoseconds / 1e9 < DETACH_TIME_S:
+            cmd.linear.x = DETACH_SPEED
+            return
+        self._cubes_delivered += 1
+        self.get_logger().info(
+            f'Cube released. Total delivered: {self._cubes_delivered}.'
+        )
+        self._resume_exploring('Delivery complete.')
+
+    # ------------------------------------------------------------------ #
+    # Nav2 delivery goal
+    # ------------------------------------------------------------------ #
+
+    def _send_home_goal(self):
+        self._nav_result = None
+        self._nav_goal_handle = None
+        if not self._nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error(
+                'navigate_to_pose action server unavailable; cannot deliver. '
+                'Releasing the cube here.'
+            )
+            self._transition(State.DETACHING, 'No Nav2 server.')
+            return
+
+        x, y, yaw = self._home
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = MAP_FRAME
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = x
+        goal.pose.pose.position.y = y
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        self._nav_sent_time = self.get_clock().now()
+        self.get_logger().info(f'Sending NavigateToPose to HOME ({x:.2f}, {y:.2f}).')
+        self._nav_client.send_goal_async(goal).add_done_callback(self._goal_response_cb)
+
+    def _goal_response_cb(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warn('Nav2 rejected the HOME goal.')
+            self._nav_result = GoalStatus.STATUS_ABORTED
+            return
+        self._nav_goal_handle = handle
+        handle.get_result_async().add_done_callback(self._result_cb)
+
+    def _result_cb(self, future):
+        # Recorded rather than acted on directly: the state machine owns transitions,
+        # and this fires on an executor thread.
+        self._nav_result = future.result().status
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    def _get_robot_pose(self):
+        """Return (x, y, yaw) of the robot in MAP_FRAME, or None if TF isn't ready."""
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                MAP_FRAME, ROBOT_FRAME, rclpy.time.Time()
+            )
+        except TransformException:
+            return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        return (t.x, t.y, yaw)
+
+    def _publish_exploration_enabled(self, enabled: bool):
+        self._explore_pub.publish(Bool(data=enabled))
+
+    def _resume_exploring(self, reason=''):
+        self._target_cube = None
+        self._cube_lost_time = None
+        self._blind_spot_frames = 0
+        self._publish_exploration_enabled(True)
+        self._transition(State.EXPLORING, reason)
+
+    def _transition(self, new_state, reason=''):
+        self.get_logger().info(f'[{self._state}] -> [{new_state}] | {reason}')
+        self._state = new_state
+        self._phase_start = self.get_clock().now()
+        if new_state in (State.TARGETING, State.APPROACHING):
+            self._blind_spot_frames = 0
+
+    def _cube_timed_out(self, now):
+        if self._cube_last_seen is None:
+            return True
+        return (now - self._cube_last_seen).nanoseconds / 1e9 > CUBE_LOST_TIMEOUT_S
+
+    @staticmethod
+    def _clamp_angular(value):
+        return max(-MAX_ANGULAR, min(MAX_ANGULAR, value))
+
+    def _publish_status(self):
+        home = (
+            f'({self._home[0]:.2f},{self._home[1]:.2f})' if self._home else 'unset'
+        )
+        cube = (
+            f'x={self._target_cube.x:+.2f},z={self._target_cube.z:.2f}'
+            if self._target_cube else 'none'
+        )
+        self._status_pub.publish(String(data=(
+            f'state={self._state} home={home} cube={cube} '
+            f'delivered={self._cubes_delivered}'
+        )))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ExecutorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._cmd_pub.publish(Twist())  # stop the base on the way out
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

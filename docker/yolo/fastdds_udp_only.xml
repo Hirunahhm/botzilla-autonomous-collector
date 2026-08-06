@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Force FastDDS to use UDPv4 only, disabling the shared-memory transport.
+
+  Why this is needed
+  ------------------
+  With --network host the container shares the host's network namespace, so
+  FastDDS concludes that host participants are on the same machine and negotiates
+  its shared-memory transport for data. Discovery still runs over UDP multicast
+  and succeeds, which makes everything *look* healthy — `ros2 topic list` and
+  `ros2 node list` inside the container show the full host graph, and the host
+  reports the container as a subscriber. But no data ever crosses, because the
+  SHM segments live in different mount namespaces.
+
+  The failure is completely silent. Measured on hardware: kinect_bridge
+  publishing at 17.5 Hz on the host, 0 messages received in-container — and not
+  just images: /odom (tiny) and /scan were also 0, which is what ruled out a
+  message-size or /dev/shm-size explanation.
+
+  Bind-mounting /dev/shm alone does NOT fix it; the transport has to be changed.
+
+  Applied via FASTRTPS_DEFAULT_PROFILES_FILE in run_yolo_container.sh.
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_transport</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="udp_only_participant" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>udp_transport</transport_id>
+        </userTransports>
+        <!-- false = do not add the default SHM + UDP pair, use only the above -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>
