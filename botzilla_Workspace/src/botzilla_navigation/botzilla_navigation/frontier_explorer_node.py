@@ -13,6 +13,20 @@ suggest: this project's own Nav2 debugging (see PHASE_1_IMPLEMENTATION_PLAN.md's
 rotate-in-place stall" fix) found that repeatedly preempting/resending goals starves real
 progress, especially under the arena's low Gazebo real-time factor.
 
+Costmap snapping: a raw frontier cell is, by definition, adjacent to unknown space, and
+unknown space in a bounded arena is almost always adjacent to a wall just beyond sensor
+range — so most raw frontier cells fall inside that wall's inflation halo: free (cost 0)
+in the raw SLAM map, but LETHAL_OBSTACLE/INSCRIBED_INFLATED_OBSTACLE (cost 96-100) in the
+actual /global_costmap/costmap the planner uses. Confirmed live: in a compact arena this
+made ComputePathToPose reject the majority of raw frontier targets with NO_VALID_PATH,
+leaving exploration looking "stuck" between the rare targets far enough from a wall to
+succeed. Before every reachability check, the frontier point is snapped to the nearest
+costmap cell below COSTMAP_SAFE_COST (see _snap_to_reachable/frontier_detection.
+find_low_cost_point) and that snapped point — not the raw frontier — is what's sent to
+Nav2. Blacklisting still keys off the raw frontier point (see _frontier_origin), so a
+cluster whose every nearby cell is unreachable gets banned as a whole rather than
+re-tried against a slightly different snapped point next tick.
+
 Reachability pre-check: before committing to a full NavigateToPose attempt (which can run
 for a long time — see "Stall watchdog" below), this node first asks Nav2's planner
 directly via ComputePathToPose whether ANY path to the target exists at all. That call
@@ -86,6 +100,24 @@ the cooldown each time, up to BLACKLIST_COOLDOWN_MAX_S — so a truly unreachabl
 gets pushed out far enough to let the rest of the map be explored, while a one-off failure
 doesn't get penalized as harshly.
 
+Stuck recovery: costmap snapping (above) fixes goals that individually land in wall
+inflation, but a robot wedged into a tight nook can end up with EVERY known frontier
+genuinely unreachable — no route exists in the known map from the robot's current pose to
+any of them, not because a goal cell is bad but because the immediate surroundings pinch
+the corridor shut. Confirmed live: a flood-fill from the robot's position through every
+sub-inscribed-cost cell in the global costmap did not reach either remaining frontier,
+while the passage the robot could still take (behind it) was outside the frontiers'
+direction entirely. Waiting out BLACKLIST_COOLDOWN_BASE_S changes nothing here since the
+robot hasn't moved — the geometry that caused the rejection is still exactly the same.
+When every known frontier stays blacklisted for STUCK_RECOVERY_TIMEOUT_S straight, this
+node sends a BackUp goal (Nav2's own recovery action, already used internally by
+bt_navigator) to reverse BACKUP_DISTANCE_M, then clears the blacklist entirely so every
+frontier gets a fresh reachability check from the new pose — backing up is specifically
+meant to change the geometry that made them fail, so there's no reason to keep them
+banned. failure_history (the exponential-backoff counters) is deliberately NOT cleared,
+so a frontier that's genuinely unreachable rather than just occluded by the robot's own
+position still gets pushed out further on repeat offenses.
+
 Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
@@ -96,10 +128,12 @@ from action_msgs.msg import GoalStatus
 from botzilla_navigation.frontier_detection import (
     distance,
     find_frontiers,
+    find_low_cost_point,
     grid_to_world,
     select_target,
+    world_to_grid,
 )
-from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.action import ActionClient
@@ -135,6 +169,19 @@ PROGRESS_EPSILON_M = 0.15
 # goal_handle ever arrives) — see module docstring.
 GOAL_ABS_TIMEOUT_S = 420.0
 
+# Stuck recovery — see module docstring. If every known frontier stays blacklisted (no
+# candidate at all, as opposed to a candidate that's merely still being evaluated) for
+# this long, the robot backs up rather than waiting out the cooldown for geometry that
+# backing up itself is meant to fix.
+STUCK_RECOVERY_TIMEOUT_S = 15.0
+BACKUP_DISTANCE_M = 0.3
+BACKUP_SPEED_MPS = 0.1
+BACKUP_TIME_ALLOWANCE_S = 10.0
+# Generous backstop in case the BackUp goal's own done-callback never lands (server
+# unresponsive) — mirrors the same unaccepted-goal gap _check_stall/_check_path_stall
+# guard against elsewhere in this node. Comfortably above BACKUP_TIME_ALLOWANCE_S.
+RECOVERY_ABS_TIMEOUT_S = 30.0
+
 # How long to wait for a compute_path_to_pose response before giving up on the
 # reachability check directly. Reachability checks normally resolve in well under a
 # second (see module docstring) — this is a generous backstop against the exchange
@@ -151,6 +198,18 @@ BLACKLIST_RADIUS_M = 0.5
 BLACKLIST_COOLDOWN_BASE_S = 360.0
 BLACKLIST_COOLDOWN_MAX_S = 3600.0
 
+# Raw frontier cells sit against unknown space, which almost always sits against a wall
+# just beyond sensor range — so most raw frontier cells fall inside the wall's inflation
+# halo (cost 0 in the raw SLAM map, but 96-100 in the actual global_costmap), which is
+# why ComputePathToPose was observed live rejecting the large majority of raw frontier
+# targets in this arena. Before navigating, the target is snapped to the nearest cell in
+# /global_costmap/costmap whose cost is below COSTMAP_SAFE_COST — see
+# frontier_detection.find_low_cost_point. Well under the 99 inscribed-inflated cutoff so
+# the result is a point Nav2 can actually plan into, not one that merely scrapes under
+# the lethal threshold.
+COSTMAP_SAFE_COST = 50
+COSTMAP_SEARCH_RADIUS_CELLS = 10
+
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
 
@@ -159,6 +218,7 @@ class State:
     IDLE = 'IDLE'
     CHECKING_PATH = 'CHECKING_PATH'
     NAVIGATING = 'NAVIGATING'
+    RECOVERING = 'RECOVERING'
     EXPLORATION_COMPLETE = 'EXPLORATION_COMPLETE'
 
 
@@ -174,7 +234,14 @@ class FrontierExplorerNode(Node):
         # over cmd_vel is worse than either alone.
         self._enabled = True
         self._latest_map = None
+        self._latest_costmap = None
         self._current_target = None
+        # The original frontier-cluster coordinate a NavigateToPose attempt was picked
+        # for — kept separate from _current_target (which becomes the cost-map-snapped
+        # navigation point actually sent to Nav2, see COSTMAP_SAFE_COST) so blacklisting
+        # bans the frontier CLUSTER, not a snapped point that can drift a few cells
+        # between ticks as the costmap updates.
+        self._frontier_origin = None
         self._pending_yaw = None  # yaw computed for the target currently under path-check
         self._path_check_start_time = None  # rclpy.time.Time the path-check was sent
         self._path_epoch = 0  # bumped per path-check attempt; guards stale callbacks
@@ -186,6 +253,13 @@ class FrontierExplorerNode(Node):
         self._blacklist = []  # list of (x, y, expiry_time: rclpy.time.Time) — active bans
         self._failure_history = []  # list of [x, y, count] — persists across cooldowns
 
+        # Stuck recovery — see module docstring. Set the first tick every known frontier
+        # is blacklisted (no candidate left at all); cleared once a candidate exists again
+        # or a recovery backup completes.
+        self._stuck_since = None
+        self._backup_goal_handle = None
+        self._recovery_start_time = None  # rclpy.time.Time the BackUp goal was sent
+
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -193,6 +267,15 @@ class FrontierExplorerNode(Node):
         map_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = QoSReliabilityPolicy.RELIABLE
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
+
+        # Ground truth for what the planner will actually accept — see
+        # COSTMAP_SAFE_COST above for why the raw /map alone isn't enough.
+        costmap_qos = QoSProfile(depth=1)
+        costmap_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        costmap_qos.reliability = QoSReliabilityPolicy.RELIABLE
+        self.create_subscription(
+            OccupancyGrid, '/global_costmap/costmap', self._costmap_cb, costmap_qos
+        )
 
         # Latched so the executor's current enable/disable state is picked up even if
         # this node restarts mid-mission.
@@ -206,6 +289,7 @@ class FrontierExplorerNode(Node):
 
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
+        self._backup_client = ActionClient(self, BackUp, 'backup')
 
         self.create_timer(EVAL_PERIOD_S, self._evaluate)
 
@@ -218,6 +302,9 @@ class FrontierExplorerNode(Node):
 
     def _map_cb(self, msg: OccupancyGrid):
         self._latest_map = msg
+
+    def _costmap_cb(self, msg: OccupancyGrid):
+        self._latest_costmap = msg
 
     # ------------------------------------------------------------------ #
     # /exploration_enabled — executor_node hands the robot back and forth
@@ -232,21 +319,27 @@ class FrontierExplorerNode(Node):
             return
 
         self.get_logger().info('Exploration DISABLED — yielding the base to executor_node.')
-        # Actively cancel rather than just going idle: an in-flight NavigateToPose goal
-        # keeps Nav2 publishing cmd_vel, which would fight the executor's own commands
-        # all the way through cube approach and capture.
+        # Actively cancel rather than just going idle: an in-flight NavigateToPose or
+        # BackUp goal keeps Nav2 publishing cmd_vel, which would fight the executor's own
+        # commands all the way through cube approach and capture.
         if self._goal_handle is not None and not self._cancel_requested:
             self._goal_handle.cancel_goal_async()
             self._cancel_requested = True
+        if self._backup_goal_handle is not None:
+            self._backup_goal_handle.cancel_goal_async()
+            self._backup_goal_handle = None
         # Invalidate any in-flight attempt so its late callback can't resurrect state
         # after we've handed control over.
         self._goal_epoch += 1
         self._path_epoch += 1
         self._current_target = None
+        self._frontier_origin = None
         self._goal_start_time = None
         self._path_check_start_time = None
         self._last_progress_distance = None
         self._last_progress_time = None
+        self._stuck_since = None
+        self._recovery_start_time = None
         if self._state != State.EXPLORATION_COMPLETE:
             self._state = State.IDLE
 
@@ -281,11 +374,22 @@ class FrontierExplorerNode(Node):
             # how long we wait — see _check_path_stall.
             self._check_path_stall()
             return
+        if self._state == State.RECOVERING:
+            # A BackUp goal is in flight; wait for it to finish (or time out) rather
+            # than picking a target concurrently — see _check_recovery_stall.
+            self._check_recovery_stall()
+            return
         if self._state == State.EXPLORATION_COMPLETE:
             return
         if self._latest_map is None:
             self.get_logger().info(
                 'Still waiting for the first /map message.', throttle_duration_sec=5.0
+            )
+            return
+        if self._latest_costmap is None:
+            self.get_logger().info(
+                'Still waiting for the first /global_costmap/costmap message.',
+                throttle_duration_sec=5.0,
             )
             return
 
@@ -318,10 +422,9 @@ class FrontierExplorerNode(Node):
 
         candidates = self._filter_blacklisted(frontiers_world)
         if not candidates:
-            self.get_logger().debug(
-                'All known frontiers are on cooldown after recent failures, waiting.'
-            )
+            self._handle_all_frontiers_blacklisted()
             return
+        self._stuck_since = None
 
         target = select_target(candidates, robot_x, robot_y)
 
@@ -329,11 +432,46 @@ class FrontierExplorerNode(Node):
             self.get_logger().debug('Nearest frontier is too close, waiting for next map update.')
             return
 
+        nav_point = self._snap_to_reachable(target)
+        if nav_point is None:
+            self.get_logger().info(
+                f'Frontier ({target[0]:.2f}, {target[1]:.2f}) has no low-cost cell within '
+                f'{COSTMAP_SEARCH_RADIUS_CELLS} cells in the costmap (buried in wall '
+                f'inflation); blacklisting without spending a path-check on it.'
+            )
+            self._blacklist_target(target[0], target[1])
+            return
+
+        nav_x, nav_y = nav_point
         self.get_logger().info(
-            f'{len(clusters)} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f})'
+            f'{len(clusters)} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f}) '
+            f'-> snapped to reachable point ({nav_x:.2f}, {nav_y:.2f})'
         )
-        yaw = math.atan2(target[1] - robot_y, target[0] - robot_x)
-        self._check_reachability(target[0], target[1], yaw)
+        yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
+        self._frontier_origin = target
+        self._check_reachability(nav_x, nav_y, yaw)
+
+    def _snap_to_reachable(self, target_world):
+        """Move a raw frontier point to the nearest costmap cell Nav2 can plan into.
+
+        See COSTMAP_SAFE_COST module comment for why this is necessary. Returns a world
+        (x, y) tuple, or None if no low-cost cell exists within COSTMAP_SEARCH_RADIUS_CELLS.
+        """
+        cm = self._latest_costmap
+        row, col = world_to_grid(
+            target_world[0], target_world[1], cm.info.resolution,
+            cm.info.origin.position.x, cm.info.origin.position.y
+        )
+        snapped = find_low_cost_point(
+            cm.data, cm.info.width, cm.info.height, row, col,
+            max_cost=COSTMAP_SAFE_COST, search_radius=COSTMAP_SEARCH_RADIUS_CELLS
+        )
+        if snapped is None:
+            return None
+        return grid_to_world(
+            snapped[0], snapped[1], cm.info.resolution,
+            cm.info.origin.position.x, cm.info.origin.position.y
+        )
 
     def _filter_blacklisted(self, frontiers_world):
         now = self.get_clock().now()
@@ -346,6 +484,92 @@ class FrontierExplorerNode(Node):
             )
 
         return [(x, y) for (x, y) in frontiers_world if not is_blacklisted(x, y)]
+
+    # ------------------------------------------------------------------ #
+    # Stuck recovery — see module docstring
+    # ------------------------------------------------------------------ #
+
+    def _handle_all_frontiers_blacklisted(self):
+        now = self.get_clock().now()
+        if self._stuck_since is None:
+            self._stuck_since = now
+        elapsed_s = (now - self._stuck_since).nanoseconds / 1e9
+        if elapsed_s < STUCK_RECOVERY_TIMEOUT_S:
+            self.get_logger().debug(
+                'All known frontiers are on cooldown after recent failures, waiting '
+                f'({elapsed_s:.0f}/{STUCK_RECOVERY_TIMEOUT_S:.0f}s before backing up).'
+            )
+            return
+        self._start_recovery_backup()
+
+    def _start_recovery_backup(self):
+        if not self._backup_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn('backup action server not available yet; will retry next tick.')
+            return
+        self.get_logger().warn(
+            f'Every known frontier has been unreachable for {STUCK_RECOVERY_TIMEOUT_S:.0f}s '
+            f'straight — backing up {BACKUP_DISTANCE_M:.2f}m to change the geometry instead '
+            f'of waiting out the cooldown.'
+        )
+        goal = BackUp.Goal()
+        goal.target.x = -BACKUP_DISTANCE_M
+        goal.speed = BACKUP_SPEED_MPS
+        goal.time_allowance = Duration(seconds=BACKUP_TIME_ALLOWANCE_S).to_msg()
+
+        self._state = State.RECOVERING
+        self._recovery_start_time = self.get_clock().now()
+        send_future = self._backup_client.send_goal_async(goal)
+        send_future.add_done_callback(self._backup_response_cb)
+
+    def _backup_response_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('BackUp goal rejected; will retry stuck-recovery next tick.')
+            self._finish_recovery()
+            return
+        self._backup_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._backup_result_cb)
+
+    def _backup_result_cb(self, future):
+        result = future.result()
+        status_name = {
+            GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+            GoalStatus.STATUS_ABORTED: 'ABORTED',
+            GoalStatus.STATUS_CANCELED: 'CANCELED',
+        }.get(result.status, f'status={result.status}')
+        self.get_logger().info(f'BackUp recovery finished: {status_name}')
+        self._finish_recovery()
+
+    def _check_recovery_stall(self):
+        """Give up waiting on a BackUp goal that never resolves at all.
+
+        Mirrors _check_stall/_check_path_stall's unaccepted-goal handling — see module
+        docstring. RECOVERY_ABS_TIMEOUT_S is comfortably above BACKUP_TIME_ALLOWANCE_S,
+        so this only fires if the done-callback itself never lands.
+        """
+        if self._recovery_start_time is None:
+            return
+        elapsed_s = (self.get_clock().now() - self._recovery_start_time).nanoseconds / 1e9
+        if elapsed_s < RECOVERY_ABS_TIMEOUT_S:
+            return
+        self.get_logger().warn(
+            f'BackUp recovery did not resolve within {RECOVERY_ABS_TIMEOUT_S:.0f}s; '
+            f'giving up on it directly.'
+        )
+        self._finish_recovery()
+
+    def _finish_recovery(self):
+        # Give every frontier a fresh chance from the new pose — the whole point of
+        # backing up is that the geometry that made them unreachable may have changed.
+        # failure_history is NOT cleared: a target that's genuinely unreachable (not
+        # just occluded by the robot's prior position) still gets pushed out further on
+        # repeat offenses — see module docstring.
+        self._blacklist = []
+        self._stuck_since = None
+        self._backup_goal_handle = None
+        self._recovery_start_time = None
+        self._state = State.IDLE
 
     def _check_stall(self):
         """Cancel the active goal if it stops making progress, or hits the absolute cap.
@@ -375,10 +599,11 @@ class FrontierExplorerNode(Node):
                 f'within {GOAL_ABS_TIMEOUT_S:.0f}s; giving up on it directly.'
             )
             self._goal_epoch += 1  # invalidate a late-arriving response, see docstring
-            if self._current_target is not None:
-                x, y = self._current_target
+            if self._frontier_origin is not None:
+                x, y = self._frontier_origin
                 self._blacklist_target(x, y)
             self._current_target = None
+            self._frontier_origin = None
             self._goal_start_time = None
             self._last_progress_distance = None
             self._last_progress_time = None
@@ -421,10 +646,11 @@ class FrontierExplorerNode(Node):
             f'{PATH_CHECK_TIMEOUT_S:.0f}s; giving up on it directly.'
         )
         self._path_epoch += 1  # invalidate a late-arriving response, see docstring
-        if self._current_target is not None:
-            x, y = self._current_target
+        if self._frontier_origin is not None:
+            x, y = self._frontier_origin
             self._blacklist_target(x, y)
         self._current_target = None
+        self._frontier_origin = None
         self._pending_yaw = None
         self._path_check_start_time = None
         self._state = State.IDLE
@@ -508,6 +734,7 @@ class FrontierExplorerNode(Node):
                 'compute_path_to_pose goal rejected; will retry from scratch next tick.'
             )
             self._current_target = None
+            self._frontier_origin = None
             self._pending_yaw = None
             self._path_check_start_time = None
             self._state = State.IDLE
@@ -541,8 +768,10 @@ class FrontierExplorerNode(Node):
                 f'(error_code={result.result.error_code}); skipping without spending a '
                 f'full Nav2 attempt on it.'
             )
-            self._blacklist_target(x, y)
+            fx, fy = self._frontier_origin if self._frontier_origin is not None else (x, y)
+            self._blacklist_target(fx, fy)
             self._current_target = None
+            self._frontier_origin = None
             self._pending_yaw = None
             self._state = State.IDLE
             return
@@ -562,6 +791,7 @@ class FrontierExplorerNode(Node):
             # forever when called from _path_result_cb, since _evaluate() unconditionally
             # no-ops on that state and nothing else would ever pull it back out.
             self._current_target = None
+            self._frontier_origin = None
             self._state = State.IDLE
             return
         self.get_logger().info(f'Sending NavigateToPose goal to ({x:.2f}, {y:.2f}).')
@@ -620,6 +850,7 @@ class FrontierExplorerNode(Node):
             self.get_logger().warn('Nav2 rejected the frontier goal.')
             self._state = State.IDLE
             self._current_target = None
+            self._frontier_origin = None
             self._goal_start_time = None
             self._last_progress_distance = None
             self._last_progress_time = None
@@ -637,11 +868,12 @@ class FrontierExplorerNode(Node):
         }.get(result.status, f'status={result.status}')
         self.get_logger().info(f'Nav2 goal finished: {status_name}')
 
-        if result.status != GoalStatus.STATUS_SUCCEEDED and self._current_target is not None:
-            x, y = self._current_target
+        if result.status != GoalStatus.STATUS_SUCCEEDED and self._frontier_origin is not None:
+            x, y = self._frontier_origin
             self._blacklist_target(x, y)
 
         self._current_target = None
+        self._frontier_origin = None
         self._goal_handle = None
         self._goal_start_time = None
         self._cancel_requested = False

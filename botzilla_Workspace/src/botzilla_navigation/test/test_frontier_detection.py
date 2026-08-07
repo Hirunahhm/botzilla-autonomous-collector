@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from botzilla_navigation.frontier_detection import (  # noqa: E402,I100
     distance,
     find_frontiers,
+    find_low_cost_point,
     grid_to_world,
     select_target,
     world_to_grid,
@@ -168,3 +169,57 @@ def test_select_target_empty_returns_none():
 
 def test_distance():
     assert distance(0.0, 0.0, 3.0, 4.0) == 5.0
+
+
+def test_find_low_cost_point_returns_start_if_already_safe():
+    rows = [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+    ]
+    data, w, h = grid(rows, 3)
+    assert find_low_cost_point(data, w, h, row=1, col=1, max_cost=50) == (1, 1)
+
+
+def test_find_low_cost_point_snaps_away_from_wall_inflation():
+    """Regression test for the live "stuck exploration" bug.
+
+    A frontier cell sitting in a wall's inflation halo (cost 99, just under lethal 100)
+    is free in the raw SLAM map but unreachable in the costmap Nav2 actually plans
+    against. find_low_cost_point must walk outward to the nearest cell clear of that
+    halo rather than hand back the frontier cell itself.
+    """
+    rows = [
+        [100, 99, 99, 10, 0],
+        [100, 99, 99, 10, 0],
+        [100, 99, 99, 10, 0],
+    ]
+    data, w, h = grid(rows, 5)
+    # Frontier cell at (1, 1): buried in inflation (cost 99).
+    result = find_low_cost_point(data, w, h, row=1, col=1, max_cost=50, search_radius=10)
+    assert result is not None
+    r, c = result
+    assert data[r * w + c] < 50
+
+
+def test_find_low_cost_point_returns_none_when_nothing_nearby():
+    rows = [[99] * 5 for _ in range(5)]
+    data, w, h = grid(rows, 5)
+    assert find_low_cost_point(data, w, h, row=2, col=2, max_cost=50, search_radius=2) is None
+
+
+def test_find_low_cost_point_out_of_bounds_returns_none():
+    rows = [[0, 0], [0, 0]]
+    data, w, h = grid(rows, 2)
+    assert find_low_cost_point(data, w, h, row=5, col=5, max_cost=50) is None
+
+
+def test_find_low_cost_point_ignores_unknown_cells():
+    rows = [
+        [99, 99, -1],
+        [99, 99, -1],
+        [99, 99, -1],
+    ]
+    data, w, h = grid(rows, 3)
+    # Everything reachable is either inflated (99) or unknown (-1); no cell qualifies.
+    assert find_low_cost_point(data, w, h, row=1, col=1, max_cost=50, search_radius=5) is None

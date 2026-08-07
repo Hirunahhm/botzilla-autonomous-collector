@@ -118,8 +118,8 @@ planner_server:
       # for 8 s while 4 consecutive goals to a target 0.527 m away all "succeeded" in
       # 0.07-0.18 s each. The frontier was never cleared, so the explorer re-selected
       # it forever. Frontier cells sit against walls by definition, so with
-      # robot_radius 0.275 many are genuinely unreachable — they must fail honestly
-      # and get blacklisted rather than loop.
+      # robot_radius 0.20 many are still genuinely unreachable — they must fail
+      # honestly and get blacklisted rather than loop.
       tolerance: 0.1
       use_astar: false
       # true -> false: NavFn treated UNKNOWN cells as traversable and produced
@@ -184,26 +184,34 @@ local_costmap:
       # Circular footprint instead of the true polygon. With the polygon, the
       # costmap derived inscribed=0.157m / circumscribed=0.275m, and NavFn (a
       # POINT planner) only hard-refuses gaps narrower than 2*inscribed=0.314m
-      # — while the robot actually sweeps up to 0.550m. Every gap in that band
-      # was a path the planner promised and DWB could not execute, giving a 25%
-      # goal success rate (2/8) with the rest hitting "Failed to make progress".
-      # A circle makes inscribed == circumscribed == 0.275m, so the costmap
-      # blocks within 0.275m of any obstacle and NavFn cannot route through a
-      # gap under 0.55m. Conservative (won't attempt tight-but-passable spots)
-      # but costs no CPU, which matters on this board.
-      robot_radius: 0.275
+      # — while the robot actually sweeps up to 0.550m during an in-place
+      # rotation. Every gap in that band was a path the planner promised and
+      # DWB could not execute, giving a 25% goal success rate (2/8) with the
+      # rest hitting "Failed to make progress".
+      #
+      # 0.275 (circumscribed, i.e. worst-case rotate-anywhere clearance) was
+      # tried first and was too conservative: confirmed live that the robot
+      # could be manually driven straight through passages the planner refused
+      # to route through, because 0.275 demands ~0.55m of clearance on every
+      # passage even ones only ever driven through, never rotated in. 0.20
+      # instead approximates the robot's actual straight-line half-width, so
+      # the planner will attempt those passages. This trades away the earlier
+      # rotate-anywhere guarantee: if a planned path needs an in-place
+      # rotation somewhere narrower than 0.55m, DWB will still correctly
+      # refuse to execute that step — but that's now a soft failure the
+      # frontier explorer's stall watchdog / blacklist / backup-recovery
+      # handles (try the next target, back up if truly stuck), not a hard
+      # block on the passage entirely.
+      robot_radius: 0.20
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        # Reduced 0.55 -> 0.30: the footprint's circumscribed radius is ~0.275m, so 0.30
-        # keeps a safe margin without painting a wide inscribed-cost band around every
-        # obstacle. At 0.55 the robot sat inside inscribed cost near any wall/pillar, and
-        # DWB's BaseObstacle critic rejects *any* trajectory through inscribed cost as
-        # infeasible -> only in-place rotation survived -> robot span forever with
-        # linear.x=0 (confirmed live: 1856 cmd_vel samples, linear.x=0 in every one).
-        # Arena corridors are >1m wide, so 0.30 stays collision-safe.
-        inflation_radius: 0.30
+        # Kept ~3cm above robot_radius, same margin ratio as the original
+        # 0.275/0.30 pairing — enough clearance to not paint inscribed cost
+        # directly on the footprint boundary, without re-adding back the
+        # rotate-anywhere padding robot_radius above just removed.
+        inflation_radius: 0.23
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -268,7 +276,7 @@ global_costmap:
       track_unknown_space: true
       # Circular footprint — must match local_costmap or the planner and
       # controller disagree about what fits. See the local_costmap note.
-      robot_radius: 0.275
+      robot_radius: 0.20
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -292,8 +300,8 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        # Reduced 0.55 -> 0.30 to match local_costmap (see the local inflation_layer note):
-        # keeps planner and controller costmaps consistent so DWB doesn't reject the
+        # Must match local_costmap (see the local inflation_layer note): keeps
+        # planner and controller costmaps consistent so DWB doesn't reject the
         # global planner's route as infeasible.
-        inflation_radius: 0.30
+        inflation_radius: 0.23
       always_send_full_costmap: True

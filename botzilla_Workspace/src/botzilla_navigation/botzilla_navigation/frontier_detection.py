@@ -100,6 +100,55 @@ def find_frontiers(data, width, height, min_cluster_size=4):
     return clusters
 
 
+def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_radius=10):
+    """Find the nearest cell to (row, col) whose inflated costmap cost is safely low.
+
+    A frontier cell is, by definition, adjacent to unknown space — and unknown space in
+    a bounded arena is almost always adjacent to a wall just beyond sensor range. With
+    inflation applied, that puts most raw frontier cells inside the wall's inflation
+    halo: free in the raw SLAM map (cost 0) but LETHAL_OBSTACLE(100) or
+    INSCRIBED_INFLATED_OBSTACLE(99) in the actual global_costmap the planner uses,
+    which is why ComputePathToPose was observed live returning NO_VALID_PATH for the
+    large majority of raw frontier targets in a compact arena. Rather than send Nav2 a
+    goal it can only ever reject, expand outward (BFS, nearest-first) from the frontier
+    cell and hand back the first cell whose cost is below max_cost — well under the 99
+    inscribed cutoff, so the result is a point Nav2 can actually plan into, not just one
+    that scrapes under the lethal threshold.
+
+    costmap is a flat row-major int8 array matching nav_msgs/msg/OccupancyGrid.data
+    (as published on /global_costmap/costmap): 0-100 = cost, -1 = unknown/unseen by the
+    costmap. search_radius bounds the BFS in cells — a frontier with no low-cost cell
+    anywhere nearby is treated as genuinely unreachable rather than searched forever.
+
+    Returns (row, col) of the nearest qualifying cell, or None if none exists within
+    search_radius.
+    """
+    def idx(r, c):
+        return r * width + c
+
+    if not (0 <= row < height and 0 <= col < width):
+        return None
+
+    visited = {(row, col)}
+    queue = [(row, col)]
+    head = 0
+    while head < len(queue):
+        r, c = queue[head]
+        head += 1
+        cost = costmap[idx(r, c)]
+        if 0 <= cost < max_cost:
+            return (r, c)
+        if abs(r - row) >= search_radius or abs(c - col) >= search_radius:
+            continue
+        for dr, dc in _NEIGHBORS_8:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < height and 0 <= nc < width and (nr, nc) not in visited:
+                visited.add((nr, nc))
+                queue.append((nr, nc))
+
+    return None
+
+
 def grid_to_world(row, col, resolution, origin_x, origin_y):
     """Grid-cell coordinates -> world coordinates (cell center), per OccupancyGrid.info."""
     x = origin_x + (col + 0.5) * resolution
