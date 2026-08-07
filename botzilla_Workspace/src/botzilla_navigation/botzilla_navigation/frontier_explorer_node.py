@@ -118,6 +118,41 @@ banned. failure_history (the exponential-backoff counters) is deliberately NOT c
 so a frontier that's genuinely unreachable rather than just occluded by the robot's own
 position still gets pushed out further on repeat offenses.
 
+Self-clearance: the stuck-recovery trigger above reacts to "no known frontier is
+reachable," which is a SYMPTOM — investigating why revealed a sharper cause. Confirmed
+live: after successfully reaching a frontier and stopping, the robot's own center cell
+read costmap cost 0, but a real wall sat only one costmap cell away — well inside the
+robot's actual footprint radius. From that resting pose, EVERY subsequent
+ComputePathToPose call failed with NO_VALID_PATH in every direction tried (five
+differently-located frontiers, all rejected), not because those destinations were
+actually blocked, but because the START pose itself was already footprint-in-collision:
+NavFn plans from the robot's current pose, and a start pose whose body overlaps
+high-cost space can't produce a valid path to anywhere. The generic stuck-recovery above
+still caught this (eventually — after burning through 15s of failed attempts across
+every known frontier first), which is why it looked like the robot was "deadlocked" even
+in rooms with plenty of open floor: the problem was never the destinations, it was
+whichever wall the robot happened to park next to on its way in. _evaluate() now checks
+this directly and first, via frontier_detection.footprint_clear on the robot's own
+current cell — if the robot's body already overlaps high cost, it backs up immediately
+via the same recovery path, without wasting a cycle finding out the hard way through
+five doomed reachability checks.
+
+Spin fallback: BackUp can itself fail this exact same way. Confirmed live: the goal
+heading a frontier approach ends on points toward the frontier, not away from whatever
+wall the approach passed close to, so the wall self-clearance detects can sit
+beside/behind the robot's heading rather than in front of it — meaning a straight
+reverse drives directly into the very obstacle it's trying to escape (Nav2's BackUp
+correctly detects this itself and aborts with "Collision Ahead"). A rotation only needs
+radial clearance around the robot, not linear clearance in one specific direction, so it
+can succeed exactly where a straight reverse can't — matching what driving the robot
+manually confirmed live (turning was possible from spots straight reversal wasn't).
+_backup_result_cb chains into a Spin goal whenever BackUp itself doesn't SUCCEED, turning
+RECOVERY_SPIN_ANGLE_RAD (always the same direction, see the constant's own comment for
+why alternating direction was tried first and abandoned) before ending the recovery
+cycle either way — if the robot is still footprint-blocked afterward, the next tick's
+self-clearance check starts another backup/spin cycle, sweeping a new quadrant each time
+rather than re-trying the same one.
+
 Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
@@ -129,11 +164,12 @@ from botzilla_navigation.frontier_detection import (
     distance,
     find_frontiers,
     find_low_cost_point,
+    footprint_clear,
     grid_to_world,
     select_target,
     world_to_grid,
 )
-from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
+from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose, Spin
 from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.action import ActionClient
@@ -177,10 +213,32 @@ STUCK_RECOVERY_TIMEOUT_S = 15.0
 BACKUP_DISTANCE_M = 0.3
 BACKUP_SPEED_MPS = 0.1
 BACKUP_TIME_ALLOWANCE_S = 10.0
-# Generous backstop in case the BackUp goal's own done-callback never lands (server
+
+# Fallback when BackUp itself aborts (Nav2's own "Collision Ahead" — the local costmap
+# sees an obstacle in the reverse direction too). Confirmed live: a wall detected via
+# self-clearance can sit BESIDE/BEHIND the robot's current heading rather than in front
+# of it, since the goal-approach heading points toward the frontier, not away from
+# whatever wall the approach happened to pass close to — so straight backward travel
+# drives directly into the same obstacle self-clearance just flagged. A rotation needs
+# only radial clearance around the robot, not linear clearance in one specific
+# direction, so it can succeed in exactly the cases a straight reverse can't.
+#
+# Always the SAME direction (left — matches empirically confirmed clearance in this
+# arena), never alternated: target_yaw is RELATIVE to the robot's current heading, so
+# alternating +/-90 each attempt ping-pongs between only TWO absolute headings forever
+# (theta, theta+90, theta, theta+90, ...) — confirmed live, this left the robot cycling
+# in place at a genuine corner without ever trying the other two quadrants. A fixed
+# +90 every time instead sweeps theta, theta+90, theta+180, theta+270 in turn — a full
+# rotation across four recovery cycles worst case — before any heading repeats.
+RECOVERY_SPIN_ANGLE_RAD = math.pi / 2.0
+SPIN_TIME_ALLOWANCE_S = 10.0
+
+# Generous backstop in case a recovery goal's own done-callback never lands (server
 # unresponsive) — mirrors the same unaccepted-goal gap _check_stall/_check_path_stall
-# guard against elsewhere in this node. Comfortably above BACKUP_TIME_ALLOWANCE_S.
-RECOVERY_ABS_TIMEOUT_S = 30.0
+# guard against elsewhere in this node. Comfortably above
+# BACKUP_TIME_ALLOWANCE_S + SPIN_TIME_ALLOWANCE_S combined (the worst case: backup runs
+# its full allowance, aborts, then spin also runs its full allowance).
+RECOVERY_ABS_TIMEOUT_S = 45.0
 
 # How long to wait for a compute_path_to_pose response before giving up on the
 # reachability check directly. Reachability checks normally resolve in well under a
@@ -209,6 +267,16 @@ BLACKLIST_COOLDOWN_MAX_S = 3600.0
 # the lethal threshold.
 COSTMAP_SAFE_COST = 50
 COSTMAP_SEARCH_RADIUS_CELLS = 10
+
+# Self-clearance check — see module docstring's "Self-clearance" section. Confirmed
+# live: a point-cost check on a candidate goal isn't enough to guarantee the robot's own
+# BODY stays clear once parked there. SELF_CLEARANCE_RADIUS_M matches the planner's
+# robot_radius (nav2_params.yaml) — the same footprint the planner itself uses to decide
+# whether a pose is in collision. SELF_CLEARANCE_MAX_COST uses the inscribed/lethal
+# cutoff (99), not COSTMAP_SAFE_COST's stricter 50: this check asks "is my body actually
+# touching something," not "is this a comfortable place to aim for."
+SELF_CLEARANCE_RADIUS_M = 0.20
+SELF_CLEARANCE_MAX_COST = 99
 
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
@@ -258,7 +326,8 @@ class FrontierExplorerNode(Node):
         # or a recovery backup completes.
         self._stuck_since = None
         self._backup_goal_handle = None
-        self._recovery_start_time = None  # rclpy.time.Time the BackUp goal was sent
+        self._spin_goal_handle = None
+        self._recovery_start_time = None  # rclpy.time.Time the recovery sequence started
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -290,6 +359,7 @@ class FrontierExplorerNode(Node):
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
         self._backup_client = ActionClient(self, BackUp, 'backup')
+        self._spin_client = ActionClient(self, Spin, 'spin')
 
         self.create_timer(EVAL_PERIOD_S, self._evaluate)
 
@@ -319,15 +389,18 @@ class FrontierExplorerNode(Node):
             return
 
         self.get_logger().info('Exploration DISABLED — yielding the base to executor_node.')
-        # Actively cancel rather than just going idle: an in-flight NavigateToPose or
-        # BackUp goal keeps Nav2 publishing cmd_vel, which would fight the executor's own
-        # commands all the way through cube approach and capture.
+        # Actively cancel rather than just going idle: an in-flight NavigateToPose,
+        # BackUp, or Spin goal keeps Nav2 publishing cmd_vel, which would fight the
+        # executor's own commands all the way through cube approach and capture.
         if self._goal_handle is not None and not self._cancel_requested:
             self._goal_handle.cancel_goal_async()
             self._cancel_requested = True
         if self._backup_goal_handle is not None:
             self._backup_goal_handle.cancel_goal_async()
             self._backup_goal_handle = None
+        if self._spin_goal_handle is not None:
+            self._spin_goal_handle.cancel_goal_async()
+            self._spin_goal_handle = None
         # Invalidate any in-flight attempt so its late callback can't resurrect state
         # after we've handed control over.
         self._goal_epoch += 1
@@ -399,6 +472,15 @@ class FrontierExplorerNode(Node):
         if robot_pose is None:
             return
         robot_x, robot_y = robot_pose
+
+        if not self._is_self_clear(robot_x, robot_y):
+            self.get_logger().warn(
+                'Own footprint overlaps high-cost space (parked too close to an '
+                'obstacle) — backing up immediately rather than trying frontiers that '
+                'are doomed from this start pose. See module docstring "Self-clearance".'
+            )
+            self._start_recovery_backup()
+            return
 
         clusters = find_frontiers(
             msg.data, msg.info.width, msg.info.height, MIN_FRONTIER_CLUSTER_SIZE
@@ -473,6 +555,26 @@ class FrontierExplorerNode(Node):
             cm.info.origin.position.x, cm.info.origin.position.y
         )
 
+    def _is_self_clear(self, robot_x, robot_y):
+        """Check the robot's own footprint against the costmap it's currently standing in.
+
+        See module docstring's "Self-clearance" section — a candidate goal being clear
+        (find_low_cost_point) says nothing about whether the robot's own BODY is
+        currently clear of high cost, and confirmed live, it can end up parked close
+        enough to a wall that every subsequent path attempt fails from that start pose
+        alone, in every direction.
+        """
+        cm = self._latest_costmap
+        row, col = world_to_grid(
+            robot_x, robot_y, cm.info.resolution,
+            cm.info.origin.position.x, cm.info.origin.position.y
+        )
+        radius_cells = max(1, round(SELF_CLEARANCE_RADIUS_M / cm.info.resolution))
+        return footprint_clear(
+            cm.data, cm.info.width, cm.info.height, row, col,
+            radius_cells=radius_cells, max_cost=SELF_CLEARANCE_MAX_COST
+        )
+
     def _filter_blacklisted(self, frontiers_world):
         now = self.get_clock().now()
         self._blacklist = [b for b in self._blacklist if b[2] > now]
@@ -500,17 +602,17 @@ class FrontierExplorerNode(Node):
                 f'({elapsed_s:.0f}/{STUCK_RECOVERY_TIMEOUT_S:.0f}s before backing up).'
             )
             return
+        self.get_logger().warn(
+            f'Every known frontier has been unreachable for {STUCK_RECOVERY_TIMEOUT_S:.0f}s '
+            f'straight — backing up instead of waiting out the cooldown.'
+        )
         self._start_recovery_backup()
 
     def _start_recovery_backup(self):
         if not self._backup_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn('backup action server not available yet; will retry next tick.')
             return
-        self.get_logger().warn(
-            f'Every known frontier has been unreachable for {STUCK_RECOVERY_TIMEOUT_S:.0f}s '
-            f'straight — backing up {BACKUP_DISTANCE_M:.2f}m to change the geometry instead '
-            f'of waiting out the cooldown.'
-        )
+        self.get_logger().info(f'Backing up {BACKUP_DISTANCE_M:.2f}m.')
         goal = BackUp.Goal()
         goal.target.x = -BACKUP_DISTANCE_M
         goal.speed = BACKUP_SPEED_MPS
@@ -539,14 +641,65 @@ class FrontierExplorerNode(Node):
             GoalStatus.STATUS_CANCELED: 'CANCELED',
         }.get(result.status, f'status={result.status}')
         self.get_logger().info(f'BackUp recovery finished: {status_name}')
+        self._backup_goal_handle = None
+        if result.status == GoalStatus.STATUS_SUCCEEDED:
+            self._finish_recovery()
+            return
+        # BackUp itself failed — most likely Nav2's own "Collision Ahead" from the
+        # local costmap. Confirmed live: this happens when the obstacle self-clearance
+        # detected sits beside/behind the robot's current heading rather than in front
+        # of it, so straight backward travel drives right into the same wall. A
+        # rotation needs only radial clearance, not linear clearance in one specific
+        # direction — see module docstring's "Self-clearance" section.
+        self._start_recovery_spin()
+
+    def _start_recovery_spin(self):
+        if not self._spin_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn(
+                'spin action server not available yet; giving up on this recovery cycle.'
+            )
+            self._finish_recovery()
+            return
+        self.get_logger().info(
+            f'BackUp could not clear the obstacle; spinning '
+            f'{math.degrees(RECOVERY_SPIN_ANGLE_RAD):.0f} deg instead.'
+        )
+        goal = Spin.Goal()
+        goal.target_yaw = RECOVERY_SPIN_ANGLE_RAD
+        goal.time_allowance = Duration(seconds=SPIN_TIME_ALLOWANCE_S).to_msg()
+        send_future = self._spin_client.send_goal_async(goal)
+        send_future.add_done_callback(self._spin_response_cb)
+
+    def _spin_response_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Spin goal rejected; ending this recovery cycle.')
+            self._finish_recovery()
+            return
+        self._spin_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._spin_result_cb)
+
+    def _spin_result_cb(self, future):
+        result = future.result()
+        status_name = {
+            GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+            GoalStatus.STATUS_ABORTED: 'ABORTED',
+            GoalStatus.STATUS_CANCELED: 'CANCELED',
+        }.get(result.status, f'status={result.status}')
+        self.get_logger().info(f'Spin recovery finished: {status_name}')
+        self._spin_goal_handle = None
+        # Whether spin succeeded or not, the recovery cycle is over — if the robot is
+        # still footprint-blocked, next tick's self-clearance check will catch it and
+        # start another backup/spin cycle (see module docstring's "Self-clearance").
         self._finish_recovery()
 
     def _check_recovery_stall(self):
-        """Give up waiting on a BackUp goal that never resolves at all.
+        """Give up waiting on a recovery goal (BackUp or Spin) that never resolves at all.
 
         Mirrors _check_stall/_check_path_stall's unaccepted-goal handling — see module
-        docstring. RECOVERY_ABS_TIMEOUT_S is comfortably above BACKUP_TIME_ALLOWANCE_S,
-        so this only fires if the done-callback itself never lands.
+        docstring. RECOVERY_ABS_TIMEOUT_S is comfortably above the combined worst-case
+        BackUp + Spin runtime, so this only fires if a done-callback never lands.
         """
         if self._recovery_start_time is None:
             return
@@ -554,7 +707,7 @@ class FrontierExplorerNode(Node):
         if elapsed_s < RECOVERY_ABS_TIMEOUT_S:
             return
         self.get_logger().warn(
-            f'BackUp recovery did not resolve within {RECOVERY_ABS_TIMEOUT_S:.0f}s; '
+            f'Recovery did not resolve within {RECOVERY_ABS_TIMEOUT_S:.0f}s; '
             f'giving up on it directly.'
         )
         self._finish_recovery()
@@ -568,6 +721,7 @@ class FrontierExplorerNode(Node):
         self._blacklist = []
         self._stuck_since = None
         self._backup_goal_handle = None
+        self._spin_goal_handle = None
         self._recovery_start_time = None
         self._state = State.IDLE
 

@@ -149,6 +149,42 @@ def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_ra
     return None
 
 
+def footprint_clear(costmap, width, height, row, col, radius_cells, max_cost=99):
+    """Check whether a circular footprint centered at (row, col) is free of high cost.
+
+    find_low_cost_point (above) checks a single point's own cost, which is enough for a
+    navigation TARGET — but it does not guarantee the robot's actual body stays clear
+    once it parks there. Confirmed live: after successfully reaching a frontier, the
+    robot's own center cell read cost 0, yet a real wall sat only one cell away — well
+    inside the robot's footprint radius. From that pose, every subsequent
+    ComputePathToPose call failed with NO_VALID_PATH in every direction, because the
+    START pose itself was already footprint-in-collision, not because the destinations
+    were actually blocked. This function lets the caller detect that directly (checking
+    the robot's OWN current cell, not a candidate goal) so it can back away immediately
+    instead of cycling through doomed targets first.
+
+    radius_cells should match the robot's actual footprint radius in grid cells (not a
+    search radius to expand outward like find_low_cost_point — every cell within it is
+    checked). Returns True if every in-bounds cell within radius_cells has cost strictly
+    below max_cost (unknown cells, value -1, do not count as blocking — matches the
+    project's existing free/occupied cost-threshold convention elsewhere). Out-of-bounds
+    cells are skipped rather than treated as blocking, since the footprint circle can
+    extend past the costmap edge near map boundaries.
+    """
+    def idx(r, c):
+        return r * width + c
+
+    r_sq = radius_cells * radius_cells
+    for dr in range(-radius_cells, radius_cells + 1):
+        for dc in range(-radius_cells, radius_cells + 1):
+            if dr * dr + dc * dc > r_sq:
+                continue
+            nr, nc = row + dr, col + dc
+            if 0 <= nr < height and 0 <= nc < width and costmap[idx(nr, nc)] >= max_cost:
+                return False
+    return True
+
+
 def grid_to_world(row, col, resolution, origin_x, origin_y):
     """Grid-cell coordinates -> world coordinates (cell center), per OccupancyGrid.info."""
     x = origin_x + (col + 0.5) * resolution
