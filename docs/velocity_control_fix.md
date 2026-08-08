@@ -344,16 +344,11 @@ holding each for 5 s, discard the first 2 s, then least-squares fit
    LOCAL plan length                : mean 8.4 poses, min 0 (sometimes empty)
    ```
 
-   The robot sits roughly perpendicular to its own path and shuffles backward. Reversing
-   toward the goal satisfies `PathDist`/`GoalDist` as well as turning around does — those
-   critics score distance, not heading — so DWB is exploiting a scoring gap that only
-   opens once alignment is lost. The empty local plans are the more interesting clue.
-   **Do not "fix" this by clamping `min_vel_x`**; that suppresses the symptom without
-   addressing why alignment is lost in the first place.
-
-   The outstanding measurement is distance-to-goal over time within a single goal, which
-   separates "wanders with no net approach" (alignment/control) from "approaches then
-   overshoots" (goal tolerance / oscillation).
+   **ROOT CAUSE FOUND — see §9.** An earlier revision of this section warned "do not fix
+   this by clamping `min_vel_x`", on the grounds that it would mask the symptom. That
+   warning was written before the mechanism was identified and is now withdrawn: the
+   scoring gap turned out to be a genuine misconfiguration, and restricting reverse is
+   part of the correct fix rather than a band-aid.
 
 2. **Recovery behaviours are failing.** In the same run a `BackUp` aborted and the
    fallback `Spin` aborted too — consistent with the local costmap being tighter than it
@@ -361,3 +356,76 @@ holding each for 5 s, discard the first 2 s, then least-squares fit
 3. **Local costmap is lidar-only** (`observation_sources: scan`), so it cannot see anything
    below the lidar plane. Unrelated to this fix, but must be addressed with
    `pointcloud_to_laserscan` before cube collection.
+
+---
+
+## 9. Why the robot drove backwards to its goals
+
+Separate root cause from the velocity work above, found after it. Worth recording because
+the symptom (never reaching a goal) looked like a planner or SLAM problem and was neither.
+
+### Only two critics care about heading, and both were disabled by a parameter
+
+The active critic list is:
+
+```yaml
+critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+```
+
+`PathAlign` and `GoalAlign` are the **only** two that consider which way the robot faces.
+From nav2's own header (`dwb_critics/path_align.hpp`): *"this critic calculates how far a
+point `forward_point_distance` in front of the robot is from the global path."*
+
+`forward_point_distance` was set to **0.1 m**, against a `robot_radius` of **0.20 m**. The
+projected point therefore sat *inside the robot's own footprint*, and rotating the robot a
+full 180° moved it by only 0.2 m — a rounding error at 0.05 m costmap resolution.
+
+So both heading-aware critics were effectively blind, while the two highest-weighted
+critics scored pure distance:
+
+| critic | scale | heading-aware? |
+|---|---|---|
+| `PathDist` | 32.0 | no — pure distance |
+| `GoalDist` | 24.0 | no — pure distance |
+| `PathAlign` | 32.0 | yes, but crippled at 0.1 m |
+| `GoalAlign` | 24.0 | yes, but crippled at 0.1 m |
+
+**Reversing toward a goal scored identically to driving forward toward it.** With
+`min_vel_x: -0.10` making reverse legal, DWB had no reason to prefer forward. Measured
+over a 150 s hardware run: **1295 reverse commands vs 349 forward**, mean bearing error to
+its own path **96.9°**, path *behind* the robot 58% of the time, **0 of 12 goals reached**.
+
+### Fix
+
+```yaml
+PathAlign.forward_point_distance: 0.325   # was 0.1 (0.325 is nav2's default)
+GoalAlign.forward_point_distance: 0.325   # was 0.1
+min_vel_x: 0.0                            # was -0.10
+```
+
+At 0.325 the projected point clears the footprint by ~0.12 m, so facing the wrong way
+costs real score.
+
+### Why simulation did not catch it
+
+Both offending values were present in the simulation config that ran successfully. The
+misconfiguration was **latent, not absent**: reversing in simulation works fine — perfect
+odometry, no deadband, instant localisation — so a reverse-biased controller still reached
+its goals. On hardware, reverse driving is unsensed (the depth camera faces forward, and
+the local costmap is lidar-only), and every forward/reverse flip bleeds odometry accuracy
+while RTAB-Map only corrects pose at ~1 Hz.
+
+The lesson worth keeping: **simulation validates logic, not cost-function tuning.** A
+critic weighting that merely fails to *prefer* the right behaviour is invisible in a world
+forgiving enough that the wrong behaviour also succeeds.
+
+### The `min_vel_x` history, corrected
+
+`min_vel_x: -0.10` was originally introduced because a robot wedged against a wall had no
+escape trajectory — recorded at the time as "the path-alignment critics kept pulling it
+back toward the blocked heading". That is the *same* bug: the align critics could not see
+heading, so they could not reward turning away from the obstruction. Allowing reverse
+treated the symptom and, on hardware, made things considerably worse.
+
+Reversing still exists where it belongs: `behavior_server`'s `BackUp` recovery, a
+deliberate bounded escape, rather than a routine path-following option.

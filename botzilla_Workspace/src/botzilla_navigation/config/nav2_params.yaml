@@ -63,16 +63,27 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      # Negative so DWB can sample REVERSE during normal path following, not only via the
-      # BackUp recovery behaviour. Confirmed live in sim: with this at 0.0 a robot wedged
-      # against a wall had no escape trajectory at all — forward was blocked, the
-      # path-alignment critics kept pulling it back toward the blocked heading, and it
-      # simply oscillated in place until the stall watchdog gave up, despite open floor
-      # directly behind it. Kept small (half of max_vel_x): the depth camera faces
-      # forward, so extended reversing is blind and should stay the exception. vx=0 is
-      # still sampled, so pure in-place rotation remains available; the velocity deadband
-      # is enforced separately by min_speed_xy/min_speed_theta below.
-      min_vel_x: -0.10
+      # Back to 0.0 — reverse is no longer sampled during normal path following.
+      #
+      # This was set to -0.10 in sim after a robot wedged against a wall had no escape
+      # trajectory: forward was blocked, "the path-alignment critics kept pulling it back
+      # toward the blocked heading", and it oscillated until the watchdog gave up despite
+      # open floor behind it. That symptom is now understood to be the SAME bug fixed at
+      # PathAlign.forward_point_distance below: those critics were blind to heading, so
+      # they could not reward turning away from the blockage. Allowing reverse treated the
+      # symptom, and on hardware it backfired badly — with reversing legal AND heading
+      # unscored, DWB reversed 1295 times vs 349 forward and reached 0 of 12 goals.
+      #
+      # With the align critics actually able to see heading, the robot can now be rewarded
+      # for turning toward free space instead of reversing into it blind. That matters
+      # because the depth camera faces forward: sustained reverse driving is unsensed, and
+      # the local costmap is lidar-only (it cannot see anything below the lidar plane).
+      #
+      # vx=0 is still sampled, so pure in-place rotation remains available. The BackUp
+      # recovery behaviour is unaffected — it lives in behavior_server, not DWB, and still
+      # reverses when genuinely wedged. That is the right place for reversing: a
+      # deliberate, bounded, supervised escape rather than a routine path-following option.
+      min_vel_x: 0.0
       min_vel_y: 0.0
       max_vel_x: 0.2
       max_vel_y: 0.0
@@ -122,24 +133,31 @@ controller_server:
       decel_lim_x: -0.4
       decel_lim_y: 0.0
       decel_lim_theta: -1.5
-      # DWB's DEFAULT generator (StandardTrajectoryGenerator, used implicitly whenever this
-      # is unset) samples the entire velocity range every cycle regardless of the robot's
-      # current velocity — acc_lim_* above only shape the simulated trajectory and do NOT
-      # bound the emitted command. That is why cmd_vel could jump 0 -> +0.4 -> -0.4 on
-      # consecutive 20 Hz cycles. LimitedAccelGenerator restricts sampling to velocities
-      # actually reachable within one control period, making acceleration continuity a
-      # property of the controller rather than something bolted on downstream.
+      # trajectory_generator_name is deliberately LEFT UNSET, so DWB uses its default
+      # StandardTrajectoryGenerator. Do not set LimitedAccelGenerator here — it was tried
+      # and it nearly stopped the robot translating at all.
       #
-      # Note this only governs DWB. behavior_server's BackUp/Spin publish their own
-      # commands and bypass it entirely — velocity_smoother covers those.
-      trajectory_generator_name: "dwb_plugins::LimitedAccelGenerator"
-      # LimitedAccelGenerator warns "'sim_period' parameter is not set for FollowPath" and
-      # falls back to an implicit default if this is omitted. Set it explicitly because it
-      # is exactly what sizes the reachable-velocity window: the generator samples
-      # current_vel +/- acc_lim * sim_period, so a value that disagrees with the real
-      # control period silently makes the acceleration limiting either useless (too large)
-      # or crippling (too small). Must equal 1 / controller_frequency (20 Hz above).
-      sim_period: 0.05
+      # The reasoning that led to trying it: StandardTrajectoryGenerator samples the entire
+      # velocity range every cycle regardless of current velocity (acc_lim_* only shape the
+      # simulated trajectory, they do not bound the emitted command), which is why cmd_vel
+      # could jump 0 -> +0.4 -> -0.4 on consecutive 20 Hz cycles. LimitedAccelGenerator
+      # restricts sampling to velocities reachable within one control period, which sounds
+      # like the principled fix.
+      #
+      # In practice it starves forward motion. It samples current_vel +/- acc_lim_x *
+      # sim_period = +/-0.02 m/s per cycle, so from a standstill the robot can only ask for
+      # 0.02 m/s and needs ~10 consecutive cycles of the critics preferring forward to
+      # reach max_vel_x. Whenever the robot is meaningfully misaligned the critics prefer
+      # rotating first, so translation never accumulates and it rotates indefinitely.
+      # Measured A/B on hardware, same arena, everything else equal:
+      #
+      #     StandardTrajectoryGenerator : 20.2 m travelled in 150 s
+      #     LimitedAccelGenerator       :  0.12 m travelled in  89 s   (heading swung 128 deg)
+      #
+      # Acceleration continuity is instead enforced downstream by botzilla_control's
+      # velocity_smoother, which bounds the command actually sent to the base and also
+      # covers behavior_server's BackUp/Spin — those bypass DWB's trajectory generator
+      # entirely, so no generator choice could have smoothed them anyway.
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
@@ -172,10 +190,30 @@ controller_server:
       # the rotate-in-place lock (BaseObstacle rejects inscribed-cost trajectories outright,
       # independent of this scale).
       BaseObstacle.scale: 0.10
+      # 0.1 -> 0.325 (nav2's own default) on BOTH align critics. This was the bug that
+      # made the robot drive backwards to its goals.
+      #
+      # PathAlign/GoalAlign are the ONLY two critics in the list above that care which way
+      # the robot is facing. They work by projecting a point forward_point_distance in
+      # front of the robot and scoring that point's distance to the path/goal. At 0.1 m
+      # the projected point sits INSIDE the robot's own footprint (robot_radius is 0.20),
+      # so rotating the robot 180 degrees moved it by 0.2 m total — a rounding error at
+      # 0.05 m costmap resolution. Both heading-aware critics were therefore effectively
+      # blind, while the two highest-weighted critics, PathDist (32) and GoalDist (24),
+      # score pure distance and are completely direction-agnostic.
+      #
+      # Net effect: reversing toward a goal scored identically to driving forward toward
+      # it, so DWB had no reason to prefer forward and frequently chose reverse. Measured
+      # on hardware over a 150 s run: 1295 reverse commands vs 349 forward, mean bearing
+      # error to its own path 96.9 deg, path behind the robot 58% of the time, and 0 of 12
+      # goals reached. Heading simply was not being optimised.
+      #
+      # At 0.325 the projected point clears the footprint by ~0.12 m, so facing the wrong
+      # way costs real score and forward progress wins.
       PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
+      PathAlign.forward_point_distance: 0.325
       GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
+      GoalAlign.forward_point_distance: 0.325
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0

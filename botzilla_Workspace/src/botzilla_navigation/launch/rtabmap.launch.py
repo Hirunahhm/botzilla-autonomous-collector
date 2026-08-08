@@ -46,14 +46,12 @@ def generate_launch_description():
 
     grid_sensor_arg = DeclareLaunchArgument(
         'grid_sensor',
-        default_value='2',
+        default_value='0',
         description=(
-            'Which sensor builds the occupancy grid: 0=laser scan only, 1=depth camera '
-            'only, 2=both. Exposed as an argument so the depth camera can be isolated '
-            'from the grid without editing this file — the depth contribution is a '
-            'prime suspect whenever obstacles appear to sweep around with the robot, '
-            'since with Grid/NormalsSegmentation=false the ground/obstacle split is '
-            'purely by height and a camera pose error paints the floor as a wall.'
+            'Which sensor builds the occupancy grid: 0=laser scan only (DEFAULT), '
+            '1=depth camera only, 2=both. Defaults to laser-only because the depth '
+            'camera was measured writing overwhelmingly false obstacles into the grid — '
+            'see the comment block below for the numbers before changing this.'
         ),
     )
 
@@ -92,6 +90,38 @@ def generate_launch_description():
         'Grid/RangeMax': '10.0',
         # value_type=str is required: RTAB-Map's own parameters are all strings, but a
         # bare LaunchConfiguration substitution would be auto-typed as an integer here.
+        #
+        # Defaults to '0' (laser only). This was '2' (laser + depth camera) and the depth
+        # contribution was measured to be almost entirely FALSE. Method: for every occupied
+        # cell in /map lying along a CURRENT laser beam and closer than that beam's measured
+        # range, the lidar is actively asserting free space where the map claims an obstacle.
+        # Cells beyond a beam endpoint are not counted — the lidar has nothing to say there.
+        # Same room, same robot pose, only Grid/Sensor changed:
+        #
+        #                              Grid/Sensor=2      Grid/Sensor=0
+        #   occupied cells in /map          694                298
+        #   lidar-contradicted              688                  3
+        #   contradiction rate             3.46%              0.01%
+        #   beam endpoints correct          235                245
+        #
+        # 57% of everything mapped was camera-painted fiction, and the contradicted cells
+        # formed a solid line directly ahead of the robot at 0.85-1.25 m — the signature of
+        # a downward-pitched depth camera painting the FLOOR as a wall. Real structure did
+        # not suffer: correctly-mapped beam endpoints actually rose (235 -> 245).
+        #
+        # This mattered far beyond the map looking wrong. /map is the global costmap's
+        # static_layer, so those phantoms became cost-99 inflated regions that fragmented
+        # free space and made frontier targets genuinely unreachable — the flood of
+        # NavFn error_code=208 "no valid path". They did NOT appear in the local costmap,
+        # whose voxel_layer reads /scan only, which is exactly why the two costmaps
+        # disagreed and why no lidar beam ever lined up with them.
+        #
+        # Before setting this back to 2, fix the cause: check the camera pitch in
+        # botzilla_qbot.urdf against the physical mount, and reconsider
+        # Grid/MaxGroundHeight (0.05) below, since with Grid/NormalsSegmentation=false the
+        # ground/obstacle split is purely by height and a small pose error paints floor as
+        # wall at range. Obstacles below the lidar plane are better recovered with
+        # pointcloud_to_laserscan than by re-enabling this.
         'Grid/Sensor': ParameterValue(grid_sensor, value_type=str),
         # Ghost-map hardening (overlapping/smeared occupancy layers during arcs):
         'Grid/RayTracing': 'true',           # clear free cells along each beam so stale marks
