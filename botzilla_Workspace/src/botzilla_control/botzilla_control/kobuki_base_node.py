@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 import math
 
 from .KobukiDriver import Kobuki
@@ -11,6 +12,185 @@ from .KobukiDriver import Kobuki
 # ≈ 11724 ticks per metre.  Tune TICKS_PER_M if measured distance doesn't match.
 TICKS_PER_M  = 11724.41
 WHEEL_BASE_M = 0.230    # 23 cm — must match cmd_vel_callback below
+
+# ── IMU ──────────────────────────────────────────────────────────────────────
+# The onboard gyro is rate-only (no absolute-heading register), unlike Gazebo's
+# simulated IMU — so orientation is left unset (orientation_covariance[0] = -1,
+# the sensor_msgs/Imu convention for "no orientation estimate available").
+# Only angular_velocity.z (yaw rate) is populated; that's what the hardware EKF
+# config (ekf_hardware.yaml) fuses, letting the filter integrate heading itself
+# rather than trusting a fabricated absolute orientation.
+YAW_RATE_VARIANCE = 0.02   # rad/s, moderate confidence — tune against measured noise
+
+# Stationary gyro bias calibration: the raw z-axis rate has a small offset even
+# at rest. With no absolute-yaw source to anchor it, ekf_hardware.yaml's
+# yaw-rate-only fusion integrates that offset without bound — the filter's yaw
+# state (and the map frame RTAB-Map registers against) slowly spins in place
+# even when the robot never moves, which also shows up as smeared/ghosted map
+# layers. Average the first GYRO_CALIB_SAMPLES readings at startup (robot must
+# be stationary while the node launches) to get an initial bias estimate.
+GYRO_CALIB_SAMPLES = 100   # 50 Hz updates -> 2 s of calibration
+
+# The offset isn't a fixed constant — it's bias *instability*, common on cheap
+# MEMS gyros: it wanders slowly even at rest (confirmed on this unit: ~0.01
+# rad/s of residual drift remained after the one-shot startup calibration
+# above). So keep tracking it: whenever the robot is confirmed stationary,
+# slowly adapt the bias estimate toward the current raw reading (EMA). Frozen
+# (not updated) while the robot is actually moving, since a real yaw rate
+# would otherwise get absorbed into the "bias" and get subtracted back out.
+#
+# "Confirmed stationary" requires BOTH wheel encoders showing no motion AND the
+# last /cmd_vel commanding zero. Encoders alone are not enough: an in-place
+# rotation via skid-steering causes bursty, stick-slip wheel motion, so
+# individual 20ms ticks can read as near-zero encoder motion even mid-turn —
+# without the cmd_vel gate, those false-stationary ticks feed the real turn
+# rate into the bias estimate and silently subtract a chunk of it back out,
+# which is what caused /odometry/filtered to badly under-report an actual
+# ~138 deg commanded turn (measured ~9 deg) during hardware testing.
+GYRO_BIAS_EMA_ALPHA = 0.005          # slow adaptation — time-averages over ~tens of seconds
+STATIONARY_D_THRESHOLD_M = 0.0005    # per 20ms odom tick (~2.5cm/s) — below encoder noise floor at rest
+STATIONARY_DTHETA_THRESHOLD_RAD = 0.001   # per 20ms odom tick
+
+# ── Closed-loop velocity control ─────────────────────────────────────────────
+# This base has a large, purely mechanical deadband: measured on this unit (odom over a
+# 3 s constant command with nothing else driving cmd_vel), a commanded yaw rate <= 0.12
+# rad/s produces NO motion at all (0-2% of commanded), 0.15 rad/s only ~10%, and 0.40
+# rad/s only ~0.22 rad/s actual (56%). Linear below ~0.04 m/s barely creeps.
+#
+# That deadband used to be worked around upstream, by flooring DWB's output
+# (min_speed_theta 0.2 in nav2_params.yaml) so it never asked for anything the base
+# would ignore. The floor made the robot move, but it also made the set of reachable
+# commands effectively {0, +/-0.2 ... +/-0.4} — the robot could not rotate gently at
+# all, so every heading correction was a step input. That is what the visible jerking
+# was, and it is also why the robot oscillated instead of converging (24 angular sign
+# flips measured in 80 s).
+#
+# The fix belongs here, not in the planner: close the loop on the sensors this node
+# already owns, so a commanded velocity is *delivered* and the planner is free to ask
+# for fine corrections. Yaw uses the bias-calibrated rate gyro (the same 50 Hz signal
+# already published on /imu); forward speed uses the encoder-derived linear velocity
+# computed in _odom_update.
+#
+# Structure: cmd_vel_callback now only stores the setpoint. A 50 Hz control timer does
+# the actual hardware write, so correction continues between (and after) cmd_vel
+# messages instead of only on arrival.
+CONTROL_PERIOD_S = 0.02      # 50 Hz — matches the odom/IMU feedback rate
+
+# ── Why feedforward inversion rather than pure PI ────────────────────────────
+# A deadband is a STATIC nonlinearity, so the right primary correction is a static inverse
+# applied feedforward — not integral action. Measured here with PI only (gyro step response
+# to a commanded 0.20 rad/s, 0.2 s bins): steady state reached 0.180 rad/s (90% — accurate),
+# but rise time was ~1.8 s and the signal rippled over a 0.316 rad/s spread, briefly even
+# reversing sign. DWB re-decides at 20 Hz, so a base needing ~2 s to reach a commanded rate
+# cannot track it at all; that lag is itself a source of Nav2-level oscillation, and the
+# ripple is the integrator chasing stick-slip.
+#
+# So: invert the measured deadband curve directly (instant, no lag, no ripple), and keep
+# only a small integral term to trim residual error. The base's response above the deadband
+# is close to linear, so the model is
+#     actual ~= gain * (|command| - deadband)     for |command| > deadband
+# and the inverse applied to a setpoint s is
+#     |output| = deadband + |s| / gain
+#
+# Exposed as ROS parameters, not constants: these are per-unit physical measurements
+# (they will differ on another Kobuki, and drift as the gearbox wears), and tuning them
+# by rebuilding is slow. Override at launch, e.g.
+#   ros2 run botzilla_control kobuki_base_node --ros-args -p yaw_ff_gain:=0.62
+# Yaw values are MEASURED on this unit, not guessed. Open-loop sweep with all correction
+# disabled (ff/kp/ki all 0), 5 s hold per point, first 2 s of transient discarded:
+#
+#     cmd  0.10  0.15  0.20  0.25  0.30  0.40   rad/s
+#     act  0.001 0.023 0.076 0.120 0.152 0.251  rad/s
+#
+# Least-squares fit: actual = 0.891 * (cmd - 0.121), R^2 = 0.997 — the deadband model is
+# essentially exact for this base, and the slope above the deadband is near unity.
+YAW_FF_DEADBAND_DEFAULT = 0.121  # rad/s — below this, commanded yaw produces no motion
+YAW_FF_GAIN_DEFAULT = 0.891     # measured slope above the deadband
+
+# Linear axis, measured the same way (short forward bursts with reverse returns, to stay
+# inside a ~1.5 m corridor; 3.6 s per point, first 1.2 s of transient discarded):
+#
+#     cmd  0.05  0.08  0.10  0.13  0.16  0.20   m/s
+#     act  0.033 0.056 0.082 0.101 0.126 0.157  m/s
+#
+# Least-squares fit: actual = 0.830 * (cmd - 0.009), R^2 = 0.995.
+#
+# Note how much SMALLER the linear deadband is than the yaw one (0.009 m/s vs 0.121
+# rad/s). That is physically sensible: driving forward turns both wheels the same way,
+# whereas rotating in place has to break stiction on both wheels in OPPOSITE directions.
+# It also corrected a bad guess — these were previously estimated at deadband 0.04 /
+# gain 0.90, and that 0.04 offset (4.4x too large) made the feedforward over-command by
+# ~38% at low speed, producing a surge-then-settle that was felt as residual jerk.
+LIN_FF_DEADBAND_DEFAULT = 0.009  # m/s, measured
+LIN_FF_GAIN_DEFAULT = 0.830      # measured slope
+
+# Trim gains only — the feedforward does the heavy lifting, and these correct just the
+# residual the static model misses. Kept small because the feedback is genuinely noisy:
+# measured open loop at a delivered ~0.17 rad/s, the gyro reports stdev 0.084 rad/s (half
+# the mean) with a 0.349 rad/s spread that briefly reverses sign. That is real stick-slip
+# in the drivetrain at low speed, not sensor error and not controller-induced — the
+# closed-loop spread at the same delivered rate was 0.298, i.e. slightly BETTER than open
+# loop. No gain schedule can remove it, so don't try: large gains here would only inject
+# that noise straight into the motor command.
+#
+# ki lowered 0.40 -> 0.15 and the clamp tightened (see YAW_RATE_I_CLAMP) after observing
+# the integrator slowly wind past target: with ki 0.40 the delivered rate crept from 0.15
+# at 0.6 s up to 0.24 by 4.8 s against a 0.20 setpoint — a 20% overshoot arriving so slowly
+# that it reads as drift rather than oscillation.
+YAW_RATE_KP_DEFAULT = 0.20
+YAW_RATE_KI_DEFAULT = 0.15
+LIN_VEL_KP_DEFAULT = 0.20
+LIN_VEL_KI_DEFAULT = 0.15
+
+# Anti-windup: cap the integrator's authority. Tightened from 0.35 once the feedforward
+# took over the deadband: the integrator no longer has to cover the whole shortfall, only
+# the few percent the static model misses, so a large clamp buys nothing and actively hurt
+# — it was what let the slow 20% overshoot described above accumulate. Small enough, too,
+# that a robot with blocked wheels cannot wind up and then lurch when it frees.
+YAW_RATE_I_CLAMP = 0.10      # rad/s
+LIN_VEL_I_CLAMP = 0.05       # m/s
+
+# Feedback below these magnitudes is treated as noise rather than real motion, so the
+# integrator doesn't chase sensor jitter while genuinely commanded to hold still.
+YAW_RATE_DEADZONE = 0.02     # rad/s
+LIN_VEL_DEADZONE = 0.01      # m/s
+
+# ── Feedback filtering ───────────────────────────────────────────────────────
+# The encoder-derived velocity (d/dt in _odom_update) is badly behaved as a control
+# signal, because we poll the Kobuki at 50 Hz but its encoder registers refresh more
+# slowly. Many polls therefore return an UNCHANGED tick count -> d = 0 -> velocity 0,
+# and then one poll catches the whole accumulated movement over a very short dt and
+# d/dt explodes.
+#
+# Measured while driving at a commanded 0.05 m/s: median 0.000 m/s but mean 0.036 m/s,
+# peaks to 0.35 m/s, and /odom inter-arrival median 19.9 ms with a minimum of 0.64 ms
+# (16 of 259 intervals under 5 ms). The signal is bimodal — zeros punctuated by spikes —
+# rather than noisy about the truth. Its MEAN is right, so it is unbiased and a
+# low-pass filter recovers the real value cleanly.
+#
+# Unfiltered, those spikes land directly in the P term and the integrator, which is a
+# source of translational jerk that no amount of deadband compensation can remove.
+#
+# Filtering is applied ONLY to the controller's copy of the feedback. The values
+# published on /odom are deliberately left raw: robot_localization has its own noise
+# model and covariances tuned against that raw signal (ekf_hardware.yaml), and quietly
+# changing the statistics of a topic other nodes consume would be a much wider change
+# than this fix warrants.
+#
+# alpha 0.25 at 50 Hz is a ~0.12 s time constant: long enough to bridge the runs of
+# zeros, short enough that the added phase lag stays well inside what the feedforward
+# (which needs no feedback at all) already covers.
+MEAS_FILTER_ALPHA = 0.25
+
+# Guard against the small-dt division itself. Below this the sample is discarded rather
+# than filtered, because a 0.64 ms interval carrying a whole 20 ms of accumulated ticks
+# is not a measurement of anything — it is an artifact of the polling mismatch.
+MIN_ODOM_DT_S = 0.005
+
+# Safety watchdog. The old passthrough had none: the last command was latched into the
+# motors forever, so if whatever was publishing cmd_vel died mid-drive the robot kept
+# going. Stop if no cmd_vel arrives within this window.
+CMD_VEL_TIMEOUT_S = 0.5
 
 
 class KobukiBaseNode(Node):
@@ -31,10 +211,43 @@ class KobukiBaseNode(Node):
         self._ot = 0.0          # heading (rad, CCW+)
         self._prev_L = None     # previous raw 16-bit left  tick
         self._prev_R = None     # previous raw 16-bit right tick
+        self._prev_odom_time = None   # rclpy.time.Time of the previous tick, for real dt
+        self._stationary = True   # updated each odom tick; read by _imu_update for bias tracking
+        self._cmd_vel_zero = True   # updated in cmd_vel_callback; see GYRO_BIAS_EMA_ALPHA comment
         self.create_timer(0.02, self._odom_update)   # 50 Hz
 
+        # IMU publisher
+        self._imu_pub = self.create_publisher(Imu, 'imu', 10)
+        self._gyro_bias_dps = 0.0
+        self._gyro_calib_readings = []
+        self._gyro_calibrated = False
+        self.create_timer(0.02, self._imu_update)     # 50 Hz
+
+        # ── Closed-loop velocity control (see CONTROL_PERIOD_S comment block) ──
+        # Declared as parameters so the deadband curve can be re-measured and tuned without
+        # a rebuild — set feedforward gains to 0 and kp/ki to 0 to characterise open loop.
+        self.declare_parameter('yaw_ff_deadband', YAW_FF_DEADBAND_DEFAULT)
+        self.declare_parameter('yaw_ff_gain', YAW_FF_GAIN_DEFAULT)
+        self.declare_parameter('lin_ff_deadband', LIN_FF_DEADBAND_DEFAULT)
+        self.declare_parameter('lin_ff_gain', LIN_FF_GAIN_DEFAULT)
+        self.declare_parameter('yaw_kp', YAW_RATE_KP_DEFAULT)
+        self.declare_parameter('yaw_ki', YAW_RATE_KI_DEFAULT)
+        self.declare_parameter('lin_kp', LIN_VEL_KP_DEFAULT)
+        self.declare_parameter('lin_ki', LIN_VEL_KI_DEFAULT)
+
+        self._cmd_lin = 0.0          # setpoint from cmd_vel
+        self._cmd_ang = 0.0
+        self._cmd_vel_stamp = None   # for the watchdog
+        self._meas_lin = 0.0         # encoder-derived, set in _odom_update
+        self._meas_ang = 0.0         # gyro-derived, set in _imu_update
+        self._i_lin = 0.0            # integrator accumulators
+        self._i_ang = 0.0
+        self._watchdog_tripped = False
+        self.create_timer(CONTROL_PERIOD_S, self._control_update)   # 50 Hz
+
         self.get_logger().info(
-            'Kobuki Base Node started. /cmd_vel → motors | encoders → /odom')
+            'Kobuki Base Node started. /cmd_vel → closed-loop (gyro + encoder) → motors '
+            '| encoders → /odom, gyro → /imu')
 
     # ── Odometry ────────────────────────────────────────────────────────────
 
@@ -52,54 +265,229 @@ class KobukiBaseNode(Node):
 
         L = enc['Left_encoder']
         R = enc['Right_encoder']
+        now = self.get_clock().now()
 
         if self._prev_L is None:
             self._prev_L, self._prev_R = L, R
+            self._prev_odom_time = now
             return
 
         dl = self._tick_diff(L, self._prev_L) / TICKS_PER_M
         dr = self._tick_diff(R, self._prev_R) / TICKS_PER_M
         self._prev_L, self._prev_R = L, R
 
+        dt = (now - self._prev_odom_time).nanoseconds / 1e9
+        self._prev_odom_time = now
+        if dt <= 0.0:
+            return   # clock didn't advance (or went backwards) — skip this tick
+
         d      = (dl + dr) / 2.0
         dtheta = (dr - dl) / WHEEL_BASE_M
+        self._stationary = abs(d) < STATIONARY_D_THRESHOLD_M and abs(dtheta) < STATIONARY_DTHETA_THRESHOLD_RAD
         self._ox += d * math.cos(self._ot + dtheta / 2.0)
         self._oy += d * math.sin(self._ot + dtheta / 2.0)
         self._ot += dtheta
 
         msg = Odometry()
-        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.stamp    = now.to_msg()
         msg.header.frame_id = 'odom'
         msg.child_frame_id  = 'base_link'
         msg.pose.pose.position.x    = self._ox
         msg.pose.pose.position.y    = self._oy
         msg.pose.pose.orientation.z = math.sin(self._ot / 2.0)
         msg.pose.pose.orientation.w = math.cos(self._ot / 2.0)
+        # robot_localization's ekf_hardware.yaml fuses ONLY these velocities from this
+        # source (never the pose above — wheel odometry pose drifts under slip). Without
+        # them the EKF fuses "measured velocity = 0" on every update regardless of real
+        # motion, which is why /odometry/filtered was previously observed pinned at the
+        # origin even during confirmed real motion.
+        msg.twist.twist.linear.x  = d / dt
+        msg.twist.twist.angular.z = dtheta / dt
         self._odom_pub.publish(msg)
+
+        # Feedback for the linear half of _control_update. Encoder-derived rather than
+        # gyro (the gyro measures yaw only), and taken from the same averaged wheel delta
+        # the odometry uses so the two can never disagree about how fast we're going.
+        #
+        # Filtered, unlike the raw value published above — see MEAS_FILTER_ALPHA. A
+        # too-short dt means the encoder register simply had not refreshed, so d/dt is an
+        # artifact rather than a measurement; drop it instead of feeding it to the filter.
+        if dt >= MIN_ODOM_DT_S:
+            self._meas_lin += MEAS_FILTER_ALPHA * ((d / dt) - self._meas_lin)
+
+    # ── IMU (rate gyro only — see YAW_RATE_VARIANCE comment above) ───────────
+
+    def _imu_update(self):
+        try:
+            gyro = self.robot.gyro_velocity_data()
+            z_samples = gyro['angular velocity of z: ']
+            if not z_samples:
+                return
+            yaw_rate_dps = z_samples[-1]
+        except Exception:
+            return   # __gyro not populated yet
+
+        if not self._gyro_calibrated:
+            self._gyro_calib_readings.append(yaw_rate_dps)
+            if len(self._gyro_calib_readings) >= GYRO_CALIB_SAMPLES:
+                self._gyro_bias_dps = sum(self._gyro_calib_readings) / len(self._gyro_calib_readings)
+                self._gyro_calibrated = True
+                self.get_logger().info(
+                    f'Gyro bias calibrated: {self._gyro_bias_dps:.4f} deg/s (robot must have been stationary)')
+            return   # don't publish uncorrected samples during calibration
+
+        if self._stationary and self._cmd_vel_zero:
+            self._gyro_bias_dps += GYRO_BIAS_EMA_ALPHA * (yaw_rate_dps - self._gyro_bias_dps)
+
+        yaw_rate_dps -= self._gyro_bias_dps
+
+        msg = Imu()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'imu_link'
+
+        # No absolute orientation available from this sensor: element 0 of the
+        # covariance is the sensor_msgs/Imu sentinel for "whole field invalid" —
+        # unlike a per-axis covariance, -1 here must NOT be set on
+        # angular_velocity_covariance below, since z *is* valid data.
+        msg.orientation_covariance[0] = -1.0
+        # No accelerometer data available from this driver.
+        msg.linear_acceleration_covariance[0] = -1.0
+
+        msg.angular_velocity.z = math.radians(yaw_rate_dps)
+        # Feedback for the yaw half of _control_update — the bias-corrected rate, i.e. the
+        # same value published here, so the controller and the EKF agree on the truth.
+        # Filtered with the same time constant as the linear axis for consistency. The
+        # gyro does not suffer the polling artifact the encoders do (it is a genuine
+        # continuous measurement), but it does carry real stick-slip content: measured
+        # stdev 0.084 rad/s against a 0.17 rad/s mean. Smoothing that keeps the drivetrain's
+        # own judder out of the motor command instead of amplifying it round the loop.
+        self._meas_ang += MEAS_FILTER_ALPHA * (math.radians(yaw_rate_dps) - self._meas_ang)
+        msg.angular_velocity_covariance[0] = 1e6   # x: not fused, large variance (not -1 —
+        msg.angular_velocity_covariance[4] = 1e6   # y: that would invalidate z too)
+        msg.angular_velocity_covariance[8] = YAW_RATE_VARIANCE
+
+        self._imu_pub.publish(msg)
 
     # ── Velocity command ─────────────────────────────────────────────────────
 
     def cmd_vel_callback(self, msg):
+        """Store the velocity setpoint; _control_update does the hardware write."""
+        self._cmd_lin = msg.linear.x    # Forward/Backward speed (m/s)
+        self._cmd_ang = msg.angular.z   # Turning speed (rad/s)
+        self._cmd_vel_zero = (self._cmd_lin == 0.0 and self._cmd_ang == 0.0)
+        self._cmd_vel_stamp = self.get_clock().now()
+
+        if self._watchdog_tripped:
+            self.get_logger().info('cmd_vel resumed; releasing watchdog stop.')
+            self._watchdog_tripped = False
+
+        # A commanded stop must take effect immediately and completely — don't wait for
+        # the next control tick, and drop the integrators so a stop can never be
+        # partially cancelled by accumulated correction from the motion that preceded it.
+        if self._cmd_vel_zero:
+            self._i_lin = 0.0
+            self._i_ang = 0.0
+            self._write_wheels(0.0, 0.0)
+
+    @staticmethod
+    def _clamp(value, limit):
+        return max(-limit, min(limit, value))
+
+    @staticmethod
+    def _feedforward(setpoint, deadband, gain):
+        """Invert the measured deadband curve: what to command to actually get `setpoint`.
+
+        The base's response above its deadband is roughly actual = gain * (|cmd| - deadband),
+        so getting `setpoint` out requires asking for deadband + |setpoint| / gain. Returns
+        0 for a 0 setpoint — the deadband offset must never be added to a commanded stop,
+        or the robot would creep whenever told to hold still.
         """
-        Translates ROS 2 Twist messages into Kobuki hardware commands.
-        """
-        linear_x = msg.linear.x   # Forward/Backward speed (m/s)
-        angular_z = msg.angular.z # Turning speed (rad/s)
-        
-        wheel_base = 0.230 # 23 cm wheel separation for Kobuki
-        
-        # Calculate left and right wheel speeds in mm/s
-        left_wheel_speed = (linear_x - (angular_z * wheel_base / 2.0)) * 1000.0
-        right_wheel_speed = (linear_x + (angular_z * wheel_base / 2.0)) * 1000.0
-        
-        # Determine the 'rotate' flag based on your driver's logic
-        # 1 means pure rotation, 0 means forward/arc 
-        rotate_flag = 1 if linear_x == 0.0 and angular_z != 0.0 else 0
-        
-        # Send to hardware
+        if setpoint == 0.0 or gain <= 0.0:
+            return setpoint
+        sign = 1.0 if setpoint > 0.0 else -1.0
+        return sign * (deadband + abs(setpoint) / gain)
+
+    def _control_update(self):
+        """Closed-loop velocity control at 50 Hz — see CONTROL_PERIOD_S comment block."""
+        # Watchdog: stop if the commander went away mid-drive.
+        if self._cmd_vel_stamp is None:
+            return   # nothing has ever commanded us; leave the motors alone
+        age = (self.get_clock().now() - self._cmd_vel_stamp).nanoseconds / 1e9
+        if age > CMD_VEL_TIMEOUT_S:
+            if not self._watchdog_tripped:
+                self.get_logger().warn(
+                    f'No /cmd_vel for {age:.2f}s (> {CMD_VEL_TIMEOUT_S}s) — stopping motors. '
+                    'The previous behaviour latched the last command indefinitely.')
+                self._watchdog_tripped = True
+                self._cmd_lin = 0.0
+                self._cmd_ang = 0.0
+                self._i_lin = 0.0
+                self._i_ang = 0.0
+                self._write_wheels(0.0, 0.0)
+            return
+
+        # Holding still is open-loop on purpose: with zero setpoint there is no shortfall
+        # to correct, and running the integrator here would make it fight sensor noise and
+        # creep the robot instead of keeping it parked.
+        if self._cmd_vel_zero:
+            self._write_wheels(0.0, 0.0)
+            return
+
+        meas_lin = self._meas_lin if abs(self._meas_lin) > LIN_VEL_DEADZONE else 0.0
+        meas_ang = self._meas_ang if abs(self._meas_ang) > YAW_RATE_DEADZONE else 0.0
+
+        err_lin = self._cmd_lin - meas_lin
+        err_ang = self._cmd_ang - meas_ang
+
+        lin_ki = self.get_parameter('lin_ki').value
+        yaw_ki = self.get_parameter('yaw_ki').value
+
+        # Integrate only the axis we are actually being asked to move, so e.g. a pure
+        # rotation doesn't wind up the linear integrator against its own zero setpoint.
+        if self._cmd_lin != 0.0:
+            self._i_lin = self._clamp(
+                self._i_lin + err_lin * lin_ki * CONTROL_PERIOD_S, LIN_VEL_I_CLAMP)
+        else:
+            self._i_lin = 0.0
+        if self._cmd_ang != 0.0:
+            self._i_ang = self._clamp(
+                self._i_ang + err_ang * yaw_ki * CONTROL_PERIOD_S, YAW_RATE_I_CLAMP)
+        else:
+            self._i_ang = 0.0
+
+        # Static deadband inversion does the bulk of the work (instant, no lag); the small
+        # PI terms only trim what the model gets wrong. See the _feedforward docstring.
+        ff_lin = self._feedforward(
+            self._cmd_lin,
+            self.get_parameter('lin_ff_deadband').value,
+            self.get_parameter('lin_ff_gain').value)
+        ff_ang = self._feedforward(
+            self._cmd_ang,
+            self.get_parameter('yaw_ff_deadband').value,
+            self.get_parameter('yaw_ff_gain').value)
+
+        out_lin = ff_lin + self.get_parameter('lin_kp').value * err_lin + self._i_lin
+        out_ang = ff_ang + self.get_parameter('yaw_kp').value * err_ang + self._i_ang
+
+        self._write_wheels(out_lin, out_ang)
+
+    def _write_wheels(self, linear_x, angular_z):
+        """Differential-drive mixing + hardware write (mm/s, as the driver expects)."""
+        left_wheel_speed = (linear_x - (angular_z * WHEEL_BASE_M / 2.0)) * 1000.0
+        right_wheel_speed = (linear_x + (angular_z * WHEEL_BASE_M / 2.0)) * 1000.0
+
+        # 1 means pure rotation, 0 means forward/arc. Keyed off the *commanded* linear
+        # velocity, not the post-correction output: out_lin can pick up a small nonzero
+        # value from the controller during an in-place turn, and that must not silently
+        # switch the driver out of rotation mode.
+        rotate_flag = 1 if self._cmd_lin == 0.0 and angular_z != 0.0 else 0
+
         self.robot.move(int(left_wheel_speed), int(right_wheel_speed), rotate_flag)
-        
-        self.get_logger().debug(f'Moving -> L: {left_wheel_speed:.1f}, R: {right_wheel_speed:.1f}, Rot: {rotate_flag}')
+        self.get_logger().debug(
+            f'cmd=({self._cmd_lin:.3f},{self._cmd_ang:.3f}) '
+            f'meas=({self._meas_lin:.3f},{self._meas_ang:.3f}) '
+            f'out=({linear_x:.3f},{angular_z:.3f}) '
+            f'L={left_wheel_speed:.1f} R={right_wheel_speed:.1f} Rot={rotate_flag}')
 
 def main(args=None):
     rclpy.init(args=args)

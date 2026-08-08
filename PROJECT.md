@@ -92,7 +92,7 @@ BotZilla was a prior project (same student, different team, CS3340 module) — a
 - YOLO inference — BotZilla runs plain Ultralytics on CPU/Pi. **Export the same model to TensorRT** for GPU-accelerated inference on the Jetson.
 
 ### Explicitly Drop
-- `LD_PRELOAD=noreset.so` workaround in `kinect_bridge.py` — this fixes a Raspberry Pi 5-specific RP1 USB controller bug. The Jetson has different USB hardware; do not carry this over. Test kinect_bridge without it first; only investigate a Jetson-specific fix if the same reset symptom appears.
+~~`LD_PRELOAD=noreset.so` workaround — Jetson-specific test disproved this.~~ **Correction (Jetson Orin Nano Super hardware bring-up):** the assumption that this was Pi 5/RP1-specific was wrong. Without `noreset.so`, `freenect.sync_get_video()` hangs indefinitely on the Jetson too — `dmesg` showed the identical failure mode on Tegra's `tegra-xusb` controller (`libusb_reset_device()` triggers a USB reset, the controller fails to restore the device configuration with `error=-110`, and the Kinect disconnects/re-enumerates under a new device number). `LD_PRELOAD=noreset.so` is required on this hardware and is kept.
 - Cube-quadrant hardcoded search logic — replaced by frontier-based exploration (Section 6).
 - AprilTag docking/localization logic, gripper-arm-specific SMACH sequence for the fixed single-cube task — replaced by the new N-cube state machine (Section 6).
 
@@ -127,7 +127,7 @@ In Phase 1, the Jetson robot plays both roles (it commands itself). In Phase 2, 
 ### Week 1 — Hardware Bring-Up
 - Confirm JetPack 7.2 + ROS 2 Jazzy on Jetson.
 - Clone BotZilla; strip cube-quadrant, AprilTag, and fixed-sequence SMACH logic; retain `botzilla_bringup`/`botzilla_control`/`botzilla_perception` skeleton.
-- Bring up Kobuki (drive via `/cmd_vel`, confirm `/odom`), Kinect (RGB+depth topics, test without `noreset.so` first), and the new 2D LiDAR (`/scan`) individually.
+- Bring up Kobuki (drive via `/cmd_vel`, confirm `/odom`), Kinect (RGB+depth topics — needs `LD_PRELOAD=noreset.so`, confirmed required on Jetson too, see "Explicitly Drop" correction above), and the new 2D LiDAR (`/scan`) individually.
 - **Deliverable:** all three sensors publish correctly; robot drivable via teleop.
 
 ### Week 2 — SLAM

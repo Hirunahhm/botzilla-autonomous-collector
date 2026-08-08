@@ -1,0 +1,471 @@
+# Nav2 params for BotZilla Phase 1 Milestone 3 (PHASE_1_IMPLEMENTATION_PLAN.md).
+#
+# Based on /opt/ros/jazzy/share/rtabmap_demos/params/turtlebot3_rgbd_nav2_params.yaml,
+# the ROS-shipped reference config for pairing Nav2 with rtabmap_ros (not the generic
+# nav2_bringup default, which assumes map_server/AMCL localization instead of rtabmap).
+# The global_costmap keeps rtabmap's /map as its static_layer AND adds a live /scan
+# obstacle_layer: relying on rtabmap's /map alone left the planner blind early in a mapping
+# session (the map is incomplete/inconsistent before loop closures land), producing
+# "Failed to create a plan from potential" aborts. The scan obstacle_layer gives NavFn
+# immediate obstacle data regardless of how far along rtabmap's map is.
+#
+# DWB is used instead of the nav2_bringup default (MPPI) to keep controller CPU cost down
+# on the Jetson, since rtabmap + Gazebo already keep all 6 cores busy (see Milestone 1's
+# tegrastats baseline in PHASE_1_IMPLEMENTATION_PLAN.md).
+#
+# Footprint (both costmaps) approximates the chassis (r=0.17m) plus the twin front collection
+# arms, which extend to x=0.26m at y=+-0.09m (see arm_left_link/arm_right_link in
+# botzilla_qbot.urdf) — PHASE_1_PLAN.md Milestone 2 explicitly calls for this padding so Nav2
+# doesn't clip the arms against doorways/obstacles.
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: False
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+    navigators: ["navigate_to_pose"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+
+controller_server:
+  ros__parameters:
+    use_sim_time: False
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # SimpleProgressChecker measures TRANSLATION only, so a leg that legitimately needs
+      # a long rotate-in-place registers as zero progress no matter how well the turn is
+      # going. Combined with the base's rotational deadband (see min_speed_theta below),
+      # 0.5 m in 10 s was failing goals that were actually fine. 0.2 m still catches a
+      # genuinely wedged robot but tolerates a slow turn-then-go.
+      required_movement_radius: 0.2
+      movement_time_allowance: 10.0
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.25
+    # DWB parameters — velocity limits kept close to speeds already tested elsewhere in
+    # this codebase (brain_node.py APPROACH_SPEED=0.15, teleop_keyboard_node defaults
+    # 0.2/0.6), not the higher turtlebot3 defaults this file is based on.
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: True
+      # Back to 0.0 — reverse is no longer sampled during normal path following.
+      #
+      # This was set to -0.10 in sim after a robot wedged against a wall had no escape
+      # trajectory: forward was blocked, "the path-alignment critics kept pulling it back
+      # toward the blocked heading", and it oscillated until the watchdog gave up despite
+      # open floor behind it. That symptom is now understood to be the SAME bug fixed at
+      # PathAlign.forward_point_distance below: those critics were blind to heading, so
+      # they could not reward turning away from the blockage. Allowing reverse treated the
+      # symptom, and on hardware it backfired badly — with reversing legal AND heading
+      # unscored, DWB reversed 1295 times vs 349 forward and reached 0 of 12 goals.
+      #
+      # With the align critics actually able to see heading, the robot can now be rewarded
+      # for turning toward free space instead of reversing into it blind. That matters
+      # because the depth camera faces forward: sustained reverse driving is unsensed, and
+      # the local costmap is lidar-only (it cannot see anything below the lidar plane).
+      #
+      # vx=0 is still sampled, so pure in-place rotation remains available. The BackUp
+      # recovery behaviour is unaffected — it lives in behavior_server, not DWB, and still
+      # reverses when genuinely wedged. That is the right place for reversing: a
+      # deliberate, bounded, supervised escape rather than a routine path-following option.
+      min_vel_x: 0.0
+      min_vel_y: 0.0
+      max_vel_x: 0.2
+      max_vel_y: 0.0
+      # Measured on this Kobuki (odom over a 3 s constant command, nothing else driving
+      # cmd_vel): 0.40 rad/s commanded yields only ~0.22 rad/s actual (56%), so hardware
+      # would prefer a higher value here to get a usable real turn rate. Kept at 0.4
+      # anyway because that compensation is wrong everywhere the commanded velocity is
+      # actually delivered: in sim, 0.6 against max_vel_x 0.2 gives a minimum turning
+      # radius of only ~0.33 m, and DWB was observed orbiting goals at full speed
+      # instead of converging on them. This wants to be a per-platform override rather
+      # than one shared number — until then the honest, physically-consistent value wins.
+      max_vel_theta: 0.4
+      # Deadband floors, now BACK TO ZERO — the deadband is compensated in the base driver
+      # instead. History, because this flip-flopped once and the reasoning matters:
+      #
+      # Measured on this Kobuki, rotation <= 0.12 rad/s produces NO motion at all (0-2% of
+      # commanded), 0.15 rad/s only ~10%; linear below ~0.04 m/s barely creeps. With these
+      # at 0.0 and an open-loop base, DWB emitted 0.063 rad/s / 0.021 m/s — inside the dead
+      # zone — so the robot sat motionless while Nav2 believed it was driving and every
+      # goal failed "Failed to make progress". Flooring the output above the deadband fixed
+      # that, and was correct given an open-loop base.
+      #
+      # But the floor has a second, worse effect: DWB rejects a trajectory when translation
+      # < min_speed_xy AND |rotation| < min_speed_theta, so with 0.2 the smallest legal
+      # in-place rotation IS 0.2 rad/s. The reachable command set became roughly
+      # {0, +/-0.2 ... +/-0.4} and the robot could not rotate gently at all: every heading
+      # correction was a step input. Measured consequence, on hardware: visible jerking and
+      # 24 angular sign changes in 80 s, overshooting and reversing instead of converging.
+      # The same self-inflicted limit cycle had already been confirmed in simulation.
+      #
+      # kobuki_base_node now closes the loop on the bias-calibrated rate gyro and the wheel
+      # encoders, so a small commanded velocity is actually *delivered* and no floor is
+      # needed. Zero here restores DWB's ability to ask for arbitrarily fine corrections,
+      # which is the correct configuration for any platform that can execute them.
+      min_speed_xy: 0.0
+      max_speed_xy: 0.2
+      min_speed_theta: 0.0
+      # With LimitedAccelGenerator selected below these stop being advisory and become the
+      # real bound on how fast the *command* can change, so they now directly set how
+      # smooth the motion is. acc_lim_theta raised 0.8 -> 1.5: at 20 Hz, 0.8 allows only
+      # 0.04 rad/s of change per cycle, which needs a full 0.5 s to reach max_vel_theta and
+      # left DWB with a sampling window too narrow to consider meaningfully different
+      # options. 1.5 reaches 0.4 rad/s in ~0.27 s while still ramping visibly smoothly.
+      acc_lim_x: 0.4
+      acc_lim_y: 0.0
+      acc_lim_theta: 1.5
+      decel_lim_x: -0.4
+      decel_lim_y: 0.0
+      decel_lim_theta: -1.5
+      # trajectory_generator_name is deliberately LEFT UNSET, so DWB uses its default
+      # StandardTrajectoryGenerator. Do not set LimitedAccelGenerator here — it was tried
+      # and it nearly stopped the robot translating at all.
+      #
+      # The reasoning that led to trying it: StandardTrajectoryGenerator samples the entire
+      # velocity range every cycle regardless of current velocity (acc_lim_* only shape the
+      # simulated trajectory, they do not bound the emitted command), which is why cmd_vel
+      # could jump 0 -> +0.4 -> -0.4 on consecutive 20 Hz cycles. LimitedAccelGenerator
+      # restricts sampling to velocities reachable within one control period, which sounds
+      # like the principled fix.
+      #
+      # In practice it starves forward motion. It samples current_vel +/- acc_lim_x *
+      # sim_period = +/-0.02 m/s per cycle, so from a standstill the robot can only ask for
+      # 0.02 m/s and needs ~10 consecutive cycles of the critics preferring forward to
+      # reach max_vel_x. Whenever the robot is meaningfully misaligned the critics prefer
+      # rotating first, so translation never accumulates and it rotates indefinitely.
+      # Measured A/B on hardware, same arena, everything else equal:
+      #
+      #     StandardTrajectoryGenerator : 20.2 m travelled in 150 s
+      #     LimitedAccelGenerator       :  0.12 m travelled in  89 s   (heading swung 128 deg)
+      #
+      # Acceleration continuity is instead enforced downstream by botzilla_control's
+      # velocity_smoother, which bounds the command actually sent to the base and also
+      # covers behavior_server's BackUp/Spin — those bypass DWB's trajectory generator
+      # entirely, so no generator choice could have smoothed them anyway.
+      vx_samples: 20
+      vy_samples: 5
+      vtheta_samples: 20
+      sim_time: 1.7
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      # Raised 0.2 -> 0.5: rtabmap broadcasts map->odom at only ~1Hz (its processing rate,
+      # with ~0.3s internal delay), so a 0.2s tolerance is too tight and the controller
+      # aborted with "Transform data too old when converting from odom to map". 0.5s is the
+      # standard rtabmap+nav2 margin for a slow map->odom source.
+      transform_tolerance: 0.5
+      xy_goal_tolerance: 0.15
+      trans_stopped_velocity: 0.25
+      short_circuit_trajectory_evaluation: True
+      stateful: True
+      # BaseObstacle -> ObstacleFootprint. BaseObstacleCritic scores a trajectory using
+      # ONLY the cost of the cell under the robot's centre point. That is sound for a
+      # circular robot whose radius equals the inflation inscribed radius, and unsound
+      # here: with the arms reaching 0.310 m forward against an inscribed radius of
+      # 0.165 m, a centre-point check certifies clearance the corners do not have. This
+      # is why the robot clipped obstacles with its sides while the costmap said clear —
+      # correcting the footprint alone would NOT have fixed it, because nothing was
+      # checking the footprint. ObstacleFootprintCritic tests the actual polygon at each
+      # sampled pose, so orientation is finally accounted for and in-place rotations in
+      # gaps narrower than 2*circumscribed (0.702 m) get rejected as they should be.
+      critics: ["RotateToGoal", "Oscillation", "ObstacleFootprint", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # The Oscillation critic bans reversing the sign of rotation until the robot has
+      # committed — travelled oscillation_reset_dist or turned oscillation_reset_angle.
+      # On the default 0.2 rad (11.5 deg) that commitment is far too cheap: measured live
+      # in sim, a robot wedged with a wall spanning ~120 deg of its surroundings swung
+      # through a yaw span of exactly 12.5 deg, just past the reset angle, which cleared
+      # the ban and let it flip straight back — 44 direction changes in 20 s with zero
+      # net translation. Requiring ~29 deg makes the robot actually turn far enough to
+      # discover the free side instead of resetting the critic and re-deciding.
+      Oscillation.oscillation_reset_angle: 0.5
+      Oscillation.oscillation_reset_dist: 0.10
+      # Renamed from BaseObstacle.scale when that critic was replaced by ObstacleFootprint
+      # (see the critics list above) — a scale keyed to a critic that is no longer loaded
+      # is silently ignored, which would have quietly dropped obstacle avoidance from the
+      # scoring altogether.
+      #
+      # Raised 0.02 -> 0.10 originally so DWB meaningfully prefers routing *around*
+      # residual non-lethal cost rather than scoring near-obstacle trajectories almost the
+      # same as clear ones. That still applies, and matters more now: with
+      # inflation_radius at 0.45 there is a much wider cost gradient for this scale to act
+      # on, which is what steers the robot down the middle of a passage instead of along
+      # one wall.
+      ObstacleFootprint.scale: 0.10
+      # 0.1 -> 0.325 (nav2's own default) on BOTH align critics. This was the bug that
+      # made the robot drive backwards to its goals.
+      #
+      # PathAlign/GoalAlign are the ONLY two critics in the list above that care which way
+      # the robot is facing. They work by projecting a point forward_point_distance in
+      # front of the robot and scoring that point's distance to the path/goal. At 0.1 m
+      # the projected point sits INSIDE the robot's own footprint (robot_radius is 0.20),
+      # so rotating the robot 180 degrees moved it by 0.2 m total — a rounding error at
+      # 0.05 m costmap resolution. Both heading-aware critics were therefore effectively
+      # blind, while the two highest-weighted critics, PathDist (32) and GoalDist (24),
+      # score pure distance and are completely direction-agnostic.
+      #
+      # Net effect: reversing toward a goal scored identically to driving forward toward
+      # it, so DWB had no reason to prefer forward and frequently chose reverse. Measured
+      # on hardware over a 150 s run: 1295 reverse commands vs 349 forward, mean bearing
+      # error to its own path 96.9 deg, path behind the robot 58% of the time, and 0 of 12
+      # goals reached. Heading simply was not being optimised.
+      #
+      # At 0.325 the projected point clears the footprint by ~0.12 m, so facing the wrong
+      # way costs real score and forward progress wins.
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.325
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.325
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+planner_server:
+  ros__parameters:
+    use_sim_time: False
+    expected_planner_frequency: 20.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      # 0.5 -> 0.1. With tolerance 0.5, an unreachable goal did not fail: NavFn
+      # silently substituted "nearest reachable cell within 0.5 m", which was often
+      # where the robot already stood. follow_path then completed in ~0.1 s without
+      # moving and reported SUCCEEDED. Measured live: robot pinned at (-2.571,-0.021)
+      # for 8 s while 4 consecutive goals to a target 0.527 m away all "succeeded" in
+      # 0.07-0.18 s each. The frontier was never cleared, so the explorer re-selected
+      # it forever. Frontier cells sit against walls by definition, so with
+      # robot_radius 0.20 many are still genuinely unreachable — they must fail
+      # honestly and get blacklisted rather than loop.
+      tolerance: 0.1
+      use_astar: false
+      # true -> false: NavFn treated UNKNOWN cells as traversable and produced
+      # confident paths straight through never-sensed territory. During frontier
+      # exploration every target sits ~half-surrounded by unknown (measured: a
+      # 5x5 window around three live targets held 6/12/11 unknown cells), so the
+      # planner routed through the unexplored side, the robot drove in, hit
+      # something the map didn't know about, and the no-progress watchdog
+      # cancelled 32s later. 5 consecutive targets were blacklisted this way.
+      # With false, an unreachable-through-known-space target is rejected
+      # instantly by the explorer's compute_path_to_pose pre-check instead.
+      allow_unknown: false
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: False
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 0.5   # match controller: slow ~1Hz rtabmap map->odom
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.4
+    min_rotational_vel: 0.2
+    rotational_acc_lim: 0.8
+
+# velocity_smoother was removed from nav2.launch.py — see that file's docstring.
+# It silently stopped republishing cmd_vel_nav -> cmd_vel on hardware while
+# reporting itself active, stalling every goal. controller_server now publishes
+# straight to /cmd_vel; DWB's own acc_lim_*/max_vel_* above bound the output.
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: False
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
+      rolling_window: true
+      # 3x3 -> 5x5: with a 3m window (1.5m each side) DWB rejected 52% of its
+      # sampled trajectories as "BaseObstacle/Trajectory Goes Off Grid" — the
+      # window was too small for the trajectories it samples, so legal paths
+      # were discarded for leaving the map rather than for hitting anything.
+      width: 5
+      height: 5
+      resolution: 0.05
+      # TRUE POLYGON FOOTPRINT, from physical measurement of this robot:
+      # 0.48 m from the front of the grabber arms to the back of the chassis, and
+      # 0.33 m across. base_link sits at the Kobuki body centre (the wheel axis is at
+      # x=0 in botzilla_qbot.urdf, and the body cylinder has radius 0.17), so the rear
+      # edge is at -0.17 and the front of the arms lands at -0.17 + 0.48 = +0.31.
+      #
+      #   front  x = +0.310      rear  x = -0.170      half-width = 0.165
+      #   -> inscribed radius    0.165 m
+      #   -> circumscribed radius 0.351 m
+      #
+      # This replaces robot_radius: 0.20, which modelled the robot as a 0.40 m circle
+      # and was wrong in a way that caused real collisions: the arms reach 0.310 m
+      # forward, i.e. 0.110 m BEYOND the modelled circle, and the true swept radius
+      # (0.351) was underestimated by 76%. Observed on hardware as the robot clipping
+      # obstacles with its sides/corners while the costmap reported clearance.
+      #
+      # Note this is not simply "more conservative". A point planner hard-refuses gaps
+      # narrower than 2*inscribed, which is now 0.330 m — the robot's actual width —
+      # versus 0.400 m under the old circle. So straight-line passages get LESS
+      # restrictive and honest at the same time; what changes is that orientation now
+      # matters, which is the whole point for a 1.45:1 robot.
+      #
+      # An earlier revision used circumscribed-as-radius (0.275 from a smaller, wrong
+      # polygon) and rejected it as too conservative because it demanded ~0.55 m on
+      # every passage including ones only ever driven straight through. A real polygon
+      # avoids that trap without giving up correctness: it is only the ROTATION that
+      # needs 2*circumscribed = 0.702 m, and ObstacleFootprint (see FollowPath critics)
+      # evaluates that per-trajectory rather than baking it into every cell.
+      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
+      plugins: ["voxel_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        # 0.23 -> 0.45. With a polygon footprint the costmap derives inscribed_radius
+        # (0.165) itself and writes cost 99 within that of any obstacle; inflation_radius
+        # only controls how far the DECAYING cost extends beyond it. At 0.23 there was
+        # just 0.065 m of gradient, so trajectories hugging a wall scored almost the same
+        # as ones down the middle of a corridor. 0.45 (past the 0.351 circumscribed
+        # radius) gives a real gradient, which is what makes the planner prefer routes
+        # the robot can actually turn around in — addressing "it goes places it can
+        # barely manoeuvre". This does NOT narrow any passage: only cells within
+        # inscribed_radius are lethal-equivalent.
+        inflation_radius: 0.45
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: True
+        publish_voxel_map: True
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        # Number of marked voxels a vertical column needs before it projects down as a
+        # lethal cell. MUST stay 0 while the only source is the 2D lidar: a single-plane
+        # scan marks exactly ONE voxel per column, so any threshold above 1 can never be
+        # met and the costmap silently contains no obstacles at all — verified live,
+        # raising this to 2 took the local costmap to 0 lethal cells while a wall stood
+        # 0.42 m away. Only worth revisiting if a genuine 3D source is added back.
+        mark_threshold: 0
+        # NOTE: "pointcloud" (/camera/points) is deliberately NOT a source here, though
+        # its settings are kept below for when it can be reintroduced safely.
+        #
+        # A sensor can only CLEAR what it can currently see. The Kinect's ~57 deg FOV
+        # sees a narrow wedge, and the 2D lidar raytraces only within its own scan
+        # plane, so nothing can clear a voxel the camera marked once the robot turns
+        # away from it. Confirmed live in sim: camera marks accumulated until the robot
+        # stood ringed by lethal cells in demonstrably open floor, Spin aborted with
+        # "Collision Ahead", and DWB could only orbit — every goal then failed for a
+        # reason that had nothing to do with the goal. The 360 deg lidar marks and
+        # clears consistently, so it is the sole source until the camera's clearing is
+        # solved properly (needs a wider clearing frustum or periodic voxel decay).
+        #
+        # This also makes sim match hardware, where /camera/points has no publisher at
+        # all — which is exactly why this failure never showed up on the robot. The
+        # tradeoff is real and known: the lidar sees one horizontal plane, so low
+        # obstacles (desk edges, sills) are invisible to DWB again. That gap must be
+        # closed before cube collection, but a costmap that boxes the robot in is worse
+        # than one that misses low obstacles.
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+        pointcloud:
+          # Sim: bridged from Gazebo's rgbd_camera (simulation.launch.py).
+          # Hardware: needs a depth_image_proc point-cloud node — kinect_bridge
+          # publishes depth as an Image, not a PointCloud2. Not wired up yet.
+          topic: /camera/points
+          data_type: "PointCloud2"
+          clearing: True
+          marking: True
+          # Floor points would otherwise be marked as obstacles and box the robot
+          # in; 0.08 clears the floor, 0.60 matches rtabmap's Grid/MaxObstacleHeight.
+          min_obstacle_height: 0.08
+          max_obstacle_height: 0.60
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          # Kinect returns nothing usable closer than ~0.55m on hardware
+          # (KINECT_MIN_RANGE_M in kinect_bridge.py / yolo_node.py); the sim
+          # camera's near clip is 0.1. 0.30 is a compromise — revisit on hardware.
+          obstacle_min_range: 0.30
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: False
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
+      resolution: 0.05
+      track_unknown_space: true
+      # Must match local_costmap exactly or the planner and controller disagree about
+      # what fits, and the planner promises routes DWB then refuses to execute.
+      # Measured polygon — see the local_costmap note for the derivation and for why
+      # this replaced robot_radius: 0.20.
+      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
+      # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
+      # isn't blind while rtabmap's map is still forming — see header comment).
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        # Must match local_costmap (see the local inflation_layer note): keeps
+        # planner and controller costmaps consistent so DWB doesn't reject the
+        # global planner's route as infeasible.
+        inflation_radius: 0.45
+      always_send_full_costmap: True

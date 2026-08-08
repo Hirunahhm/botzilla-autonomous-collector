@@ -154,7 +154,17 @@
   <joint name="camera_joint" type="fixed">
     <parent link="base_link"/>
     <child link="camera_link"/>
-    <origin xyz="0.15 0 0.07" rpy="0 0 0"/>
+    <origin xyz="0.0 0 0.19" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ROS optical-frame convention (Z-forward, X-right, Y-down), required by
+       RTAB-Map / image_geometry for correct depth-to-3D projection. -->
+  <link name="camera_link_optical"/>
+
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_link_optical"/>
+    <origin xyz="0 0 0" rpy="-1.570796 0 -1.570796"/>
   </joint>
 
   <!-- =============== Pushing Arms (Front Plates) =============== -->
@@ -234,7 +244,21 @@
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="laser_frame"/>
-    <origin xyz="0.0 0.0 0.12" rpy="0 0 0"/>
+    <origin xyz="0.0 0.0 0.24" rpy="0 0 0"/>
+  </joint>
+
+  <!-- =============== IMU Link & Joint =============== -->
+  <link name="imu_link">
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+    </inertial>
+  </link>
+
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
 
   <!-- =============== Gazebo Plugins (Harmonic) =============== -->
@@ -250,7 +274,10 @@
       <odom_topic>odom</odom_topic>
       <frame_id>odom</frame_id>
       <child_frame_id>base_footprint</child_frame_id>
+      <publish_odom_tf>false</publish_odom_tf>
     </plugin>
+    <!-- IMU System Plugin -->
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
   </gazebo>
 
   <gazebo reference="camera_link">
@@ -266,6 +293,7 @@
           <near>0.1</near>
           <far>10.0</far>
         </clip>
+        <optical_frame_id>camera_link_optical</optical_frame_id>
       </camera>
       <always_on>1</always_on>
       <update_rate>30</update_rate>
@@ -296,6 +324,33 @@
       </ray>
       <always_on>1</always_on>
       <visualize>true</visualize>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="imu_link">
+    <sensor name="imu_sensor" type="imu">
+      <always_on>1</always_on>
+      <update_rate>50</update_rate>
+      <visualize>true</visualize>
+      <topic>imu</topic>
+      <!-- A real IMU always has noise; without a noise model Gazebo publishes an
+           all-zero covariance matrix, which robot_localization's EKF reads as
+           "zero uncertainty" (absolute certainty) rather than "unknown" — making
+           the filter snap to any single glitchy reading instead of blending it
+           against the wheel odometry. These are typical low-cost MEMS MPU-6050-
+           class stddevs, standard reference values used across ROS/Gazebo IMU configs. -->
+      <imu>
+        <angular_velocity>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>0.0003</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>0.0003</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>0.0003</stddev></noise></z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></z>
+        </linear_acceleration>
+      </imu>
     </sensor>
   </gazebo>
 

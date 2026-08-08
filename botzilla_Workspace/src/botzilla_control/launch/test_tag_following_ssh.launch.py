@@ -31,7 +31,7 @@ from launch import LaunchDescription
 from launch.actions import LogInfoilding the full autonomy pipeline for cube collection and AprilTag delivery. Run colcon build
 from launch_ros.actions import Node
 
-_NORESET = os.path.join(os.path.expanduser('~'), 'Desktop/Bozilla-ws/final-project-botzilla/noreset.so')
+_NORESET = os.path.join(os.path.expanduser('~'), 'Desktop/Projects/sem5/final-project-botzilla/noreset.so')
 
 
 def generate_launch_description():

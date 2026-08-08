@@ -5,6 +5,20 @@ import threading
 import serial.tools.list_ports as lsports
 
 
+def gyro_bytes_to_signed_int16(byte_pair):
+    """Combine a little-endian [lo, hi] byte pair from Kobuki's gyro feedback into one
+    signed 16-bit value.
+
+    Kobuki's gyro packet stores each sample as two consecutive bytes, little-endian.
+    Reading lo/hi as two independent unsigned samples (the historical bug here) silently
+    corrupts every value whose magnitude needs the high byte — i.e. any real rotation,
+    while looking like ordinary near-zero noise while stationary.
+    """
+    lo, hi = byte_pair[0], byte_pair[1]
+    raw = lo | (hi << 8)
+    return raw - 65536 if raw >= 32768 else raw
+
+
 class Kobuki:
     __in_buff = []
     __temp = bytearray()
@@ -453,14 +467,11 @@ class Kobuki:
             if count == 3:
                 count = 0
         for data in x_axis:
-            for innerdata in data:
-                y_axis_velocity.append((digit_to_dps * -1) * innerdata)
+            y_axis_velocity.append((digit_to_dps * -1) * gyro_bytes_to_signed_int16(data))
         for data in y_axis:
-            for innerdata in data:
-                x_axis_velocity.append(digit_to_dps * innerdata)
+            x_axis_velocity.append(digit_to_dps * gyro_bytes_to_signed_int16(data))
         for data in z_axis:
-            for innerdata in data:
-                z_axis_velocity.append(digit_to_dps * innerdata)
+            z_axis_velocity.append(digit_to_dps * gyro_bytes_to_signed_int16(data))
         gyro.update({"angular velocity of x: ": x_axis_velocity})
         gyro.update({"angular velocity of y: ": y_axis_velocity})
         gyro.update({"angular velocity of z: ": z_axis_velocity})

@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'kobuki_base_node = botzilla_control.kobuki_base_node:main',
+            'velocity_smoother = botzilla_control.velocity_smoother:main',
             'brain_node = botzilla_control.brain_node:main',
             'cube_collector = botzilla_control.cube_collector:main',
             'perception_simulator = botzilla_control.perception_simulator:main',
@@ -31,6 +32,8 @@ setup(
             'encoder_test_node = botzilla_control.encoder_test_node:main',
             'nav_test_node = botzilla_control.nav_test_node:main',
             'final_test_node = botzilla_control.final_test_node:main',
+            'teleop_keyboard_node = botzilla_control.teleop_keyboard_node:main',
+            'rotation_test_node = botzilla_control.rotation_test_node:main',
         ],
     },
 )

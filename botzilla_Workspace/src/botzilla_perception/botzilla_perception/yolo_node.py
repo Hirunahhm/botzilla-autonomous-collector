@@ -36,7 +36,10 @@ class YoloDetector(Node):
         self.frame_count = 0
 
         self.bridge = cv_bridge.CvBridge()
-        self.latest_depth = None  # Raw float32 depth frame (480x640), values in mm
+        self.latest_depth = None  # Raw depth frame; units depend on the encoding below
+        # Set from each depth message. Drives the unit conversion in get_depth_at():
+        # 'mono8' on hardware (kinect_bridge's rescaled 11-bit), '32FC1' in sim.
+        self.latest_depth_encoding = None
 
         # Subscribe to the Kinect RGB stream
         self.subscription = self.create_subscription(
@@ -61,24 +64,43 @@ class YoloDetector(Node):
         self.cube_pub = self.create_publisher(Point, 'detected_cube', 10)
 
         # Load YOLO model
+        # Confidence threshold, exposed as a parameter because the right value differs
+        # sharply between domains. best.pt was trained on photographs of real cubes, so
+        # on hardware it fires confidently and 0.8 rejects false positives well. Gazebo's
+        # cubes are flat-shaded untextured boxes with no photographic texture, and the
+        # same model tops out around 0.25 on them — measured on a captured sim frame,
+        # where the 0.25 detection's box centre (319, 344) matched an independent
+        # red-pixel centroid (320, 345) almost exactly, so it is a true positive, just a
+        # low-confidence one. Left at 0.8 the node detects nothing at all in sim.
+        # Override with:  ros2 run ... --ros-args -p confidence:=0.25
+        self.declare_parameter('confidence', 0.8)
+        self.confidence = self.get_parameter('confidence').value
+
         self.model = YOLO(file_path)
+        self.get_logger().info(
+            f'Loaded model {file_path} (classes={self.model.names}) '
+            f'confidence>={self.confidence}'
+        )
 
         self.get_logger().info('YOLO Perception Node Initialized. Waiting for video stream...')
 
     def depth_callback(self, msg):
         """Store the latest depth frame for use in image_callback."""
         try:
-            # mono8 encoding from kinect_bridge: depth scaled to 0-255 (lossy)
-            # Use passthrough to keep raw bytes for index-based access
+            # Use passthrough to keep raw bytes for index-based access. The encoding
+            # is kept alongside the frame because the SAME topic carries two very
+            # different formats depending on where we're running — see get_depth_at().
             depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
             self.latest_depth = depth_image
+            self.latest_depth_encoding = msg.encoding
             # Log depth frame stats every 30 frames to confirm valid data is arriving
             if self.frame_count % 30 == 0:
                 valid_px = int(np.count_nonzero(depth_image > 0))
                 pct = valid_px * 100 // depth_image.size
-                max_val = int(depth_image.max())
+                max_val = float(np.nanmax(depth_image))
                 self.get_logger().info(
-                    f'Depth frame: {valid_px} valid px ({pct}%), max={max_val}'
+                    f'Depth frame [{msg.encoding}]: {valid_px} valid px ({pct}%), '
+                    f'max={max_val:.3f}'
                 )
         except Exception as e:
             self.get_logger().error(f'Depth decode error: {e}')
@@ -87,28 +109,57 @@ class YoloDetector(Node):
         """
         Sample the depth around a bounding box center in a small patch to avoid noise.
         Returns distance in meters, or None if invalid.
+
+        /camera/depth/image_raw carries a different format on hardware than in sim,
+        so the conversion has to branch on the message encoding:
+
+        * mono8   — hardware. kinect_bridge rescales the Kinect's native 11-bit
+                    disparity (0-2047, 2047 = no data) down to 0-255 to publish it
+                    as a standard mono8 Image. Undo that, then apply the Kinect
+                    disparity->metres formula.
+        * 32FC1   — simulation. simulation.launch.py's ros_gz_bridge maps Gazebo's
+                    depth camera straight through, and Gazebo already emits metres.
+                    Also what /camera/depth/image_meters carries on hardware.
+        * 16UC1   — millimetres, the common depth convention if a driver is ever
+                    swapped in that publishes it.
+
+        Getting this wrong is silent, not loud: the mono8 branch applied to metric
+        data returns a plausible-looking number that is simply wrong, which would
+        make the FSM misjudge every approach distance.
         """
         h, w = depth_img.shape[:2]
         # Clamp coordinates to image bounds
         cx = max(2, min(cx, w - 3))
         cy = max(2, min(cy, h - 3))
 
-        # Sample a 5x5 patch and take the median non-zero value
+        # Sample a 5x5 patch and take the median valid value
         patch = depth_img[cy - 2:cy + 3, cx - 2:cx + 3].flatten().astype(np.float32)
-        valid = patch[patch > 0]
+        # Gazebo writes inf/NaN for "no return"; the Kinect path writes 0.
+        valid = patch[np.isfinite(patch) & (patch > 0)]
         if len(valid) == 0:
             return None
 
-        # Reverse the kinect_bridge scaling: uint8 0-255 was scaled from 11-bit 0-2047.
-        # raw_11bit = (value / 255.0) * 2047.0
-        # Convert raw 11-bit Kinect value to meters using the standard disparity formula:
-        # depth_m = 1.0 / (raw_11bit * -0.0030711016 + 3.3309495161)
-        raw_val = np.median(valid)
-        raw_11bit = (raw_val / 255.0) * 2047.0
-        if raw_11bit >= 2040:  # Kinect reports 2047 for no-data pixels
+        raw_val = float(np.median(valid))
+        encoding = getattr(self, 'latest_depth_encoding', 'mono8')
+
+        if encoding == '32FC1':
+            # Already metres.
+            distance_m = raw_val
+        elif encoding == '16UC1':
+            # Millimetres.
+            distance_m = raw_val / 1000.0
+        else:
+            # mono8 (hardware Kinect via kinect_bridge). Reverse the 0-255 rescale
+            # back to the native 11-bit value, then disparity -> metres.
+            raw_11bit = (raw_val / 255.0) * 2047.0
+            if raw_11bit >= 2040:  # Kinect reports 2047 for no-data pixels
+                return None
+            distance_m = 1.0 / (raw_11bit * -0.0030711016 + 3.3309495161)
+
+        # Guard against nonsense from any branch (negative/again-infinite values
+        # near the disparity formula's asymptote, or a bad sim frame).
+        if not np.isfinite(distance_m) or distance_m <= 0.0 or distance_m > 20.0:
             return None
-        # Standard Kinect disparity → depth formula
-        distance_m = 1.0 / (raw_11bit * -0.0030711016 + 3.3309495161)
         return distance_m
 
     def image_callback(self, msg):
@@ -122,7 +173,9 @@ class YoloDetector(Node):
                 self.get_logger().info(f'Processing frame #{self.frame_count}. Latest depth: {"Received" if self.latest_depth is not None else "None"}')
 
             # Run YOLO inference – lower confidence for better detection rate
-            results = self.model.predict(source=cv_image, conf = 0.8, verbose=False, iou=0.5)
+            results = self.model.predict(
+                source=cv_image, conf=self.confidence, verbose=False, iou=0.5
+            )
 
             annotated_image = results[0].plot()
 

@@ -1,0 +1,135 @@
+hirunahhm@hirunahhm:~/Desktop/Projects/sem5/final-project-botzilla/botzilla_Workspace$ ros2 launch botzilla_navigation frontier_explorer.launch.py use_sim_time:=false
+[INFO] [launch]: All log files can be found below /home/hirunahhm/.ros/log/2026-07-29-17-26-48-170615-hirunahhm-75286
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [frontier_explorer_node-1]: process started with pid [75347]
+[frontier_explorer_node-1] [INFO] [1785326211.547870420] [frontier_explorer_node]: frontier_explorer_node started, waiting for /map ...
+[frontier_explorer_node-1] [WARN] [1785326214.032679066] [frontier_explorer_node]: Could not get robot pose (map->base_link): "base_link" passed to lookupTransform argument source_frame does not exist. 
+[frontier_explorer_node-1] [INFO] [1785326215.548573372] [frontier_explorer_node]: 38 frontier(s) found, targeting (1.88, 3.83)
+[frontier_explorer_node-1] [INFO] [1785326239.368048172] [frontier_explorer_node]: Nav2 goal finished: SUCCEEDED
+[frontier_explorer_node-1] [INFO] [1785326239.561581533] [frontier_explorer_node]: 9 frontier(s) found, targeting (-1.22, 3.73)
+[frontier_explorer_node-1] [INFO] [1785326261.528831642] [frontier_explorer_node]: Nav2 goal finished: SUCCEEDED
+[frontier_explorer_node-1] [INFO] [1785326263.589919627] [frontier_explorer_node]: 41 frontier(s) found, targeting (-3.07, 3.73)
+^C[WARNING] [launch]: user interrupted with ctrl-c (SIGINT)
+^C^C[WARNING] [launch]: user interrupted with ctrl-c (SIGINT) again, ignoring...
+[ERROR] [frontier_explorer_node-1]: process has died [pid 75347, exit code -2, cmd '/home/hirunahhm/Desktop/Projects/sem5/final-project-botzilla/botzilla_Workspace/install/botzilla_navigation/lib/botzilla_navigation/frontier_explorer_node --ros-args -r __node:=frontier_explorer_node --params-file /tmp/launch_params_u_pws6e0'].
+hirunahhm@hirunahhm:~/Desktop/Projects/sem5/final-project-botzilla/botzilla_Workspace$ ros2 launch botzilla_navigation frontier_explorer.launch.py use_sim_time:=false
+[INFO] [launch]: All log files can be found below /home/hirunahhm/.ros/log/2026-07-29-17-28-12-715905-hirunahhm-77820
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [frontier_explorer_node-1]: process started with pid [77881]
+[frontier_explorer_node-1] [INFO] [1785326295.769872555] [frontier_explorer_node]: frontier_explorer_node started, waiting for /map ...
+[frontier_explorer_node-1] [INFO] [1785326299.797994374] [frontier_explorer_node]: 35 frontier(s) found, targeting (-3.07, 3.73)
+[frontier_explorer_node-1] [WARN] [1785326331.684932182] [frontier_explorer_node]: Goal to (-3.074344141408801, 3.7300785575062037) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326331.725429265] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326331.726473647] [frontier_explorer_node]: Blacklisting (-3.07, 3.73) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326333.801197386] [frontier_explorer_node]: 34 frontier(s) found, targeting (-4.02, 3.53)
+[frontier_explorer_node-1] [WARN] [1785326365.684161334] [frontier_explorer_node]: Goal to (-4.024344155564904, 3.5300785545259714) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326365.715691554] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326365.716874340] [frontier_explorer_node]: Blacklisting (-4.02, 3.53) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326367.810708408] [frontier_explorer_node]: 42 frontier(s) found, targeting (-0.82, -1.22)
+[frontier_explorer_node-1] [WARN] [1785326399.683708241] [frontier_explorer_node]: Goal to (-0.8243441078811884, -1.2199215162545443) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326399.713957423] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326399.715294805] [frontier_explorer_node]: Blacklisting (-0.82, -1.22) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326401.822420345] [frontier_explorer_node]: 45 frontier(s) found, targeting (-1.82, -2.32)
+[frontier_explorer_node-1] [WARN] [1785326433.683916713] [frontier_explorer_node]: Goal to (-1.8243441227823496, -2.3199217785149813) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326433.703987520] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326433.705903062] [frontier_explorer_node]: Blacklisting (-1.82, -2.32) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326435.904119166] [frontier_explorer_node]: 45 frontier(s) found, targeting (-2.22, -2.62)
+[frontier_explorer_node-1] [WARN] [1785326467.682532243] [frontier_explorer_node]: Goal to (-2.224344128742814, -2.6199217829853296) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326467.711846408] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326467.718389023] [frontier_explorer_node]: Blacklisting (-2.22, -2.62) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326469.846355517] [frontier_explorer_node]: 44 frontier(s) found, targeting (-1.57, -3.72)
+[frontier_explorer_node-1] [INFO] [1785326499.855682059] [frontier_explorer_node]: Nav2 goal finished: ABORTED
+[frontier_explorer_node-1] [INFO] [1785326499.856813066] [frontier_explorer_node]: Blacklisting (-1.57, -3.72) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326501.835943987] [frontier_explorer_node]: 51 frontier(s) found, targeting (4.38, 3.63)
+[frontier_explorer_node-1] [INFO] [1785326501.844738664] [frontier_explorer_node]: Target (4.38, 3.63) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326501.852351323] [frontier_explorer_node]: Blacklisting (4.38, 3.63) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326503.843085196] [frontier_explorer_node]: 51 frontier(s) found, targeting (5.33, 4.58)
+[frontier_explorer_node-1] [INFO] [1785326503.860918268] [frontier_explorer_node]: Target (5.33, 4.58) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326503.862832593] [frontier_explorer_node]: Blacklisting (5.33, 4.58) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326505.856663454] [frontier_explorer_node]: 51 frontier(s) found, targeting (5.68, 5.18)
+[frontier_explorer_node-1] [INFO] [1785326505.874666674] [frontier_explorer_node]: Target (5.68, 5.18) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326505.876641928] [frontier_explorer_node]: Blacklisting (5.68, 5.18) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326507.830598698] [frontier_explorer_node]: 51 frontier(s) found, targeting (0.28, 6.73)
+[frontier_explorer_node-1] [WARN] [1785326539.684330018] [frontier_explorer_node]: Goal to (0.2756559085100889, 6.7300783563405275) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326539.729607713] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326539.731988515] [frontier_explorer_node]: Blacklisting (0.28, 6.73) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326541.852683539] [frontier_explorer_node]: 50 frontier(s) found, targeting (2.44, 6.78)
+[frontier_explorer_node-1] [WARN] [1785326573.684125343] [frontier_explorer_node]: Goal to (2.442235568538308, 6.784564441069961) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326573.734664068] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326573.735791555] [frontier_explorer_node]: Blacklisting (2.44, 6.78) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326575.847019402] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.01, 1.58)
+[frontier_explorer_node-1] [WARN] [1785326607.682650572] [frontier_explorer_node]: Goal to (-2.007764497771859, 1.5845643635839224) stalled (no progress for 32s); canceling instead of waiting on Nav2 to give up.
+[frontier_explorer_node-1] [INFO] [1785326607.726178922] [frontier_explorer_node]: Nav2 goal finished: CANCELED
+[frontier_explorer_node-1] [INFO] [1785326607.730521600] [frontier_explorer_node]: Blacklisting (-2.01, 1.58) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326609.882838295] [frontier_explorer_node]: 50 frontier(s) found, targeting (-1.96, 0.08)
+[frontier_explorer_node-1] [INFO] [1785326609.908863610] [frontier_explorer_node]: Target (-1.96, 0.08) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326609.911465088] [frontier_explorer_node]: Blacklisting (-1.96, 0.08) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326611.897517537] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.01, 2.08)
+[frontier_explorer_node-1] [INFO] [1785326611.911176563] [frontier_explorer_node]: Target (-2.01, 2.08) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326611.912328915] [frontier_explorer_node]: Blacklisting (-2.01, 2.08) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326613.848391954] [frontier_explorer_node]: 50 frontier(s) found, targeting (-1.96, 2.93)
+[frontier_explorer_node-1] [INFO] [1785326613.875362830] [frontier_explorer_node]: Target (-1.96, 2.93) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326613.878237308] [frontier_explorer_node]: Blacklisting (-1.96, 2.93) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326615.859749528] [frontier_explorer_node]: 50 frontier(s) found, targeting (-1.91, -1.62)
+[frontier_explorer_node-1] [INFO] [1785326615.882812841] [frontier_explorer_node]: Target (-1.91, -1.62) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326615.886316104] [frontier_explorer_node]: Blacklisting (-1.91, -1.62) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326617.910280941] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.56, 3.73)
+[frontier_explorer_node-1] [INFO] [1785326617.930038277] [frontier_explorer_node]: Target (-2.56, 3.73) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326617.931320168] [frontier_explorer_node]: Blacklisting (-2.56, 3.73) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326619.878271889] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.91, -3.17)
+[frontier_explorer_node-1] [INFO] [1785326619.906370378] [frontier_explorer_node]: Target (-2.91, -3.17) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326619.908006871] [frontier_explorer_node]: Blacklisting (-2.91, -3.17) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326621.850704793] [frontier_explorer_node]: 50 frontier(s) found, targeting (-1.91, -4.27)
+[frontier_explorer_node-1] [INFO] [1785326621.864018722] [frontier_explorer_node]: Target (-1.91, -4.27) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326621.865158177] [frontier_explorer_node]: Blacklisting (-1.91, -4.27) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326623.913984712] [frontier_explorer_node]: 50 frontier(s) found, targeting (-1.06, -4.97)
+[frontier_explorer_node-1] [INFO] [1785326623.936257539] [frontier_explorer_node]: Target (-1.06, -4.97) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326623.939024014] [frontier_explorer_node]: Blacklisting (-1.06, -4.97) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326625.869616417] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.11, -4.77)
+[frontier_explorer_node-1] [INFO] [1785326625.892652560] [frontier_explorer_node]: Target (-2.11, -4.77) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326625.894345310] [frontier_explorer_node]: Blacklisting (-2.11, -4.77) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326627.831056738] [frontier_explorer_node]: 50 frontier(s) found, targeting (-4.61, 3.48)
+[frontier_explorer_node-1] [INFO] [1785326627.845818258] [frontier_explorer_node]: Target (-4.61, 3.48) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326627.846852654] [frontier_explorer_node]: Blacklisting (-4.61, 3.48) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326629.868854145] [frontier_explorer_node]: 50 frontier(s) found, targeting (-1.81, -5.52)
+[frontier_explorer_node-1] [INFO] [1785326629.896551310] [frontier_explorer_node]: Target (-1.81, -5.52) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326629.901565814] [frontier_explorer_node]: Blacklisting (-1.81, -5.52) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326631.852775931] [frontier_explorer_node]: 50 frontier(s) found, targeting (-4.91, 3.88)
+[frontier_explorer_node-1] [INFO] [1785326631.881025750] [frontier_explorer_node]: Target (-4.91, 3.88) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326631.892582734] [frontier_explorer_node]: Blacklisting (-4.91, 3.88) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326633.886453440] [frontier_explorer_node]: 50 frontier(s) found, targeting (-5.41, 3.48)
+[frontier_explorer_node-1] [INFO] [1785326633.907115086] [frontier_explorer_node]: Target (-5.41, 3.48) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326633.910246915] [frontier_explorer_node]: Blacklisting (-5.41, 3.48) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326635.830318647] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.06, -6.22)
+[frontier_explorer_node-1] [INFO] [1785326635.846838518] [frontier_explorer_node]: Target (-2.06, -6.22) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326635.848547108] [frontier_explorer_node]: Blacklisting (-2.06, -6.22) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326637.837850579] [frontier_explorer_node]: 50 frontier(s) found, targeting (-5.91, 3.88)
+[frontier_explorer_node-1] [INFO] [1785326637.852987499] [frontier_explorer_node]: Target (-5.91, 3.88) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326637.854171115] [frontier_explorer_node]: Blacklisting (-5.91, 3.88) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326639.857665125] [frontier_explorer_node]: 50 frontier(s) found, targeting (-6.26, 3.48)
+[frontier_explorer_node-1] [INFO] [1785326639.870595394] [frontier_explorer_node]: Target (-6.26, 3.48) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326639.872222542] [frontier_explorer_node]: Blacklisting (-6.26, 3.48) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326641.841222769] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.26, -6.87)
+[frontier_explorer_node-1] [INFO] [1785326641.859917577] [frontier_explorer_node]: Target (-2.26, -6.87) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326641.860936741] [frontier_explorer_node]: Blacklisting (-2.26, -6.87) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326643.816248899] [frontier_explorer_node]: 50 frontier(s) found, targeting (-6.96, 3.93)
+[frontier_explorer_node-1] [INFO] [1785326643.844112370] [frontier_explorer_node]: Target (-6.96, 3.93) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326643.845357972] [frontier_explorer_node]: Blacklisting (-6.96, 3.93) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326645.899704685] [frontier_explorer_node]: 50 frontier(s) found, targeting (-2.51, -7.67)
+[frontier_explorer_node-1] [INFO] [1785326645.919055574] [frontier_explorer_node]: Target (-2.51, -7.67) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326645.920474749] [frontier_explorer_node]: Blacklisting (-2.51, -7.67) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326647.873059466] [frontier_explorer_node]: 50 frontier(s) found, targeting (-7.81, 4.03)
+[frontier_explorer_node-1] [INFO] [1785326647.894612495] [frontier_explorer_node]: Target (-7.81, 4.03) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326647.897831494] [frontier_explorer_node]: Blacklisting (-7.81, 4.03) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326649.872333423] [frontier_explorer_node]: 50 frontier(s) found, targeting (-9.21, 4.08)
+[frontier_explorer_node-1] [INFO] [1785326649.885890332] [frontier_explorer_node]: Target (-9.21, 4.08) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326649.887071708] [frontier_explorer_node]: Blacklisting (-9.21, 4.08) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326651.886973726] [frontier_explorer_node]: 50 frontier(s) found, targeting (-9.76, 4.08)
+[frontier_explorer_node-1] [INFO] [1785326651.899635731] [frontier_explorer_node]: Target (-9.76, 4.08) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326651.901277567] [frontier_explorer_node]: Blacklisting (-9.76, 4.08) for 360s (failure #1).
+[frontier_explorer_node-1] [INFO] [1785326691.883681504] [frontier_explorer_node]: 50 frontier(s) found, targeting (-3.51, 3.53)
+[frontier_explorer_node-1] [INFO] [1785326691.894621157] [frontier_explorer_node]: Target (-3.51, 3.53) has no valid path (error_code=208); skipping without spending a full Nav2 attempt on it.
+[frontier_explorer_node-1] [INFO] [1785326691.896374132] [frontier_explorer_node]: Blacklisting (-3.51, 3.53) for 720s (failure #2).
+^C[WARNING] [launch]: user interrupted with ctrl-c (SIGINT)
+[INFO] [frontier_explorer_node-1]: process has finished cleanly [pid 77881]
+hirunahhm@hirunahhm:~/Desktop/Projects/sem5/final-project-botzilla/botzilla_Workspace$ 

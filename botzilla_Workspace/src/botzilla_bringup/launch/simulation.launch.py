@@ -29,12 +29,14 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('botzilla_bringup')
+    nav_share = get_package_share_directory('botzilla_navigation')
 
     # ------------------------------------------------------------------ #
     # Paths
     # ------------------------------------------------------------------ #
     world_file = os.path.join(pkg_share, 'worlds', 'botzilla_arena.world')
     urdf_file = os.path.join(pkg_share, 'description', 'botzilla_qbot.urdf')
+    ekf_config_file = os.path.join(nav_share, 'config', 'ekf.yaml')
 
     with open(urdf_file, 'r') as f:
         robot_description = f.read()
@@ -104,14 +106,6 @@ def generate_launch_description():
 
     # ------------------------------------------------------------------ #
     # 4. ros_gz_bridge — bridge Gazebo topics → ROS2
-    #
-    #   Gazebo RGBD camera publishes to:
-    #     /camera/image          (gz.msgs.Image)         → /camera/rgb/image_raw  (sensor_msgs/Image)
-    #     /camera/depth_image    (gz.msgs.Image)         → /camera/depth/image_raw (sensor_msgs/Image)
-    #     /camera/camera_info    (gz.msgs.CameraInfo)    → /camera/camera_info (sensor_msgs/CameraInfo)
-    #
-    #   cmd_vel bridge:
-    #     /cmd_vel (geometry_msgs/Twist) → /cmd_vel (gz.msgs.Twist)   [bidirectional]
     # ------------------------------------------------------------------ #
     gz_bridge = Node(
         package='ros_gz_bridge',
@@ -122,6 +116,11 @@ def generate_launch_description():
             '/camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
             # Depth image
             '/camera/depth_image@sensor_msgs/msg/Image[gz.msgs.Image',
+            # Depth point cloud — the rgbd_camera sensor publishes this natively.
+            # Bridged so local_costmap's voxel_layer can mark obstacles the 2D
+            # lidar plane misses entirely (desk edges, table legs, anything above
+            # or below the single scan plane). See nav2_params.yaml voxel_layer.
+            '/camera/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
             # Camera info
             '/camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
             # cmd_vel (ROS2 → Gazebo)
@@ -130,8 +129,13 @@ def generate_launch_description():
             '/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry',
             # 2D LiDAR Scan (Gazebo → ROS2)
             '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
-            # TF from diff drive plugin
-            '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            # IMU Data (Gazebo → ROS2)
+            '/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
+            # Simulation clock — required by every node running with
+            # use_sim_time:=true (robot_state_publisher, rtabmap, tf2
+            # listeners); without this their ROS clock stays frozen at
+            # zero and all sim-time TF lookups silently fail.
+            '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
         ],
         remappings=[
             # Remap Gazebo camera topic → topic the YOLO node expects
@@ -142,7 +146,60 @@ def generate_launch_description():
     )
 
     # ------------------------------------------------------------------ #
-    # 5. YOLO Perception Node
+    # 5. Sensor frame bridges & EKF
+    # ------------------------------------------------------------------ #
+    lidar_frame_bridge = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='lidar_frame_bridge',
+        arguments=[
+            '--frame-id', 'laser_frame',
+            '--child-frame-id', 'botzilla_qbot/base_footprint/gpu_lidar',
+        ],
+    )
+
+    camera_frame_bridge = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_frame_bridge',
+        arguments=[
+            '--frame-id', 'camera_link',
+            '--child-frame-id', 'botzilla_qbot/base_footprint/rgbd_camera',
+        ],
+    )
+
+    imu_frame_bridge = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='imu_frame_bridge',
+        arguments=[
+            '--frame-id', 'imu_link',
+            '--child-frame-id', 'botzilla_qbot/base_footprint/imu_sensor',
+        ],
+    )
+
+    # Gazebo's DiffDrive publishes an all-zero covariance matrix, which robot_localization
+    # reads as "infinitely certain" and cannot fuse (wheel velocities were silently dropped
+    # entirely). This relay republishes /odom as /odom_cov with realistic variances, which
+    # is what the EKF actually consumes.
+    odom_covariance_relay = Node(
+        package='botzilla_navigation',
+        executable='odom_covariance_relay',
+        name='odom_covariance_relay',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
+    ekf_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node',
+        output='screen',
+        parameters=[ekf_config_file, {'use_sim_time': use_sim_time}],
+    )
+
+    # ------------------------------------------------------------------ #
+    # 6. YOLO Perception Node
     # ------------------------------------------------------------------ #
     yolo_node = Node(
         package='botzilla_perception',
@@ -159,5 +216,10 @@ def generate_launch_description():
         robot_state_publisher,
         spawn_robot,
         gz_bridge,
+        lidar_frame_bridge,
+        camera_frame_bridge,
+        imu_frame_bridge,
+        odom_covariance_relay,
+        ekf_node,
         yolo_node,
     ])

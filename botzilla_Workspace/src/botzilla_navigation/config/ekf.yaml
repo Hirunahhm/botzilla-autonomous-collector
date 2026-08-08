@@ -1,0 +1,72 @@
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: true
+    frequency: 50.0
+    two_d_mode: true
+    publish_tf: true
+    odom_frame: odom
+    # base_footprint, NOT base_link. The URDF makes base_footprint the ROOT and the parent
+    # of base_link (base_joint), and robot_state_publisher already publishes
+    # base_footprint -> base_link. If the EKF also published odom -> base_link, then
+    # base_link would have two parents (base_footprint and odom), which is an invalid TF
+    # tree. Publishing odom -> base_footprint gives the correct single chain:
+    #   odom -> base_footprint -> base_link -> {camera, laser, imu, wheels}
+    # It also matches /odom's own child_frame_id (base_footprint), so wheel twist needs no
+    # cross-frame transform — with the old mismatch robot_localization silently DROPPED
+    # every wheel velocity measurement (measured: /odom vx=0.2000 but filtered vx=0.0000
+    # and position pinned at the origin).
+    base_link_frame: base_footprint
+    world_frame: odom
+
+    # --- Wheel odometry: VELOCITIES ONLY, never absolute pose. ---
+    #
+    # Gazebo's diff-drive plugin derives odometry from actual wheel-joint rotation, so it
+    # DOES accumulate wheel slip (an earlier revision of this file wrongly claimed it used
+    # an idealized slip-free kinematic model — measured against Gazebo ground truth, that
+    # is false). Verified directly: with the robot wedged against arena geometry, a
+    # 9-second rotation command turned the robot only 0.32 deg in truth while wheel
+    # odometry reported +50 deg of phantom rotation; cumulative wheel yaw error reached
+    # +89 deg. Fusing that absolute yaw made rtabmap paint the map at false orientations,
+    # which is what produced the overlapping/ghosted map layers.
+    #
+    # So x/y/yaw are all false here; only vx and vy are fused.
+    #   vx : wheel speed is still the best linear-velocity source available.
+    #   vy : differential drive is kinematically incapable of lateral motion, so this is a
+    #        legitimate always-true "vy=0" measurement. Leaving it unfused made vy a
+    #        free-drifting state that produced spurious sideways motion during arcs.
+    # /odom_cov, not /odom: Gazebo publishes an all-zero covariance matrix, which
+    # robot_localization treats as infinite certainty and which is numerically degenerate —
+    # with it, wheel velocities were silently never fused at all (measured: /odom vx=0.2000
+    # while the filter's vx stayed 0.0000 and position never left the origin).
+    # botzilla_navigation's odom_covariance_relay node republishes /odom with realistic
+    # variances; see that file for the values and reasoning.
+    odom0: /odom_cov
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false,
+                   false, false, false,
+                   false, false, false]
+
+    # --- IMU: the authoritative heading source (immune to wheel slip). ---
+    #
+    # Measured against Gazebo ground truth, this IMU's orientation is exact (0.00 deg error
+    # both before and after an arc, while wheel odom was off by +39 deg then +89 deg). An
+    # earlier revision disabled IMU fusion entirely on the belief that the gz IMU "lagged
+    # several seconds" — that came from a contaminated test (the diff-drive plugin has no
+    # command watchdog, so residual motion polluted the baseline) and is wrong. Its yaw
+    # rate tracks correctly too (0.4724 rad/s measured vs 0.5 commanded).
+    #
+    # Fusing yaw + yaw-rate here is what actually corrects wheel slip — the reason the IMU
+    # was added in the first place.
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    # Treat the first IMU heading as the odom-frame origin rather than assuming the
+    # sensor's absolute world yaw already matches the odom frame.
+    imu0_relative: true
+    imu0_differential: false
+    # Not fusing linear acceleration, so no gravity removal needed.
+    imu0_remove_gravitational_acceleration: false
