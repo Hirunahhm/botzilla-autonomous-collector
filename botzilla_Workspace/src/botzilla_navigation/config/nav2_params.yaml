@@ -63,27 +63,43 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      # Back to 0.0 — reverse is no longer sampled during normal path following.
+      # -0.10: a bounded reverse escape. This value has flip-flopped twice, so the whole
+      # history is here — read it before changing it again.
       #
-      # This was set to -0.10 in sim after a robot wedged against a wall had no escape
-      # trajectory: forward was blocked, "the path-alignment critics kept pulling it back
-      # toward the blocked heading", and it oscillated until the watchdog gave up despite
-      # open floor behind it. That symptom is now understood to be the SAME bug fixed at
-      # PathAlign.forward_point_distance below: those critics were blind to heading, so
-      # they could not reward turning away from the blockage. Allowing reverse treated the
-      # symptom, and on hardware it backfired badly — with reversing legal AND heading
-      # unscored, DWB reversed 1295 times vs 349 forward and reached 0 of 12 goals.
+      # It was -0.10 in sim, because a robot wedged against a wall had no escape trajectory
+      # and oscillated until the watchdog gave up despite open floor behind it. It was then
+      # set to 0.0 because that symptom was traced to a DIFFERENT bug — PathAlign/GoalAlign
+      # had forward_point_distance 0.1, so both heading-aware critics were blind and could
+      # not reward turning away from a blockage. With reversing legal AND heading unscored,
+      # DWB reversed 1295 times vs 349 forward and reached 0 of 12 goals. Disabling reverse
+      # was the right call at that moment: the align critics were broken.
       #
-      # With the align critics actually able to see heading, the robot can now be rewarded
-      # for turning toward free space instead of reversing into it blind. That matters
-      # because the depth camera faces forward: sustained reverse driving is unsensed, and
-      # the local costmap is lidar-only (it cannot see anything below the lidar plane).
+      # They are fixed now (forward_point_distance 0.325, measured: reverse commands went
+      # 1295 -> 0). What 0.0 then exposed is that DWB had no escape at all. Measured on
+      # hardware, twice in one session, in two different parts of the arena:
       #
-      # vx=0 is still sampled, so pure in-place rotation remains available. The BackUp
-      # recovery behaviour is unaffected — it lives in behavior_server, not DWB, and still
-      # reverses when genuinely wedged. That is the right place for reversing: a
-      # deliberate, bounded, supervised escape rather than a routine path-following option.
-      min_vel_x: 0.0
+      #   - ObstacleFootprintCritic rejected 419 of 419 sampled trajectories
+      #     ("Trajectory Hits Obstacle"), leaving in-place rotation as the only legal motion
+      #   - forward cmd count froze (503) while rotation climbed to 2419 over 140 s
+      #   - the footprint's REAR edge was in inscribed cells 47 times vs 655 for the front:
+      #     nose-in to a wall with the floor behind it clear
+      #   - behavior_server's BackUp could not rescue it either — DriveOnHeading aborts
+      #     "Collision Ahead" because its check trips at t=0 when the footprint already
+      #     overlaps a lethal cell. So the "recovery handles it" assumption was simply false.
+      #
+      # The remaining objection to reverse was that it is unsensed. That was about the
+      # forward-facing depth camera, and it does not apply to what actually fills the local
+      # costmap: the RPLidar C1 is 360 deg and the local costmap's voxel_layer reads /scan
+      # only, so reversing is exactly as well sensed as driving forward. (The real blind
+      # spot is vertical, not directional — the lidar sits at z=0.24 m and cannot see the
+      # ground-level grabber arms' obstacles in ANY direction. That needs
+      # pointcloud_to_laserscan, and no min_vel_x value addresses it.)
+      #
+      # Kept small deliberately: -0.10 is half of max_vel_x, enough to back out of a wedge
+      # but not fast enough to make reversing an attractive way to follow a path. The check
+      # that this has not regressed is the forward/reverse split on /cmd_vel — reverse
+      # should be ~0 during normal path following and appear only when wedged.
+      min_vel_x: -0.10
       min_vel_y: 0.0
       max_vel_x: 0.2
       max_vel_y: 0.0
@@ -199,13 +215,54 @@ controller_server:
       # is silently ignored, which would have quietly dropped obstacle avoidance from the
       # scoring altogether.
       #
-      # Raised 0.02 -> 0.10 originally so DWB meaningfully prefers routing *around*
-      # residual non-lethal cost rather than scoring near-obstacle trajectories almost the
-      # same as clear ones. That still applies, and matters more now: with
-      # inflation_radius at 0.45 there is a much wider cost gradient for this scale to act
-      # on, which is what steers the robot down the middle of a passage instead of along
-      # one wall.
-      ObstacleFootprint.scale: 0.10
+      # 0.10 -> 0.4. The intent all along was "prefer routing around residual non-lethal
+      # cost", and with inflation_radius at 0.45 there is a wide gradient to steer on — but
+      # at 0.10 the robot demonstrably ignored it, driving into inflated regions and
+      # clipping things. The cause is a units trap, and it made the earlier 0.02 -> 0.10
+      # "increase" a 4x DECREASE:
+      #
+      #   critic              getScale()                        effective weight
+      #   BaseObstacle        scale_                   (none)   0.02   <- the old value
+      #   ObstacleFootprint   costmap_resolution * scale_       0.05 * 0.10 = 0.005
+      #   PathDist/GoalDist   costmap_resolution * 0.5 * scale_ 0.80 / 0.60 per CELL
+      #
+      # ObstacleFootprintCritic overrides getScale() to multiply by resolution;
+      # BaseObstacleCritic does not (see /opt/ros/jazzy/include/dwb_critics/*.hpp). So
+      # swapping the critic silently divided the obstacle term by 20. At 0.005 the entire
+      # gradient was worth less than a rounding error next to the path critics: the largest
+      # penalty ANY trajectory could receive was 253 * 0.005 = 1.27, while ending merely
+      # 2 cells (0.10 m) off the global path already cost 1.60. Hugging a wall was
+      # literally cheaper than deviating 10 cm to avoid it, which is exactly what happened.
+      #
+      # 0.4 restores nav2's own default effective weighting (0.02 / 0.05 = 0.4). Worked
+      # through on the real numbers, in a 1.0 m passage where centring costs 4 cells of
+      # path deviation:
+      #
+      #   hug wall at 0.25 m clearance -> cost 195  ->  penalty 195 * 0.05 * 0.4 = 3.91
+      #   deviating 4 cells to centre  ->            PathDist  4 * 0.80          = 3.20
+      #   one sim window of progress   ->            GoalDist  6.8 * 0.60        = 4.08
+      #
+      # 3.91 > 3.20 so it centres, and 3.91 < 4.08 so avoidance did not outweigh making
+      # forward progress.
+      #
+      # 0.4 -> 0.8 after the robot was still observed clipping obstacles at 0.4. The
+      # progress-reward bound above (4.08) was the stated reason not to exceed ~0.5, and
+      # 0.8 knowingly crosses it: the wall penalty at 0.25 m clearance becomes 7.80, so a
+      # trajectory CAN now score worse than standing still. That trade is acceptable only
+      # because min_vel_x is no longer 0.0 — a robot that talks itself into a stall can
+      # reverse out of it, which was impossible when this bound was first derived. Do not
+      # raise this further without re-checking that reverse escape still works.
+      #
+      # Note this cannot push the robot away from obstacles it cannot see. The critic scores
+      # the local costmap, which is /scan-only with the lidar at z=0.24 m, so objects
+      # shorter than that contribute nothing at any scale — see the NOTE at the end.
+      #
+      # NOTE this critic scores the max cost over the footprint OUTLINE only (sum_scores
+      # defaults false), and it cannot help at all against obstacles that never reach the
+      # costmap — the local costmap is /scan-only and the lidar sits at z=0.24 m, so
+      # anything shorter than that is invisible to it and the ground-level grabber arms
+      # will still hit it. That needs pointcloud_to_laserscan, not a critic weight.
+      ObstacleFootprint.scale: 0.8
       # 0.1 -> 0.325 (nav2's own default) on BOTH align critics. This was the bug that
       # made the robot drive backwards to its goals.
       #
