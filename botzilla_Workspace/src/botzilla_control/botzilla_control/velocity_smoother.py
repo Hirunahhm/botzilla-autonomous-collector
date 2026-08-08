@@ -83,6 +83,47 @@ DECEL_TO_STOP_IMMEDIATELY = True
 
 DIAGNOSTIC_PERIOD_S = 10.0
 
+# --- Reversal hysteresis -----------------------------------------------------------
+# Acceleration limiting alone does not stop the robot looking jerky, because it bounds how
+# FAST the command changes but not how OFTEN it changes direction. Measured on hardware
+# over 164 s of exploring, per stage of the chain:
+#
+#                        max step/cycle          sign flips
+#   /cmd_vel_nav (DWB)   0.300 m/s, 0.800 rad/s   x=92  theta=143
+#   /cmd_vel (smoothed)  0.040 m/s, 0.125 rad/s   x=65  theta=109
+#
+# The smoother was doing its job on magnitude (7.5x and 6.4x reduction, exactly its decel
+# limits) and yet two thirds of the reversals still reached the base — it faithfully ramped
+# through every one of them. A ramped reversal is still a reversal: the robot visibly stops
+# and goes the other way ~40 times a minute.
+#
+# The reversals originate in DWB: dwb_plugins::StandardTrajectoryGenerator re-samples the
+# entire velocity range every cycle, so when the score landscape is nearly flat (a noisy
+# costmap, a path that shifts slightly) the argmax can jump from +max to -max between
+# consecutive cycles. Fixing it there would mean LimitedAccelGenerator, which was A/B'd on
+# this robot and nearly stopped it translating (0.12 m in 89 s vs 20.2 m) — see the long
+# note in nav2_params.yaml. So it is filtered here instead.
+#
+# Rule: a command that opposes the current direction of travel must persist for
+# REVERSAL_CONFIRM_CYCLES before it is honoured. While unconfirmed, the target is treated
+# as zero, so the robot DECELERATES rather than latching — which is where it was heading on
+# the way to reversing anyway. Nothing is lost if the flip was real (it costs
+# REVERSAL_CONFIRM_CYCLES / PUBLISH_RATE_HZ = 0.15 s of extra braking, during which the
+# robot is already slowing), and a spurious one-cycle flip becomes a slight slow-down
+# instead of a direction change.
+#
+# This deliberately does NOT delay stopping, and does not delay the reverse-escape
+# behaviour that min_vel_x=-0.10 exists for: a genuine escape command persists for many
+# cycles and confirms immediately.
+REVERSAL_CONFIRM_CYCLES = 3
+
+# A reversal smaller than this is dithering around zero, not a real change of intent, and
+# is collapsed straight to zero without ever being confirmed. Sized below the base's
+# measured deadbands (linear 0.009 m/s, yaw 0.121 rad/s — see kobuki_base_node) so that
+# commands the hardware could actually execute are never silently discarded.
+REVERSAL_DEADBAND_X = 0.01        # m/s
+REVERSAL_DEADBAND_THETA = 0.05    # rad/s
+
 
 class VelocitySmoother(Node):
     """Acceleration-limits 'cmd_vel_nav' onto 'cmd_vel' — see the module docstring."""
@@ -97,6 +138,9 @@ class VelocitySmoother(Node):
         self._input_count = 0
         self._output_count = 0
         self._timed_out = False
+        # Consecutive cycles the input has opposed our direction of travel, per axis.
+        self._flip_cycles = {'x': 0, 'theta': 0}
+        self._suppressed_flips = 0
 
         self._sub = self.create_subscription(Twist, 'cmd_vel_nav', self._input_cb, 10)
         self._pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -149,6 +193,31 @@ class VelocitySmoother(Node):
             return target
         return current + (limit if delta > 0 else -limit)
 
+    def _confirm_reversal(self, axis, current, target, deadband):
+        """Hold off a direction reversal until it persists — see REVERSAL_CONFIRM_CYCLES.
+
+        Returns the target to actually ramp toward. Zero means "keep decelerating while we
+        decide", which is the same direction the ramp would travel anyway on its way to
+        reversing, so waiting costs nothing but a little extra braking.
+        """
+        # Not a reversal: same sign, or either side is already at rest.
+        if current == 0.0 or target == 0.0 or (target * current) > 0.0:
+            self._flip_cycles[axis] = 0
+            return target
+
+        # Opposing, but too small to be a real change of intent — treat it as a stop.
+        if abs(target) < deadband:
+            self._flip_cycles[axis] = 0
+            return 0.0
+
+        self._flip_cycles[axis] += 1
+        if self._flip_cycles[axis] >= REVERSAL_CONFIRM_CYCLES:
+            self._flip_cycles[axis] = 0
+            return target
+
+        self._suppressed_flips += 1
+        return 0.0
+
     def _tick(self):
         if self._last_input_time is None:
             return   # never commanded — stay silent rather than publish zeros at boot
@@ -165,12 +234,15 @@ class VelocitySmoother(Node):
                 self._publish()
                 return
 
+        goal_x = self._confirm_reversal(
+            'x', self._output.linear.x, self._target.linear.x, REVERSAL_DEADBAND_X)
+        goal_th = self._confirm_reversal(
+            'theta', self._output.angular.z, self._target.angular.z, REVERSAL_DEADBAND_THETA)
+
         self._output.linear.x = self._ramp(
-            self._output.linear.x, self._target.linear.x,
-            MAX_ACCEL_X, MAX_DECEL_X, self._period)
+            self._output.linear.x, goal_x, MAX_ACCEL_X, MAX_DECEL_X, self._period)
         self._output.angular.z = self._ramp(
-            self._output.angular.z, self._target.angular.z,
-            MAX_ACCEL_THETA, MAX_DECEL_THETA, self._period)
+            self._output.angular.z, goal_th, MAX_ACCEL_THETA, MAX_DECEL_THETA, self._period)
         self._publish()
 
     def _publish(self):
@@ -188,7 +260,9 @@ class VelocitySmoother(Node):
         self.get_logger().info(
             f'[smoother] in={in_hz:.1f}Hz out={out_hz:.1f}Hz '
             f'target=({self._target.linear.x:.3f},{self._target.angular.z:.3f}) '
-            f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f})')
+            f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+            f'flips_suppressed={self._suppressed_flips}')
+        self._suppressed_flips = 0
 
 
 def main(args=None):
