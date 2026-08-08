@@ -107,14 +107,22 @@ CONTROL_PERIOD_S = 0.02      # 50 Hz — matches the odom/IMU feedback rate
 YAW_FF_DEADBAND_DEFAULT = 0.121  # rad/s — below this, commanded yaw produces no motion
 YAW_FF_GAIN_DEFAULT = 0.891     # measured slope above the deadband
 
-# NOT yet measured — the yaw sweep can be done rotating in place, but characterising the
-# linear axis needs ~1 m of clear floor per data point, which we did not have. These are
-# estimates from the earlier deadband observation ("linear below ~0.04 m/s barely creeps").
-# Erring toward a HIGH gain is the safe direction: it under-commands rather than over-
-# commands, so a wrong value here makes the robot sluggish, never faster than asked.
-# Re-measure with the same method as yaw and update. See lin_ff_* parameters.
-LIN_FF_DEADBAND_DEFAULT = 0.04   # m/s, estimated
-LIN_FF_GAIN_DEFAULT = 0.90       # m/s, estimated
+# Linear axis, measured the same way (short forward bursts with reverse returns, to stay
+# inside a ~1.5 m corridor; 3.6 s per point, first 1.2 s of transient discarded):
+#
+#     cmd  0.05  0.08  0.10  0.13  0.16  0.20   m/s
+#     act  0.033 0.056 0.082 0.101 0.126 0.157  m/s
+#
+# Least-squares fit: actual = 0.830 * (cmd - 0.009), R^2 = 0.995.
+#
+# Note how much SMALLER the linear deadband is than the yaw one (0.009 m/s vs 0.121
+# rad/s). That is physically sensible: driving forward turns both wheels the same way,
+# whereas rotating in place has to break stiction on both wheels in OPPOSITE directions.
+# It also corrected a bad guess — these were previously estimated at deadband 0.04 /
+# gain 0.90, and that 0.04 offset (4.4x too large) made the feedforward over-command by
+# ~38% at low speed, producing a surge-then-settle that was felt as residual jerk.
+LIN_FF_DEADBAND_DEFAULT = 0.009  # m/s, measured
+LIN_FF_GAIN_DEFAULT = 0.830      # measured slope
 
 # Trim gains only — the feedforward does the heavy lifting, and these correct just the
 # residual the static model misses. Kept small because the feedback is genuinely noisy:
@@ -146,6 +154,38 @@ LIN_VEL_I_CLAMP = 0.05       # m/s
 # integrator doesn't chase sensor jitter while genuinely commanded to hold still.
 YAW_RATE_DEADZONE = 0.02     # rad/s
 LIN_VEL_DEADZONE = 0.01      # m/s
+
+# ── Feedback filtering ───────────────────────────────────────────────────────
+# The encoder-derived velocity (d/dt in _odom_update) is badly behaved as a control
+# signal, because we poll the Kobuki at 50 Hz but its encoder registers refresh more
+# slowly. Many polls therefore return an UNCHANGED tick count -> d = 0 -> velocity 0,
+# and then one poll catches the whole accumulated movement over a very short dt and
+# d/dt explodes.
+#
+# Measured while driving at a commanded 0.05 m/s: median 0.000 m/s but mean 0.036 m/s,
+# peaks to 0.35 m/s, and /odom inter-arrival median 19.9 ms with a minimum of 0.64 ms
+# (16 of 259 intervals under 5 ms). The signal is bimodal — zeros punctuated by spikes —
+# rather than noisy about the truth. Its MEAN is right, so it is unbiased and a
+# low-pass filter recovers the real value cleanly.
+#
+# Unfiltered, those spikes land directly in the P term and the integrator, which is a
+# source of translational jerk that no amount of deadband compensation can remove.
+#
+# Filtering is applied ONLY to the controller's copy of the feedback. The values
+# published on /odom are deliberately left raw: robot_localization has its own noise
+# model and covariances tuned against that raw signal (ekf_hardware.yaml), and quietly
+# changing the statistics of a topic other nodes consume would be a much wider change
+# than this fix warrants.
+#
+# alpha 0.25 at 50 Hz is a ~0.12 s time constant: long enough to bridge the runs of
+# zeros, short enough that the added phase lag stays well inside what the feedforward
+# (which needs no feedback at all) already covers.
+MEAS_FILTER_ALPHA = 0.25
+
+# Guard against the small-dt division itself. Below this the sample is discarded rather
+# than filtered, because a 0.64 ms interval carrying a whole 20 ms of accumulated ticks
+# is not a measurement of anything — it is an artifact of the polling mismatch.
+MIN_ODOM_DT_S = 0.005
 
 # Safety watchdog. The old passthrough had none: the last command was latched into the
 # motors forever, so if whatever was publishing cmd_vel died mid-drive the robot kept
@@ -268,7 +308,12 @@ class KobukiBaseNode(Node):
         # Feedback for the linear half of _control_update. Encoder-derived rather than
         # gyro (the gyro measures yaw only), and taken from the same averaged wheel delta
         # the odometry uses so the two can never disagree about how fast we're going.
-        self._meas_lin = d / dt
+        #
+        # Filtered, unlike the raw value published above — see MEAS_FILTER_ALPHA. A
+        # too-short dt means the encoder register simply had not refreshed, so d/dt is an
+        # artifact rather than a measurement; drop it instead of feeding it to the filter.
+        if dt >= MIN_ODOM_DT_S:
+            self._meas_lin += MEAS_FILTER_ALPHA * ((d / dt) - self._meas_lin)
 
     # ── IMU (rate gyro only — see YAW_RATE_VARIANCE comment above) ───────────
 
@@ -311,7 +356,12 @@ class KobukiBaseNode(Node):
         msg.angular_velocity.z = math.radians(yaw_rate_dps)
         # Feedback for the yaw half of _control_update — the bias-corrected rate, i.e. the
         # same value published here, so the controller and the EKF agree on the truth.
-        self._meas_ang = math.radians(yaw_rate_dps)
+        # Filtered with the same time constant as the linear axis for consistency. The
+        # gyro does not suffer the polling artifact the encoders do (it is a genuine
+        # continuous measurement), but it does carry real stick-slip content: measured
+        # stdev 0.084 rad/s against a 0.17 rad/s mean. Smoothing that keeps the drivetrain's
+        # own judder out of the motor command instead of amplifying it round the loop.
+        self._meas_ang += MEAS_FILTER_ALPHA * (math.radians(yaw_rate_dps) - self._meas_ang)
         msg.angular_velocity_covariance[0] = 1e6   # x: not fused, large variance (not -1 —
         msg.angular_velocity_covariance[4] = 1e6   # y: that would invalidate z too)
         msg.angular_velocity_covariance[8] = YAW_RATE_VARIANCE

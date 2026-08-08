@@ -133,6 +133,13 @@ controller_server:
       # Note this only governs DWB. behavior_server's BackUp/Spin publish their own
       # commands and bypass it entirely — velocity_smoother covers those.
       trajectory_generator_name: "dwb_plugins::LimitedAccelGenerator"
+      # LimitedAccelGenerator warns "'sim_period' parameter is not set for FollowPath" and
+      # falls back to an implicit default if this is omitted. Set it explicitly because it
+      # is exactly what sizes the reachable-velocity window: the generator samples
+      # current_vel +/- acc_lim * sim_period, so a value that disagrees with the real
+      # control period silently makes the acceleration limiting either useless (too large)
+      # or crippling (too small). Must equal 1 / controller_frequency (20 Hz above).
+      sim_period: 0.05
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
