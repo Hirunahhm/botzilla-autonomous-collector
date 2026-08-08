@@ -85,25 +85,54 @@ controller_server:
       # instead of converging on them. This wants to be a per-platform override rather
       # than one shared number — until then the honest, physically-consistent value wins.
       max_vel_theta: 0.4
-      # Deadband floors. Measured on this Kobuki: rotation <= 0.12 rad/s produces NO
-      # motion at all (0-2% of commanded) and 0.15 rad/s only ~10%; linear below
-      # ~0.04 m/s barely creeps. With these left at 0.0, DWB was observed live emitting
-      # 0.063 rad/s / 0.021 m/s — squarely inside the dead zone — so the robot sat
-      # motionless while Nav2 believed it was driving, the progress checker timed out
-      # after 10 s, and EVERY goal failed with "Failed to make progress". That looked
-      # exactly like a planning/costmap deadlock and is not one: it is a velocity floor.
-      # DWB rejects a trajectory only when translation < min_speed_xy AND
-      # |rotation| < min_speed_theta, so pure rotation and pure translation both remain
-      # available — only the un-executable near-zero commands are filtered out.
-      min_speed_xy: 0.05
+      # Deadband floors, now BACK TO ZERO — the deadband is compensated in the base driver
+      # instead. History, because this flip-flopped once and the reasoning matters:
+      #
+      # Measured on this Kobuki, rotation <= 0.12 rad/s produces NO motion at all (0-2% of
+      # commanded), 0.15 rad/s only ~10%; linear below ~0.04 m/s barely creeps. With these
+      # at 0.0 and an open-loop base, DWB emitted 0.063 rad/s / 0.021 m/s — inside the dead
+      # zone — so the robot sat motionless while Nav2 believed it was driving and every
+      # goal failed "Failed to make progress". Flooring the output above the deadband fixed
+      # that, and was correct given an open-loop base.
+      #
+      # But the floor has a second, worse effect: DWB rejects a trajectory when translation
+      # < min_speed_xy AND |rotation| < min_speed_theta, so with 0.2 the smallest legal
+      # in-place rotation IS 0.2 rad/s. The reachable command set became roughly
+      # {0, +/-0.2 ... +/-0.4} and the robot could not rotate gently at all: every heading
+      # correction was a step input. Measured consequence, on hardware: visible jerking and
+      # 24 angular sign changes in 80 s, overshooting and reversing instead of converging.
+      # The same self-inflicted limit cycle had already been confirmed in simulation.
+      #
+      # kobuki_base_node now closes the loop on the bias-calibrated rate gyro and the wheel
+      # encoders, so a small commanded velocity is actually *delivered* and no floor is
+      # needed. Zero here restores DWB's ability to ask for arbitrarily fine corrections,
+      # which is the correct configuration for any platform that can execute them.
+      min_speed_xy: 0.0
       max_speed_xy: 0.2
-      min_speed_theta: 0.2
+      min_speed_theta: 0.0
+      # With LimitedAccelGenerator selected below these stop being advisory and become the
+      # real bound on how fast the *command* can change, so they now directly set how
+      # smooth the motion is. acc_lim_theta raised 0.8 -> 1.5: at 20 Hz, 0.8 allows only
+      # 0.04 rad/s of change per cycle, which needs a full 0.5 s to reach max_vel_theta and
+      # left DWB with a sampling window too narrow to consider meaningfully different
+      # options. 1.5 reaches 0.4 rad/s in ~0.27 s while still ramping visibly smoothly.
       acc_lim_x: 0.4
       acc_lim_y: 0.0
-      acc_lim_theta: 0.8
+      acc_lim_theta: 1.5
       decel_lim_x: -0.4
       decel_lim_y: 0.0
-      decel_lim_theta: -0.8
+      decel_lim_theta: -1.5
+      # DWB's DEFAULT generator (StandardTrajectoryGenerator, used implicitly whenever this
+      # is unset) samples the entire velocity range every cycle regardless of the robot's
+      # current velocity — acc_lim_* above only shape the simulated trajectory and do NOT
+      # bound the emitted command. That is why cmd_vel could jump 0 -> +0.4 -> -0.4 on
+      # consecutive 20 Hz cycles. LimitedAccelGenerator restricts sampling to velocities
+      # actually reachable within one control period, making acceleration continuity a
+      # property of the controller rather than something bolted on downstream.
+      #
+      # Note this only governs DWB. behavior_server's BackUp/Spin publish their own
+      # commands and bypass it entirely — velocity_smoother covers those.
+      trajectory_generator_name: "dwb_plugins::LimitedAccelGenerator"
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20

@@ -13,15 +13,27 @@ which navigation_launch.py always brings up regardless of whether they're
 configured or needed, adding failure surface (e.g. route_server expects a
 routing graph file we don't have) for no benefit at this milestone.
 
-cmd_vel chain: controller_server/behavior_server publish directly on plain
-'cmd_vel', which kobuki_base_node consumes. velocity_smoother used to sit in
-between ('cmd_vel_nav' -> 'cmd_vel') but was removed: on hardware it silently
-stopped republishing anything — controller_server kept publishing to
-'cmd_vel_nav' while '/cmd_vel' had no publisher at all, with the node reporting
+cmd_vel chain: controller_server/behavior_server -> 'cmd_vel_nav' ->
+botzilla_control's velocity_smoother -> 'cmd_vel' -> kobuki_base_node.
+
+History, because this chain changed twice. Originally the servers published
+straight to 'cmd_vel'. nav2_velocity_smoother was tried in between and removed:
+on hardware it silently stopped republishing — controller_server kept publishing
+to 'cmd_vel_nav' while '/cmd_vel' had no publisher at all, the node reporting
 lifecycle state active and logging no error, so every navigation goal stalled.
-The smoother is optional (DWB's own accel limits in nav2_params.yaml already
-bound the output); if smoothing is wanted later, do it in a node we own and can
-instrument rather than reintroducing a silent failure point.
+The note left behind then was that the smoother was optional because "DWB's own
+accel limits already bound the output".
+
+That last part turned out to be wrong, and is why a smoother is back. DWB's
+default trajectory generator (StandardTrajectoryGenerator) samples the entire
+velocity range every cycle regardless of current velocity; acc_lim_* only shape
+the simulated trajectory and never bound the emitted command. Measured on
+hardware: 24 angular sign changes in 80 s, with visible jerking. nav2_params.yaml
+now selects LimitedAccelGenerator to fix that inside DWB, but behavior_server's
+BackUp/Spin bypass DWB entirely — so the smoother covers them. It is our own node
+(botzilla_control/velocity_smoother.py), built so the earlier silent failure
+cannot recur: it publishes on a timer, decays to zero on input timeout rather
+than latching, and logs its in/out rates.
 
 Simulation parameters: passing use_sim_time:=true additionally layers
 config/nav2_params_sim.yaml on top of the main params file (ROS 2 merges multiple
@@ -79,10 +91,44 @@ def _launch_nav2(context, *_args, **_kwargs):
         ('nav2_behaviors', 'behavior_server'),
         ('nav2_bt_navigator', 'bt_navigator'),
     ]
+    # The two nodes that publish velocity are redirected to 'cmd_vel_nav' so
+    # velocity_smoother can sit between them and the base (see SMOOTHER note below).
+    # planner_server/bt_navigator publish no velocity, so remapping them is harmless but
+    # pointless — keep the remap targeted so the topic graph stays readable.
+    velocity_publishers = {'controller_server', 'behavior_server'}
     nodes = [
-        Node(package=pkg, executable=exe, name=exe, output='screen', parameters=params)
+        Node(
+            package=pkg, executable=exe, name=exe, output='screen', parameters=params,
+            remappings=([('cmd_vel', 'cmd_vel_nav')] if exe in velocity_publishers else []),
+        )
         for pkg, exe in servers
     ]
+
+    # SMOOTHER: 'cmd_vel_nav' -> 'cmd_vel'.
+    #
+    # A smoother used to live here (nav2_velocity_smoother) and was removed because it
+    # silently stopped republishing on hardware — see this file's module docstring. That
+    # docstring's conclusion was "if smoothing is wanted later, do it in a node we own and
+    # can instrument rather than reintroducing a silent failure point", and this is that
+    # node: botzilla_control's velocity_smoother, which publishes on a timer (so /cmd_vel
+    # always has a live publisher), decays to zero on input timeout instead of latching,
+    # and logs input/output rates periodically so the old silent failure is observable.
+    #
+    # It is NOT redundant with DWB's LimitedAccelGenerator: behavior_server's BackUp and
+    # Spin publish velocity directly and bypass DWB's trajectory generator entirely, and
+    # those recovery behaviours were the most violent part of the observed motion.
+    #
+    # Deliberately not a lifecycle node: it must be transporting velocity before and after
+    # the managed nodes transition, and adding it to lifecycle_nodes would make the whole
+    # navigation bringup fail if it were absent.
+    nodes.append(Node(
+        package='botzilla_control',
+        executable='velocity_smoother',
+        name='velocity_smoother',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    ))
+
     nodes.append(Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',

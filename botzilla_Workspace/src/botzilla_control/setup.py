@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'kobuki_base_node = botzilla_control.kobuki_base_node:main',
+            'velocity_smoother = botzilla_control.velocity_smoother:main',
             'brain_node = botzilla_control.brain_node:main',
             'cube_collector = botzilla_control.cube_collector:main',
             'perception_simulator = botzilla_control.perception_simulator:main',
