@@ -1,0 +1,47 @@
+# Simulation-only Nav2 parameter OVERLAY for BotZilla.
+#
+# This is NOT a standalone config. It is layered on top of nav2_params.yaml — ROS 2 merges
+# multiple --params-file arguments in order, with later files winning — so it contains only
+# the handful of values that must differ in Gazebo. Everything else (costmaps, critics,
+# planner, behaviours) is inherited, which is the point: a full copy of nav2_params.yaml
+# would silently drift out of sync with the hardware config the moment either is tuned.
+#
+# nav2.launch.py applies this automatically whenever use_sim_time:=true, so there is
+# nothing to remember at the command line.
+#
+# ── Why anything needs to differ at all ──────────────────────────────────────────────
+# The values below exist purely to compensate for a PHYSICAL property of the real Kobuki
+# base, measured on hardware (odom over a 3 s constant command with nothing else driving
+# cmd_vel): the base ignores rotation commands at or below ~0.12 rad/s outright, and
+# translation below ~0.04 m/s barely creeps. DWB was emitting 0.063 rad/s / 0.021 m/s, so
+# the robot stood still while Nav2 believed it was driving, the progress checker timed out,
+# and every goal failed — which looks exactly like a planning deadlock and is not one.
+# nav2_params.yaml therefore floors DWB's output above that deadband.
+#
+# Simulation has no deadband: a commanded velocity is delivered exactly. There the floor is
+# not merely unnecessary, it is actively harmful. Confirmed live in Gazebo: with
+# min_speed_theta at 0.2, a robot needing a small heading correction cannot ask for one —
+# the smallest legal in-place rotation is 0.2 rad/s — so it overshoots, the error flips
+# sign on the next 20 Hz cycle, it commands the opposite 0.2 rad/s, and overshoots again.
+# Measured result: 568 velocity commands alternating +/-0.232 rad/s, 54 sign changes,
+# 0.000 m travelled and 4.9 deg of yaw swing over 25 s, in completely open floor with every
+# costmap cell around the robot reading 0. A self-inflicted limit cycle, invisible to the
+# Oscillation critic because the robot never commits enough motion for that critic to
+# arbitrate.
+#
+# Zeroing the floors here restores DWB's ability to command arbitrarily fine corrections,
+# which is correct for any platform that can actually execute them.
+#
+# NOTE: the reverse direction of this idea also applies. max_vel_theta is kept at 0.4 in
+# nav2_params.yaml because that is the physically honest value everywhere velocity is
+# delivered as commanded; hardware measures only ~56% of commanded yaw rate and would
+# prefer ~0.6 to compensate. If that is ever wanted, it belongs in a hardware overlay
+# alongside this one — not as a global value that silently distorts simulation.
+
+controller_server:
+  ros__parameters:
+    FollowPath:
+      # Hardware: 0.05 / 0.2 (deadband floors). Simulation delivers what it is told, so the
+      # floors only prevent fine control — see the header for the measured limit cycle.
+      min_speed_xy: 0.0
+      min_speed_theta: 0.0

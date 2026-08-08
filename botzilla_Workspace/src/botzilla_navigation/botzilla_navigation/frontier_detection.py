@@ -149,40 +149,31 @@ def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_ra
     return None
 
 
-def footprint_clear(costmap, width, height, row, col, radius_cells, max_cost=99):
-    """Check whether a circular footprint centered at (row, col) is free of high cost.
+def in_collision(costmap, width, height, row, col, inscribed_cost=99):
+    """Whether a circular robot centred on this cell is in collision, per Nav2's own test.
 
-    find_low_cost_point (above) checks a single point's own cost, which is enough for a
-    navigation TARGET — but it does not guarantee the robot's actual body stays clear
-    once it parks there. Confirmed live: after successfully reaching a frontier, the
-    robot's own center cell read cost 0, yet a real wall sat only one cell away — well
-    inside the robot's footprint radius. From that pose, every subsequent
-    ComputePathToPose call failed with NO_VALID_PATH in every direction, because the
-    START pose itself was already footprint-in-collision, not because the destinations
-    were actually blocked. This function lets the caller detect that directly (checking
-    the robot's OWN current cell, not a candidate goal) so it can back away immediately
-    instead of cycling through doomed targets first.
+    Nav2's inflation layer already encodes the footprint: a cell reaches
+    INSCRIBED_INFLATED_OBSTACLE (253 internally, 99 as published on the OccupancyGrid)
+    exactly when a lethal obstacle lies within the robot's inscribed radius of it. So for
+    a circular footprint — which is what nav2_params.yaml configures via robot_radius —
+    the collision test is a single lookup of the centre cell, and that is precisely the
+    test the planner itself applies when deciding whether a pose is valid.
 
-    radius_cells should match the robot's actual footprint radius in grid cells (not a
-    search radius to expand outward like find_low_cost_point — every cell within it is
-    checked). Returns True if every in-bounds cell within radius_cells has cost strictly
-    below max_cost (unknown cells, value -1, do not count as blocking — matches the
-    project's existing free/occupied cost-threshold convention elsewhere). Out-of-bounds
-    cells are skipped rather than treated as blocking, since the footprint circle can
-    extend past the costmap edge near map boundaries.
+    This replaced an earlier check that scanned every cell within robot_radius for cost
+    >= 99. That double-counted the inflation: requiring cells a full robot_radius away to
+    also be clear of the inscribed band demands robot_radius + inscribed_radius (0.40 m
+    with this project's tuning) of clearance where the robot only needs 0.20 m. Confirmed
+    live, it reported the robot as footprint-blocked while it sat in open floor with its
+    centre cell reading cost 0 and no lethal cell anywhere within its actual footprint,
+    which sent it into an endless backup/spin recovery loop in perfectly drivable space.
+
+    Cells outside the map are treated as not-in-collision (unknown space beyond the map
+    edge is not evidence of an obstacle), matching how unknown cells are handled
+    elsewhere in this module.
     """
-    def idx(r, c):
-        return r * width + c
-
-    r_sq = radius_cells * radius_cells
-    for dr in range(-radius_cells, radius_cells + 1):
-        for dc in range(-radius_cells, radius_cells + 1):
-            if dr * dr + dc * dc > r_sq:
-                continue
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < height and 0 <= nc < width and costmap[idx(nr, nc)] >= max_cost:
-                return False
-    return True
+    if not (0 <= row < height and 0 <= col < width):
+        return False
+    return costmap[row * width + col] >= inscribed_cost
 
 
 def grid_to_world(row, col, resolution, origin_x, origin_y):

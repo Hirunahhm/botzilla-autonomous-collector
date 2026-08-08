@@ -14,8 +14,8 @@ from botzilla_navigation.frontier_detection import (  # noqa: E402,I100
     distance,
     find_frontiers,
     find_low_cost_point,
-    footprint_clear,
     grid_to_world,
+    in_collision,
     select_target,
     world_to_grid,
 )
@@ -226,52 +226,38 @@ def test_find_low_cost_point_ignores_unknown_cells():
     assert find_low_cost_point(data, w, h, row=1, col=1, max_cost=50, search_radius=5) is None
 
 
-def test_footprint_clear_open_space():
-    rows = [[0] * 7 for _ in range(7)]
-    data, w, h = grid(rows, 7)
-    assert footprint_clear(data, w, h, row=3, col=3, radius_cells=2) is True
+def test_in_collision_open_space():
+    rows = [[0] * 5 for _ in range(5)]
+    data, w, h = grid(rows, 5)
+    assert in_collision(data, w, h, row=2, col=2) is False
 
 
-def test_footprint_clear_detects_nearby_wall():
-    """Regression test for the live "false deadlock" bug.
+def test_in_collision_only_at_inscribed_cost_or_above():
+    """Regression test for the double-counted-inflation bug.
 
-    The robot's own center cell can read cost 0 while a wall sits just outside that
-    single cell but still inside the robot's actual footprint radius. A point-cost
-    check alone (as used for candidate goals) would miss this; footprint_clear must
-    catch it by scanning the whole radius, not just the center cell.
+    Costmap value 99 (INSCRIBED_INFLATED_OBSTACLE) already means "a lethal obstacle lies
+    within the robot's inscribed radius of this cell", so it alone decides collision for
+    a circular footprint. The earlier check scanned every cell within robot_radius for
+    >= 99, which demanded robot_radius + inscribed_radius of clearance and reported open
+    floor as blocked — confirmed live on hardware, causing an endless backup/spin loop.
+    A centre cell below the cutoff must read as clear even with high cost nearby.
     """
     rows = [
-        [0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0],
-        [100, 0, 0, 0, 0],  # lethal wall one cell to the left of the robot
-        [0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0],
+        [0,  0,   0,  0, 0],
+        [0,  0,   0,  0, 0],
+        [100, 99, 0,  0, 0],   # lethal + inscribed band immediately left of centre
+        [0,  0,   0,  0, 0],
+        [0,  0,   0,  0, 0],
     ]
     data, w, h = grid(rows, 5)
-    assert data[2 * w + 1] == 0  # robot's own cell reads clear
-    assert footprint_clear(data, w, h, row=2, col=1, radius_cells=2) is False
+    assert in_collision(data, w, h, row=2, col=0) is True    # lethal cell itself
+    assert in_collision(data, w, h, row=2, col=1) is True    # inscribed -> in collision
+    # One cell further out the inflation has decayed below the cutoff: NOT a collision,
+    # even though a lethal cell sits only two cells away.
+    assert in_collision(data, w, h, row=2, col=2) is False
 
 
-def test_footprint_clear_ignores_unknown_and_out_of_bounds():
-    rows = [
-        [-1, -1, -1],
-        [-1, 0, -1],
-        [-1, -1, -1],
-    ]
-    data, w, h = grid(rows, 3)
-    # Unknown cells don't count as blocking, and a radius extending past the map edge
-    # must not be treated as a collision either.
-    assert footprint_clear(data, w, h, row=1, col=1, radius_cells=3) is True
-
-
-def test_footprint_clear_respects_max_cost_threshold():
-    rows = [
-        [80, 0, 0],
-        [0, 0, 0],
-        [0, 0, 0],
-    ]
-    data, w, h = grid(rows, 3)
-    # 80 is below the default lethal/inscribed cutoff (99) -> still clear.
-    assert footprint_clear(data, w, h, row=1, col=1, radius_cells=2) is True
-    # But it's above a stricter caller-supplied threshold -> not clear.
-    assert footprint_clear(data, w, h, row=1, col=1, radius_cells=2, max_cost=50) is False
+def test_in_collision_out_of_bounds_is_not_a_collision():
+    rows = [[0, 0], [0, 0]]
+    data, w, h = grid(rows, 2)
+    assert in_collision(data, w, h, row=9, col=9) is False

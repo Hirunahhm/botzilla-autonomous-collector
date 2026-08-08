@@ -119,23 +119,24 @@ so a frontier that's genuinely unreachable rather than just occluded by the robo
 position still gets pushed out further on repeat offenses.
 
 Self-clearance: the stuck-recovery trigger above reacts to "no known frontier is
-reachable," which is a SYMPTOM — investigating why revealed a sharper cause. Confirmed
-live: after successfully reaching a frontier and stopping, the robot's own center cell
-read costmap cost 0, but a real wall sat only one costmap cell away — well inside the
-robot's actual footprint radius. From that resting pose, EVERY subsequent
-ComputePathToPose call failed with NO_VALID_PATH in every direction tried (five
-differently-located frontiers, all rejected), not because those destinations were
-actually blocked, but because the START pose itself was already footprint-in-collision:
-NavFn plans from the robot's current pose, and a start pose whose body overlaps
-high-cost space can't produce a valid path to anywhere. The generic stuck-recovery above
-still caught this (eventually — after burning through 15s of failed attempts across
-every known frontier first), which is why it looked like the robot was "deadlocked" even
-in rooms with plenty of open floor: the problem was never the destinations, it was
-whichever wall the robot happened to park next to on its way in. _evaluate() now checks
-this directly and first, via frontier_detection.footprint_clear on the robot's own
-current cell — if the robot's body already overlaps high cost, it backs up immediately
-via the same recovery path, without wasting a cycle finding out the hard way through
-five doomed reachability checks.
+reachable," which is a SYMPTOM. NavFn plans FROM the robot's current pose, so a robot
+that has parked itself in collision cannot produce a valid path to anywhere, and every
+frontier gets rejected in turn for a reason that has nothing to do with the frontiers.
+_evaluate() therefore tests the robot's own pose first, via
+frontier_detection.in_collision, and backs up immediately rather than discovering the
+same thing the slow way through a sequence of doomed reachability checks.
+
+That test is a single lookup of the robot's centre cell against the inscribed cutoff —
+Nav2's own criterion for a circular footprint. It began life as a scan of every cell
+within robot_radius for cost >= 99, which was wrong: cost 99 already means "a lethal
+obstacle is within the inscribed radius of THIS cell," so re-scanning a robot_radius
+neighbourhood for it demands robot_radius + inscribed_radius (0.40 m under this
+project's tuning) of clearance where the robot actually needs 0.20 m. Confirmed live on
+hardware: the robot sat in open floor, centre cell cost 0, zero lethal cells anywhere
+inside its real footprint, and the check still declared it blocked — producing an endless
+backup/spin loop in space it could drive through freely. The lesson generalises: the
+inflation layer has already done the footprint reasoning, so re-applying the footprint on
+top of an inflated costmap double-counts it.
 
 Spin fallback: BackUp can itself fail this exact same way. Confirmed live: the goal
 heading a frontier approach ends on points toward the frontier, not away from whatever
@@ -153,6 +154,48 @@ cycle either way — if the robot is still footprint-blocked afterward, the next
 self-clearance check starts another backup/spin cycle, sweeping a new quadrant each time
 rather than re-trying the same one.
 
+Coverage sweep: frontier exploration alone only ever drives to the *edges* of known
+space — once LiDAR has seen a room's walls, no frontier remains there even though the
+Kinect's narrow (~57 deg) FOV never got a camera view of the room's interior, so cubes
+away from the walls would never come within range of a camera-based detector. When
+frontiers_world comes back empty, this node no longer parks forever: it switches
+self._mode from 'FRONTIER' to 'SWEEPING', builds a boustrophedon waypoint queue from the
+now-complete /map via coverage_planning.generate_coverage_waypoints, and starts
+dispatching it (_dispatch_next_sweep_waypoint) one point at a time. Deliberately reuses
+every safety primitive already hardened above for frontier targets — costmap-snapping
+(_snap_to_reachable), the reachability pre-check, the stall watchdog, and the
+self-clearance/BackUp/Spin recovery chain — rather than duplicating any of it: a sweep
+waypoint is, from Nav2's perspective, exactly the same kind of goal a frontier target is.
+Sweep waypoints set self._frontier_origin = None, which every existing blacklist call
+site already guards on — so a failed sweep waypoint is simply skipped (it was already
+popped) rather than entered into the cooldown/backoff bookkeeping meant for frontier
+clusters that get re-evaluated every tick; a one-pass queue has no "next tick" to
+re-blacklist against. Row spacing (SWEEP_ROW_SPACING_M) is a placeholder for this stage —
+no camera/cube-detection wiring is part of this milestone, so there is nothing yet to tune
+it against; that comes once cube detection is reintroduced on top of a validated sweep.
+
+Crucially the sweep is entered from TWO conditions, not one. "No frontier clusters exist
+at all" is the obvious trigger but almost never fires in a real bounded arena: the
+leftover frontiers there face unreachable space beyond the walls, so they are never
+consumed — they just accumulate permanent blacklist entries. Confirmed live in sim,
+frontier counts plateau in exactly that state. So the node also gives up on exploring
+after STUCK_RECOVERIES_BEFORE_SWEEP consecutive stuck-recoveries fail to make any
+frontier reachable again (see _handle_all_frontiers_blacklisted). Without that second
+trigger this whole phase is dead code — the node backs up forever and never sweeps.
+
+The mode is not one-way. find_frontiers runs every tick in BOTH modes, because sweeping
+drives through the room interior — precisely where pockets that were occluded from the
+walls come into view — so genuinely new frontiers can appear partway through a sweep.
+Mapping takes priority when they do: the node returns to 'FRONTIER', discards the queue,
+and rebuilds it against the larger map once frontiers are exhausted again. Resuming the
+old queue instead would be cheaper but would leave the newly-discovered floor uncovered,
+which is the exact failure this phase exists to prevent.
+
+Snap/self-clearance agreement: COSTMAP_SAFE_COST (50) sits well below the inscribed
+cutoff SELF_CLEARANCE_MAX_COST (99), so any cell _snap_to_reachable accepts is by
+construction not a colliding pose. The snap and the arrival check therefore agree, and a
+goal this node picks cannot be one the robot declares itself stuck at on arrival.
+
 Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
@@ -160,12 +203,13 @@ Usage:
 import math
 
 from action_msgs.msg import GoalStatus
+from botzilla_navigation.coverage_planning import generate_coverage_waypoints
 from botzilla_navigation.frontier_detection import (
     distance,
     find_frontiers,
     find_low_cost_point,
-    footprint_clear,
     grid_to_world,
+    in_collision,
     select_target,
     world_to_grid,
 )
@@ -210,6 +254,16 @@ GOAL_ABS_TIMEOUT_S = 420.0
 # this long, the robot backs up rather than waiting out the cooldown for geometry that
 # backing up itself is meant to fix.
 STUCK_RECOVERY_TIMEOUT_S = 15.0
+
+# How many back-to-back stuck-recoveries to attempt before concluding the remaining
+# frontiers are genuinely unreachable rather than merely awkward, and handing over to the
+# coverage sweep. Recovery changes the robot's pose, so if this many cycles have not made
+# a single frontier reachable again, the obstruction is not the robot's position.
+# Confirmed live in sim: frontier counts plateau with every survivor permanently
+# blacklisted (they face unreachable space beyond the arena walls), which the
+# "no frontiers at all" branch never observes — so without this bound the node backs up
+# indefinitely and the sweep is unreachable in any bounded arena.
+STUCK_RECOVERIES_BEFORE_SWEEP = 3
 BACKUP_DISTANCE_M = 0.3
 BACKUP_SPEED_MPS = 0.1
 BACKUP_TIME_ALLOWANCE_S = 10.0
@@ -268,15 +322,19 @@ BLACKLIST_COOLDOWN_MAX_S = 3600.0
 COSTMAP_SAFE_COST = 50
 COSTMAP_SEARCH_RADIUS_CELLS = 10
 
-# Self-clearance check — see module docstring's "Self-clearance" section. Confirmed
-# live: a point-cost check on a candidate goal isn't enough to guarantee the robot's own
-# BODY stays clear once parked there. SELF_CLEARANCE_RADIUS_M matches the planner's
-# robot_radius (nav2_params.yaml) — the same footprint the planner itself uses to decide
-# whether a pose is in collision. SELF_CLEARANCE_MAX_COST uses the inscribed/lethal
-# cutoff (99), not COSTMAP_SAFE_COST's stricter 50: this check asks "is my body actually
-# touching something," not "is this a comfortable place to aim for."
-SELF_CLEARANCE_RADIUS_M = 0.20
+# Self-clearance check — see module docstring's "Self-clearance" section. This is the
+# published-OccupancyGrid value of INSCRIBED_INFLATED_OBSTACLE: a cell reaches it exactly
+# when a lethal obstacle lies within the robot's inscribed radius, so for the circular
+# footprint nav2_params.yaml configures, "centre cell >= 99" IS the collision test the
+# planner itself uses. Deliberately not COSTMAP_SAFE_COST's stricter 50 — this asks "am I
+# actually in collision," not "is this a comfortable place to aim for."
 SELF_CLEARANCE_MAX_COST = 99
+
+# Coverage sweep — see module docstring's "Coverage sweep" section. Placeholders: this
+# stage validates sweep navigation only, not camera coverage, so these aren't tuned
+# against the Kinect's FOV yet.
+SWEEP_ROW_SPACING_M = 0.5
+SWEEP_MIN_RUN_M = 0.3
 
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
@@ -287,7 +345,7 @@ class State:
     CHECKING_PATH = 'CHECKING_PATH'
     NAVIGATING = 'NAVIGATING'
     RECOVERING = 'RECOVERING'
-    EXPLORATION_COMPLETE = 'EXPLORATION_COMPLETE'
+    COVERAGE_COMPLETE = 'COVERAGE_COMPLETE'
 
 
 class FrontierExplorerNode(Node):
@@ -329,6 +387,15 @@ class FrontierExplorerNode(Node):
         self._spin_goal_handle = None
         self._recovery_start_time = None  # rclpy.time.Time the recovery sequence started
 
+        # Coverage sweep — see module docstring's "Coverage sweep" section.
+        self._mode = 'FRONTIER'  # 'FRONTIER' | 'SWEEPING'
+        self._sweep_queue = []
+        self._exploration_complete_published = False
+        # Back-to-back stuck-recoveries with no frontier becoming reachable again; once
+        # this hits STUCK_RECOVERIES_BEFORE_SWEEP the node stops trying to explore and
+        # sweeps instead. Reset whenever any frontier becomes actionable again.
+        self._consecutive_recoveries = 0
+
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -355,6 +422,9 @@ class FrontierExplorerNode(Node):
         complete_qos = QoSProfile(depth=1)
         complete_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self._complete_pub = self.create_publisher(Bool, '/exploration_complete', complete_qos)
+        self._coverage_complete_pub = self.create_publisher(
+            Bool, '/coverage_complete', complete_qos
+        )
 
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
@@ -413,7 +483,8 @@ class FrontierExplorerNode(Node):
         self._last_progress_time = None
         self._stuck_since = None
         self._recovery_start_time = None
-        if self._state != State.EXPLORATION_COMPLETE:
+        self._consecutive_recoveries = 0
+        if self._state != State.COVERAGE_COMPLETE:
             self._state = State.IDLE
 
     # ------------------------------------------------------------------ #
@@ -452,7 +523,7 @@ class FrontierExplorerNode(Node):
             # than picking a target concurrently — see _check_recovery_stall.
             self._check_recovery_stall()
             return
-        if self._state == State.EXPLORATION_COMPLETE:
+        if self._state == State.COVERAGE_COMPLETE:
             return
         if self._latest_map is None:
             self.get_logger().info(
@@ -476,12 +547,16 @@ class FrontierExplorerNode(Node):
         if not self._is_self_clear(robot_x, robot_y):
             self.get_logger().warn(
                 'Own footprint overlaps high-cost space (parked too close to an '
-                'obstacle) — backing up immediately rather than trying frontiers that '
+                'obstacle) — backing up immediately rather than trying targets that '
                 'are doomed from this start pose. See module docstring "Self-clearance".'
             )
             self._start_recovery_backup()
             return
 
+        # Frontier detection runs every tick in BOTH modes, deliberately: sweeping drives
+        # through the interior, which is exactly where previously-occluded pockets come
+        # into view, so new frontiers can appear mid-sweep. Checking only while in
+        # FRONTIER mode would strand them unexplored forever.
         clusters = find_frontiers(
             msg.data, msg.info.width, msg.info.height, MIN_FRONTIER_CLUSTER_SIZE
         )
@@ -497,16 +572,30 @@ class FrontierExplorerNode(Node):
         ]
 
         if not frontiers_world:
-            self._state = State.EXPLORATION_COMPLETE
-            self._complete_pub.publish(Bool(data=True))
-            self.get_logger().info('No frontiers remain — exploration complete.')
+            self._begin_coverage_sweep(msg, robot_x, robot_y, 'no frontiers remain')
             return
+
+        if self._mode == 'SWEEPING':
+            # New frontiers appeared while sweeping. Map first, cover second: an unmapped
+            # pocket may contain floor the current queue doesn't even mention, so the
+            # queue is discarded rather than resumed, and rebuilt against the larger map
+            # once frontiers run out again. Costs some re-driving of already-swept ground;
+            # the alternative (resuming a queue that predates the new area) would leave
+            # that area uncovered, which is the one thing this whole phase exists to
+            # prevent.
+            self.get_logger().info(
+                f'{len(frontiers_world)} new frontier(s) appeared mid-sweep — returning '
+                f'to frontier exploration; the sweep will be replanned afterwards.'
+            )
+            self._mode = 'FRONTIER'
+            self._sweep_queue = []
 
         candidates = self._filter_blacklisted(frontiers_world)
         if not candidates:
-            self._handle_all_frontiers_blacklisted()
+            self._handle_all_frontiers_blacklisted(msg, robot_x, robot_y)
             return
         self._stuck_since = None
+        self._consecutive_recoveries = 0
 
         target = select_target(candidates, robot_x, robot_y)
 
@@ -525,6 +614,27 @@ class FrontierExplorerNode(Node):
             return
 
         nav_x, nav_y = nav_point
+        # The MIN_TARGET_DISTANCE_M check above guards the RAW frontier, but snapping can
+        # move the point we actually drive to by several cells — occasionally right onto
+        # where the robot already stands. Nav2 then returns SUCCEEDED within ~70 ms
+        # without moving, and because it SUCCEEDED nothing gets blacklisted, so the very
+        # same frontier is selected again on the next tick, forever. Confirmed live in
+        # sim: the same target was re-issued every ~5 s for minutes, racking up
+        # "successes" while the map stopped growing entirely and the frontier count
+        # froze — exploration livelocked while every counter said it was working.
+        # Blacklisting is the right response: driving to this frontier cannot consume it
+        # (the robot is already there and the cells stayed unknown), so it must step
+        # aside and let the other frontiers have a turn.
+        if distance(robot_x, robot_y, nav_x, nav_y) < MIN_TARGET_DISTANCE_M:
+            self.get_logger().info(
+                f'Frontier ({target[0]:.2f}, {target[1]:.2f}) snapped to '
+                f'({nav_x:.2f}, {nav_y:.2f}), which is where the robot already stands — '
+                f'navigating there would succeed instantly without exploring anything. '
+                f'Blacklisting so other frontiers get a turn.'
+            )
+            self._blacklist_target(target[0], target[1])
+            return
+
         self.get_logger().info(
             f'{len(clusters)} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f}) '
             f'-> snapped to reachable point ({nav_x:.2f}, {nav_y:.2f})'
@@ -538,6 +648,10 @@ class FrontierExplorerNode(Node):
 
         See COSTMAP_SAFE_COST module comment for why this is necessary. Returns a world
         (x, y) tuple, or None if no low-cost cell exists within COSTMAP_SEARCH_RADIUS_CELLS.
+
+        COSTMAP_SAFE_COST (50) is comfortably below the inscribed cutoff, so a cell that
+        passes this snap is by construction not a colliding pose either — the snap and
+        _is_self_clear agree rather than pulling against each other.
         """
         cm = self._latest_costmap
         row, col = world_to_grid(
@@ -556,24 +670,60 @@ class FrontierExplorerNode(Node):
         )
 
     def _is_self_clear(self, robot_x, robot_y):
-        """Check the robot's own footprint against the costmap it's currently standing in.
+        """Whether the robot's current pose is collision-free, by Nav2's own criterion.
 
-        See module docstring's "Self-clearance" section — a candidate goal being clear
-        (find_low_cost_point) says nothing about whether the robot's own BODY is
-        currently clear of high cost, and confirmed live, it can end up parked close
-        enough to a wall that every subsequent path attempt fails from that start pose
-        alone, in every direction.
+        See module docstring's "Self-clearance" section, and
+        frontier_detection.in_collision for why this is a single centre-cell lookup
+        rather than a scan over the footprint radius (the earlier radius scan
+        double-counted the inflation and reported open floor as blocked).
         """
         cm = self._latest_costmap
         row, col = world_to_grid(
             robot_x, robot_y, cm.info.resolution,
             cm.info.origin.position.x, cm.info.origin.position.y
         )
-        radius_cells = max(1, round(SELF_CLEARANCE_RADIUS_M / cm.info.resolution))
-        return footprint_clear(
+        return not in_collision(
             cm.data, cm.info.width, cm.info.height, row, col,
-            radius_cells=radius_cells, max_cost=SELF_CLEARANCE_MAX_COST
+            inscribed_cost=SELF_CLEARANCE_MAX_COST
         )
+
+    def _dispatch_next_sweep_waypoint(self, robot_x, robot_y):
+        """Pop and send the next coverage-sweep waypoint — see module docstring.
+
+        Reuses the same snap/reachability pipeline as a frontier target
+        (_snap_to_reachable, _check_reachability), but _frontier_origin is left None:
+        every blacklist call site already guards on it being set, so a sweep waypoint
+        that fails is simply not retried (it was already popped from the queue) rather
+        than entered into the cooldown bookkeeping meant for frontier clusters that get
+        re-evaluated every tick.
+        """
+        if not self._sweep_queue:
+            self._coverage_complete_pub.publish(Bool(data=True))
+            self._state = State.COVERAGE_COMPLETE
+            self.get_logger().info('Coverage sweep complete — every queued waypoint tried.')
+            return
+
+        target = self._sweep_queue.pop(0)
+        if distance(robot_x, robot_y, target[0], target[1]) < MIN_TARGET_DISTANCE_M:
+            self.get_logger().debug('Sweep waypoint too close to the robot; skipping it.')
+            return
+
+        nav_point = self._snap_to_reachable(target)
+        if nav_point is None:
+            self.get_logger().info(
+                f'Sweep waypoint ({target[0]:.2f}, {target[1]:.2f}) has no low-cost cell '
+                f'nearby in the costmap; skipping it.'
+            )
+            return
+
+        nav_x, nav_y = nav_point
+        self.get_logger().info(
+            f'Sweep waypoint ({target[0]:.2f}, {target[1]:.2f}) -> snapped to reachable '
+            f'point ({nav_x:.2f}, {nav_y:.2f}); {len(self._sweep_queue)} remaining.'
+        )
+        yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
+        self._frontier_origin = None
+        self._check_reachability(nav_x, nav_y, yaw)
 
     def _filter_blacklisted(self, frontiers_world):
         now = self.get_clock().now()
@@ -591,7 +741,7 @@ class FrontierExplorerNode(Node):
     # Stuck recovery — see module docstring
     # ------------------------------------------------------------------ #
 
-    def _handle_all_frontiers_blacklisted(self):
+    def _handle_all_frontiers_blacklisted(self, msg, robot_x, robot_y):
         now = self.get_clock().now()
         if self._stuck_since is None:
             self._stuck_since = now
@@ -602,11 +752,59 @@ class FrontierExplorerNode(Node):
                 f'({elapsed_s:.0f}/{STUCK_RECOVERY_TIMEOUT_S:.0f}s before backing up).'
             )
             return
+
+        # Recovery exists to change the geometry that made the frontiers unreachable. If
+        # that many attempts have not made a single one reachable again, the geometry is
+        # not the problem — what is left is genuinely unreachable (behind a wall, outside
+        # the arena, on the far side of a gap the robot cannot cross), and backing up
+        # forever accomplishes nothing. Exploration is as complete as it is ever going to
+        # get, so hand over to the coverage sweep. Without this the sweep is effectively
+        # dead code: in a bounded arena frontiers do not fall to zero, they end up
+        # permanently blacklisted, which the "no frontiers remain" branch never sees.
+        if self._consecutive_recoveries >= STUCK_RECOVERIES_BEFORE_SWEEP:
+            self._begin_coverage_sweep(
+                msg, robot_x, robot_y,
+                f'every remaining frontier stayed unreachable across '
+                f'{self._consecutive_recoveries} recovery attempts'
+            )
+            return
+
+        self._consecutive_recoveries += 1
         self.get_logger().warn(
             f'Every known frontier has been unreachable for {STUCK_RECOVERY_TIMEOUT_S:.0f}s '
-            f'straight — backing up instead of waiting out the cooldown.'
+            f'straight — backing up instead of waiting out the cooldown '
+            f'(recovery {self._consecutive_recoveries}/{STUCK_RECOVERIES_BEFORE_SWEEP} '
+            f'before giving up on frontiers and sweeping).'
         )
         self._start_recovery_backup()
+
+    def _begin_coverage_sweep(self, msg, robot_x, robot_y, reason):
+        """Enter (or continue) the coverage sweep — see module docstring "Coverage sweep".
+
+        Reached from two places: frontier detection returning nothing at all, and every
+        remaining frontier proving persistently unreachable. The second is the case that
+        actually happens in a bounded arena, where leftover frontiers face unreachable
+        space beyond the walls and simply stay blacklisted forever.
+        """
+        if not self._exploration_complete_published:
+            self._complete_pub.publish(Bool(data=True))
+            self._exploration_complete_published = True
+            self.get_logger().info(f'Exploration complete — {reason}.')
+        if self._mode != 'SWEEPING':
+            self._mode = 'SWEEPING'
+            self._blacklist = []
+            self._stuck_since = None
+            self._consecutive_recoveries = 0
+            self._sweep_queue = generate_coverage_waypoints(
+                msg.data, msg.info.width, msg.info.height, msg.info.resolution,
+                msg.info.origin.position.x, msg.info.origin.position.y,
+                row_spacing_m=SWEEP_ROW_SPACING_M, min_run_m=SWEEP_MIN_RUN_M,
+            )
+            self.get_logger().info(
+                f'Switching to coverage sweep ({reason}): {len(self._sweep_queue)} '
+                f'waypoint(s) queued over the known map.'
+            )
+        self._dispatch_next_sweep_waypoint(robot_x, robot_y)
 
     def _start_recovery_backup(self):
         if not self._backup_client.wait_for_server(timeout_sec=2.0):
@@ -922,8 +1120,9 @@ class FrontierExplorerNode(Node):
                 f'(error_code={result.result.error_code}); skipping without spending a '
                 f'full Nav2 attempt on it.'
             )
-            fx, fy = self._frontier_origin if self._frontier_origin is not None else (x, y)
-            self._blacklist_target(fx, fy)
+            if self._frontier_origin is not None:
+                fx, fy = self._frontier_origin
+                self._blacklist_target(fx, fy)
             self._current_target = None
             self._frontier_origin = None
             self._pending_yaw = None

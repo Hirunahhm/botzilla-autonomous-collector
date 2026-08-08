@@ -23,6 +23,13 @@ The smoother is optional (DWB's own accel limits in nav2_params.yaml already
 bound the output); if smoothing is wanted later, do it in a node we own and can
 instrument rather than reintroducing a silent failure point.
 
+Simulation parameters: passing use_sim_time:=true additionally layers
+config/nav2_params_sim.yaml on top of the main params file (ROS 2 merges multiple
+params files in order, last one winning). That overlay carries only the values that
+must differ in Gazebo — see its own header — rather than a full duplicate config that
+would drift out of sync with the hardware tuning. Applied automatically so it cannot
+be forgotten: the values it corrects cause a stall that looks like a planner bug.
+
 Usage (hardware is the default; pass use_sim_time:=true for Gazebo):
   ros2 launch botzilla_navigation nav2.launch.py
 """
@@ -30,9 +37,64 @@ Usage (hardware is the default; pass use_sim_time:=true for Gazebo):
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+SIM_PARAMS_FILENAME = 'nav2_params_sim.yaml'
+
+
+def _resolve_param_files(context):
+    """Build the ordered params list, appending the sim overlay when running on sim time.
+
+    Kept in an OpaqueFunction because the decision needs the *resolved* value of
+    use_sim_time, which a LaunchConfiguration substitution cannot provide while the
+    launch description is still being constructed.
+    """
+    pkg_share = get_package_share_directory('botzilla_navigation')
+    params_file = LaunchConfiguration('params_file').perform(context)
+    use_sim_time = LaunchConfiguration('use_sim_time').perform(context).lower() in (
+        'true', '1', 'yes'
+    )
+    files = [params_file]
+    if use_sim_time:
+        files.append(os.path.join(pkg_share, 'config', SIM_PARAMS_FILENAME))
+    return files, use_sim_time
+
+
+def _launch_nav2(context, *_args, **_kwargs):
+    param_files, use_sim_time = _resolve_param_files(context)
+    autostart = LaunchConfiguration('autostart')
+    params = param_files + [{'use_sim_time': use_sim_time}]
+
+    lifecycle_nodes = [
+        'controller_server',
+        'planner_server',
+        'behavior_server',
+        'bt_navigator',
+    ]
+    servers = [
+        ('nav2_controller', 'controller_server'),
+        ('nav2_planner', 'planner_server'),
+        ('nav2_behaviors', 'behavior_server'),
+        ('nav2_bt_navigator', 'bt_navigator'),
+    ]
+    nodes = [
+        Node(package=pkg, executable=exe, name=exe, output='screen', parameters=params)
+        for pkg, exe in servers
+    ]
+    nodes.append(Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': autostart,
+            'node_names': lifecycle_nodes,
+        }],
+    ))
+    return nodes
 
 
 def generate_launch_description():
@@ -59,68 +121,9 @@ def generate_launch_description():
         description='Automatically bring the lifecycle nodes up to the active state',
     )
 
-    use_sim_time = LaunchConfiguration('use_sim_time')
-    params_file = LaunchConfiguration('params_file')
-    autostart = LaunchConfiguration('autostart')
-
-    lifecycle_nodes = [
-        'controller_server',
-        'planner_server',
-        'behavior_server',
-        'bt_navigator',
-    ]
-
-    controller_server = Node(
-        package='nav2_controller',
-        executable='controller_server',
-        name='controller_server',
-        output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-    )
-
-    planner_server = Node(
-        package='nav2_planner',
-        executable='planner_server',
-        name='planner_server',
-        output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-    )
-
-    behavior_server = Node(
-        package='nav2_behaviors',
-        executable='behavior_server',
-        name='behavior_server',
-        output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-    )
-
-    bt_navigator = Node(
-        package='nav2_bt_navigator',
-        executable='bt_navigator',
-        name='bt_navigator',
-        output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-    )
-
-    lifecycle_manager = Node(
-        package='nav2_lifecycle_manager',
-        executable='lifecycle_manager',
-        name='lifecycle_manager_navigation',
-        output='screen',
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'autostart': autostart,
-            'node_names': lifecycle_nodes,
-        }],
-    )
-
     return LaunchDescription([
         use_sim_time_arg,
         params_file_arg,
         autostart_arg,
-        controller_server,
-        planner_server,
-        behavior_server,
-        bt_navigator,
-        lifecycle_manager,
+        OpaqueFunction(function=_launch_nav2),
     ])

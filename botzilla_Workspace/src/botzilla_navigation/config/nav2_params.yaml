@@ -45,7 +45,12 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
+      # SimpleProgressChecker measures TRANSLATION only, so a leg that legitimately needs
+      # a long rotate-in-place registers as zero progress no matter how well the turn is
+      # going. Combined with the base's rotational deadband (see min_speed_theta below),
+      # 0.5 m in 10 s was failing goals that were actually fine. 0.2 m still catches a
+      # genuinely wedged robot but tolerates a slow turn-then-go.
+      required_movement_radius: 0.2
       movement_time_allowance: 10.0
     general_goal_checker:
       stateful: True
@@ -58,14 +63,41 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      min_vel_x: 0.0
+      # Negative so DWB can sample REVERSE during normal path following, not only via the
+      # BackUp recovery behaviour. Confirmed live in sim: with this at 0.0 a robot wedged
+      # against a wall had no escape trajectory at all — forward was blocked, the
+      # path-alignment critics kept pulling it back toward the blocked heading, and it
+      # simply oscillated in place until the stall watchdog gave up, despite open floor
+      # directly behind it. Kept small (half of max_vel_x): the depth camera faces
+      # forward, so extended reversing is blind and should stay the exception. vx=0 is
+      # still sampled, so pure in-place rotation remains available; the velocity deadband
+      # is enforced separately by min_speed_xy/min_speed_theta below.
+      min_vel_x: -0.10
       min_vel_y: 0.0
       max_vel_x: 0.2
       max_vel_y: 0.0
+      # Measured on this Kobuki (odom over a 3 s constant command, nothing else driving
+      # cmd_vel): 0.40 rad/s commanded yields only ~0.22 rad/s actual (56%), so hardware
+      # would prefer a higher value here to get a usable real turn rate. Kept at 0.4
+      # anyway because that compensation is wrong everywhere the commanded velocity is
+      # actually delivered: in sim, 0.6 against max_vel_x 0.2 gives a minimum turning
+      # radius of only ~0.33 m, and DWB was observed orbiting goals at full speed
+      # instead of converging on them. This wants to be a per-platform override rather
+      # than one shared number — until then the honest, physically-consistent value wins.
       max_vel_theta: 0.4
-      min_speed_xy: 0.0
+      # Deadband floors. Measured on this Kobuki: rotation <= 0.12 rad/s produces NO
+      # motion at all (0-2% of commanded) and 0.15 rad/s only ~10%; linear below
+      # ~0.04 m/s barely creeps. With these left at 0.0, DWB was observed live emitting
+      # 0.063 rad/s / 0.021 m/s — squarely inside the dead zone — so the robot sat
+      # motionless while Nav2 believed it was driving, the progress checker timed out
+      # after 10 s, and EVERY goal failed with "Failed to make progress". That looked
+      # exactly like a planning/costmap deadlock and is not one: it is a velocity floor.
+      # DWB rejects a trajectory only when translation < min_speed_xy AND
+      # |rotation| < min_speed_theta, so pure rotation and pure translation both remain
+      # available — only the un-executable near-zero commands are filtered out.
+      min_speed_xy: 0.05
       max_speed_xy: 0.2
-      min_speed_theta: 0.0
+      min_speed_theta: 0.2
       acc_lim_x: 0.4
       acc_lim_y: 0.0
       acc_lim_theta: 0.8
@@ -88,6 +120,16 @@ controller_server:
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # The Oscillation critic bans reversing the sign of rotation until the robot has
+      # committed — travelled oscillation_reset_dist or turned oscillation_reset_angle.
+      # On the default 0.2 rad (11.5 deg) that commitment is far too cheap: measured live
+      # in sim, a robot wedged with a wall spanning ~120 deg of its surroundings swung
+      # through a yaw span of exactly 12.5 deg, just past the reset angle, which cleared
+      # the ban and let it flip straight back — 44 direction changes in 20 s with zero
+      # net translation. Requiring ~29 deg makes the robot actually turn far enough to
+      # discover the free side instead of resetting the critic and re-deciding.
+      Oscillation.oscillation_reset_angle: 0.5
+      Oscillation.oscillation_reset_dist: 0.10
       # Raised 0.02 -> 0.10 so DWB meaningfully prefers routing *around* residual non-lethal
       # cost rather than scoring near-obstacle trajectories almost the same as clear ones.
       # Secondary to the inflation_radius fix; the inflation change is what actually breaks
@@ -220,15 +262,33 @@ local_costmap:
         z_resolution: 0.05
         z_voxels: 16
         max_obstacle_height: 2.0
+        # Number of marked voxels a vertical column needs before it projects down as a
+        # lethal cell. MUST stay 0 while the only source is the 2D lidar: a single-plane
+        # scan marks exactly ONE voxel per column, so any threshold above 1 can never be
+        # met and the costmap silently contains no obstacles at all — verified live,
+        # raising this to 2 took the local costmap to 0 lethal cells while a wall stood
+        # 0.42 m away. Only worth revisiting if a genuine 3D source is added back.
         mark_threshold: 0
-        # Two sources: the RPLIDAR sees one horizontal plane only, so anything
-        # above or below it (desk edges, table tops, low sills) was invisible to
-        # DWB and the robot drove into it. The depth cloud fills that gap.
-        # NOTE: Grid/Sensor on rtabmap.launch.py does NOT affect this — that
-        # parameter only changes rtabmap's /map, which feeds the *global*
-        # costmap's static_layer. This voxel_layer is the only obstacle input
-        # the local controller has.
-        observation_sources: scan pointcloud
+        # NOTE: "pointcloud" (/camera/points) is deliberately NOT a source here, though
+        # its settings are kept below for when it can be reintroduced safely.
+        #
+        # A sensor can only CLEAR what it can currently see. The Kinect's ~57 deg FOV
+        # sees a narrow wedge, and the 2D lidar raytraces only within its own scan
+        # plane, so nothing can clear a voxel the camera marked once the robot turns
+        # away from it. Confirmed live in sim: camera marks accumulated until the robot
+        # stood ringed by lethal cells in demonstrably open floor, Spin aborted with
+        # "Collision Ahead", and DWB could only orbit — every goal then failed for a
+        # reason that had nothing to do with the goal. The 360 deg lidar marks and
+        # clears consistently, so it is the sole source until the camera's clearing is
+        # solved properly (needs a wider clearing frustum or periodic voxel decay).
+        #
+        # This also makes sim match hardware, where /camera/points has no publisher at
+        # all — which is exactly why this failure never showed up on the robot. The
+        # tradeoff is real and known: the lidar sees one horizontal plane, so low
+        # obstacles (desk edges, sills) are invisible to DWB again. That gap must be
+        # closed before cube collection, but a costmap that boxes the robot in is worse
+        # than one that misses low obstacles.
+        observation_sources: scan
         scan:
           topic: /scan
           max_obstacle_height: 2.0
