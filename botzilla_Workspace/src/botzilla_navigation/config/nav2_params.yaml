@@ -173,7 +173,17 @@ controller_server:
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # BaseObstacle -> ObstacleFootprint. BaseObstacleCritic scores a trajectory using
+      # ONLY the cost of the cell under the robot's centre point. That is sound for a
+      # circular robot whose radius equals the inflation inscribed radius, and unsound
+      # here: with the arms reaching 0.310 m forward against an inscribed radius of
+      # 0.165 m, a centre-point check certifies clearance the corners do not have. This
+      # is why the robot clipped obstacles with its sides while the costmap said clear —
+      # correcting the footprint alone would NOT have fixed it, because nothing was
+      # checking the footprint. ObstacleFootprintCritic tests the actual polygon at each
+      # sampled pose, so orientation is finally accounted for and in-place rotations in
+      # gaps narrower than 2*circumscribed (0.702 m) get rejected as they should be.
+      critics: ["RotateToGoal", "Oscillation", "ObstacleFootprint", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       # The Oscillation critic bans reversing the sign of rotation until the robot has
       # committed — travelled oscillation_reset_dist or turned oscillation_reset_angle.
       # On the default 0.2 rad (11.5 deg) that commitment is far too cheap: measured live
@@ -184,12 +194,18 @@ controller_server:
       # discover the free side instead of resetting the critic and re-deciding.
       Oscillation.oscillation_reset_angle: 0.5
       Oscillation.oscillation_reset_dist: 0.10
-      # Raised 0.02 -> 0.10 so DWB meaningfully prefers routing *around* residual non-lethal
-      # cost rather than scoring near-obstacle trajectories almost the same as clear ones.
-      # Secondary to the inflation_radius fix; the inflation change is what actually breaks
-      # the rotate-in-place lock (BaseObstacle rejects inscribed-cost trajectories outright,
-      # independent of this scale).
-      BaseObstacle.scale: 0.10
+      # Renamed from BaseObstacle.scale when that critic was replaced by ObstacleFootprint
+      # (see the critics list above) — a scale keyed to a critic that is no longer loaded
+      # is silently ignored, which would have quietly dropped obstacle avoidance from the
+      # scoring altogether.
+      #
+      # Raised 0.02 -> 0.10 originally so DWB meaningfully prefers routing *around*
+      # residual non-lethal cost rather than scoring near-obstacle trajectories almost the
+      # same as clear ones. That still applies, and matters more now: with
+      # inflation_radius at 0.45 there is a much wider cost gradient for this scale to act
+      # on, which is what steers the robot down the middle of a passage instead of along
+      # one wall.
+      ObstacleFootprint.scale: 0.10
       # 0.1 -> 0.325 (nav2's own default) on BOTH align critics. This was the bug that
       # made the robot drive backwards to its goals.
       #
@@ -297,37 +313,49 @@ local_costmap:
       width: 5
       height: 5
       resolution: 0.05
-      # Circular footprint instead of the true polygon. With the polygon, the
-      # costmap derived inscribed=0.157m / circumscribed=0.275m, and NavFn (a
-      # POINT planner) only hard-refuses gaps narrower than 2*inscribed=0.314m
-      # — while the robot actually sweeps up to 0.550m during an in-place
-      # rotation. Every gap in that band was a path the planner promised and
-      # DWB could not execute, giving a 25% goal success rate (2/8) with the
-      # rest hitting "Failed to make progress".
+      # TRUE POLYGON FOOTPRINT, from physical measurement of this robot:
+      # 0.48 m from the front of the grabber arms to the back of the chassis, and
+      # 0.33 m across. base_link sits at the Kobuki body centre (the wheel axis is at
+      # x=0 in botzilla_qbot.urdf, and the body cylinder has radius 0.17), so the rear
+      # edge is at -0.17 and the front of the arms lands at -0.17 + 0.48 = +0.31.
       #
-      # 0.275 (circumscribed, i.e. worst-case rotate-anywhere clearance) was
-      # tried first and was too conservative: confirmed live that the robot
-      # could be manually driven straight through passages the planner refused
-      # to route through, because 0.275 demands ~0.55m of clearance on every
-      # passage even ones only ever driven through, never rotated in. 0.20
-      # instead approximates the robot's actual straight-line half-width, so
-      # the planner will attempt those passages. This trades away the earlier
-      # rotate-anywhere guarantee: if a planned path needs an in-place
-      # rotation somewhere narrower than 0.55m, DWB will still correctly
-      # refuse to execute that step — but that's now a soft failure the
-      # frontier explorer's stall watchdog / blacklist / backup-recovery
-      # handles (try the next target, back up if truly stuck), not a hard
-      # block on the passage entirely.
-      robot_radius: 0.20
+      #   front  x = +0.310      rear  x = -0.170      half-width = 0.165
+      #   -> inscribed radius    0.165 m
+      #   -> circumscribed radius 0.351 m
+      #
+      # This replaces robot_radius: 0.20, which modelled the robot as a 0.40 m circle
+      # and was wrong in a way that caused real collisions: the arms reach 0.310 m
+      # forward, i.e. 0.110 m BEYOND the modelled circle, and the true swept radius
+      # (0.351) was underestimated by 76%. Observed on hardware as the robot clipping
+      # obstacles with its sides/corners while the costmap reported clearance.
+      #
+      # Note this is not simply "more conservative". A point planner hard-refuses gaps
+      # narrower than 2*inscribed, which is now 0.330 m — the robot's actual width —
+      # versus 0.400 m under the old circle. So straight-line passages get LESS
+      # restrictive and honest at the same time; what changes is that orientation now
+      # matters, which is the whole point for a 1.45:1 robot.
+      #
+      # An earlier revision used circumscribed-as-radius (0.275 from a smaller, wrong
+      # polygon) and rejected it as too conservative because it demanded ~0.55 m on
+      # every passage including ones only ever driven straight through. A real polygon
+      # avoids that trap without giving up correctness: it is only the ROTATION that
+      # needs 2*circumscribed = 0.702 m, and ObstacleFootprint (see FollowPath critics)
+      # evaluates that per-trajectory rather than baking it into every cell.
+      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        # Kept ~3cm above robot_radius, same margin ratio as the original
-        # 0.275/0.30 pairing — enough clearance to not paint inscribed cost
-        # directly on the footprint boundary, without re-adding back the
-        # rotate-anywhere padding robot_radius above just removed.
-        inflation_radius: 0.23
+        # 0.23 -> 0.45. With a polygon footprint the costmap derives inscribed_radius
+        # (0.165) itself and writes cost 99 within that of any obstacle; inflation_radius
+        # only controls how far the DECAYING cost extends beyond it. At 0.23 there was
+        # just 0.065 m of gradient, so trajectories hugging a wall scored almost the same
+        # as ones down the middle of a corridor. 0.45 (past the 0.351 circumscribed
+        # radius) gives a real gradient, which is what makes the planner prefer routes
+        # the robot can actually turn around in — addressing "it goes places it can
+        # barely manoeuvre". This does NOT narrow any passage: only cells within
+        # inscribed_radius are lethal-equivalent.
+        inflation_radius: 0.45
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -408,9 +436,11 @@ global_costmap:
       transform_tolerance: 0.5   # slow ~1Hz rtabmap map->odom (see FollowPath note)
       resolution: 0.05
       track_unknown_space: true
-      # Circular footprint — must match local_costmap or the planner and
-      # controller disagree about what fits. See the local_costmap note.
-      robot_radius: 0.20
+      # Must match local_costmap exactly or the planner and controller disagree about
+      # what fits, and the planner promises routes DWB then refuses to execute.
+      # Measured polygon — see the local_costmap note for the derivation and for why
+      # this replaced robot_radius: 0.20.
+      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -437,5 +467,5 @@ global_costmap:
         # Must match local_costmap (see the local inflation_layer note): keeps
         # planner and controller costmaps consistent so DWB doesn't reject the
         # global planner's route as infeasible.
-        inflation_radius: 0.23
+        inflation_radius: 0.45
       always_send_full_costmap: True
