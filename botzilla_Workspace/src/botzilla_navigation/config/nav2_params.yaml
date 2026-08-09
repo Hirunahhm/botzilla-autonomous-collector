@@ -398,7 +398,13 @@ local_costmap:
       # avoids that trap without giving up correctness: it is only the ROTATION that
       # needs 2*circumscribed = 0.702 m, and ObstacleFootprint (see FollowPath critics)
       # evaluates that per-trajectory rather than baking it into every cell.
-      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
+      # +0.05 m padding on all four sides (2026-08-09): the arms clipped a wall the
+      # unpadded polygon scored as clear. Padding forces the planner to treat gaps
+      # narrower than 2*0.215=0.43 m (e.g. between chair legs) as non-navigable rather
+      # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
+      # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
+      # margin; not rederived here since only the values below are load-bearing.
+      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -497,7 +503,13 @@ global_costmap:
       # what fits, and the planner promises routes DWB then refuses to execute.
       # Measured polygon — see the local_costmap note for the derivation and for why
       # this replaced robot_radius: 0.20.
-      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
+      # +0.05 m padding on all four sides (2026-08-09): the arms clipped a wall the
+      # unpadded polygon scored as clear. Padding forces the planner to treat gaps
+      # narrower than 2*0.215=0.43 m (e.g. between chair legs) as non-navigable rather
+      # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
+      # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
+      # margin; not rederived here since only the values below are load-bearing.
+      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]

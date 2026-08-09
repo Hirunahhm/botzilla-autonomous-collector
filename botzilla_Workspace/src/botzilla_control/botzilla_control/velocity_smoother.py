@@ -83,6 +83,19 @@ DECEL_TO_STOP_IMMEDIATELY = True
 
 DIAGNOSTIC_PERIOD_S = 10.0
 
+# --- Gap tracing --------------------------------------------------------------------
+# Added while investigating a reported "moves, stops, moves, stops" pattern plus abrupt
+# speed drops. Correlating existing logs first (before adding anything) already showed 9
+# of 13 hard timeouts in a 270s run landing 0.31-0.39s after a Nav2 goal boundary (Reached
+# the goal / goal finished / stalled+CANCELED) — i.e. almost exactly INPUT_TIMEOUT_S after
+# controller_server stops publishing between one goal ending and the next being dispatched.
+# GAP_NOTICE_S is set below INPUT_TIMEOUT_S so near-miss gaps that DON'T reach the hard
+# cutoff are visible too — without this there is no way to tell "the gap is usually ~0.15s
+# and once in a while spikes over 0.3s" from "gaps are normally near-zero and this is a
+# distinct rare fault", and that distinction is the difference between "retune the
+# threshold" and "something is actually stalling."
+GAP_NOTICE_S = 0.15
+
 # --- Reversal hysteresis -----------------------------------------------------------
 # Acceleration limiting alone does not stop the robot looking jerky, because it bounds how
 # FAST the command changes but not how OFTEN it changes direction. Measured on hardware
@@ -141,6 +154,11 @@ class VelocitySmoother(Node):
         # Consecutive cycles the input has opposed our direction of travel, per axis.
         self._flip_cycles = {'x': 0, 'theta': 0}
         self._suppressed_flips = 0
+        # Gap tracing (see GAP_NOTICE_S) — counts near-miss gaps that never reach the hard
+        # INPUT_TIMEOUT_S cutoff, so the diagnostic line can distinguish "gaps are usually
+        # small and this was a one-off" from "gaps are chronically close to the cliff edge."
+        self._near_miss_gaps = 0
+        self._max_gap_this_period = 0.0
 
         self._sub = self.create_subscription(Twist, 'cmd_vel_nav', self._input_cb, 10)
         self._pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -155,8 +173,23 @@ class VelocitySmoother(Node):
             f'decel x={MAX_DECEL_X} theta={MAX_DECEL_THETA}')
 
     def _input_cb(self, msg):
+        now = self.get_clock().now()
+        if self._last_input_time is not None:
+            gap = (now - self._last_input_time).nanoseconds / 1e9
+            if gap > self._max_gap_this_period:
+                self._max_gap_this_period = gap
+            # Below INPUT_TIMEOUT_S: _tick's watchdog never sees this, so without this line
+            # it is invisible that the gap happened at all. Log the output value at the
+            # START of the gap (self._output, not yet touched by this message) so a report
+            # of "was moving at X, then a gap" is directly readable off one log line.
+            if GAP_NOTICE_S <= gap <= INPUT_TIMEOUT_S:
+                self._near_miss_gaps += 1
+                self.get_logger().info(
+                    f'cmd_vel_nav near-miss gap {gap:.3f}s (< {INPUT_TIMEOUT_S}s cutoff) '
+                    f'— output was ({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+                    'going into it')
         self._target = msg
-        self._last_input_time = self.get_clock().now()
+        self._last_input_time = now
         self._input_count += 1
         if self._timed_out:
             self.get_logger().info('cmd_vel_nav resumed after timeout.')
@@ -226,7 +259,10 @@ class VelocitySmoother(Node):
         if age > INPUT_TIMEOUT_S:
             if not self._timed_out:
                 self.get_logger().warn(
-                    f'No cmd_vel_nav for {age:.2f}s (> {INPUT_TIMEOUT_S}s) — commanding stop.')
+                    f'No cmd_vel_nav for {age:.2f}s (> {INPUT_TIMEOUT_S}s) — commanding stop. '
+                    f'Output was ({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+                    'the instant before this (dropped with no ramp — see '
+                    'DECEL_TO_STOP_IMMEDIATELY).')
                 self._timed_out = True
             self._target = Twist()   # zero
             if DECEL_TO_STOP_IMMEDIATELY:
@@ -244,6 +280,14 @@ class VelocitySmoother(Node):
         self._output.angular.z = self._ramp(
             self._output.angular.z, goal_th, MAX_ACCEL_THETA, MAX_DECEL_THETA, self._period)
         self._publish()
+        # Full-resolution per-tick trace (20 Hz). No-op unless this node's log level is
+        # DEBUG (e.g. --log-level velocity_smoother:=debug) — for tracing the exact
+        # controller-to-smoother path of one stutter/spike episode after the fact.
+        self.get_logger().debug(
+            f'[tick] target=({self._target.linear.x:.3f},{self._target.angular.z:.3f}) '
+            f'goal=({goal_x:.3f},{goal_th:.3f}) '
+            f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+            f'flip_cycles=({self._flip_cycles["x"]},{self._flip_cycles["theta"]})')
 
     def _publish(self):
         self._pub.publish(self._output)
@@ -261,8 +305,11 @@ class VelocitySmoother(Node):
             f'[smoother] in={in_hz:.1f}Hz out={out_hz:.1f}Hz '
             f'target=({self._target.linear.x:.3f},{self._target.angular.z:.3f}) '
             f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
-            f'flips_suppressed={self._suppressed_flips}')
+            f'flips_suppressed={self._suppressed_flips} '
+            f'near_miss_gaps={self._near_miss_gaps} max_gap={self._max_gap_this_period:.3f}s')
         self._suppressed_flips = 0
+        self._near_miss_gaps = 0
+        self._max_gap_this_period = 0.0
 
 
 def main(args=None):
