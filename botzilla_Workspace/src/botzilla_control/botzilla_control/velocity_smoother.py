@@ -131,10 +131,24 @@ GAP_NOTICE_S = 0.15
 REVERSAL_CONFIRM_CYCLES = 3
 
 # A reversal smaller than this is dithering around zero, not a real change of intent, and
-# is collapsed straight to zero without ever being confirmed. Sized below the base's
-# measured deadbands (linear 0.009 m/s, yaw 0.121 rad/s — see kobuki_base_node) so that
-# commands the hardware could actually execute are never silently discarded.
-REVERSAL_DEADBAND_X = 0.01        # m/s
+# is collapsed straight to zero without ever being confirmed.
+#
+# X was originally 0.01 m/s — sized just above the base's measured linear deadband
+# (0.009 m/s) so no physically-executable command was ever silently discarded. That
+# turned out to be too tight: it meant almost every DWB linear reversal, however small,
+# skipped the deadband and went straight into the 3-cycle confirmation path, while THETA's
+# deadband (0.05 rad/s) sits well below its own measured deadband (0.121 rad/s) and so
+# pre-filters a much larger share of angular jitter before confirmation is even considered.
+# Measured effect on hardware: reversal suppression cut angular flips ~62% but linear only
+# ~34% over the same run — the axes were not being filtered comparably.
+#
+# Raised to 0.025 m/s (12.5% of max_vel_x=0.2, matching THETA's 0.05/max_vel_theta=0.4
+# ratio) to close that gap. Trade-off: commands in 0.009-0.025 m/s — a physically real but
+# marginal crawl-speed correction — now get collapsed as dithering instead of confirmed.
+# Accepted because that band is barely above the hardware's own deadband to begin with; the
+# reverse-escape behaviour (min_vel_x=-0.10) is unaffected since it is 4x this threshold and
+# was never at risk of being collapsed.
+REVERSAL_DEADBAND_X = 0.025       # m/s
 REVERSAL_DEADBAND_THETA = 0.05    # rad/s
 
 

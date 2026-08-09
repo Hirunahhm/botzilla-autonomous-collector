@@ -187,6 +187,22 @@ MEAS_FILTER_ALPHA = 0.25
 # is not a measurement of anything — it is an artifact of the polling mismatch.
 MIN_ODOM_DT_S = 0.005
 
+# Guard against a corrupted encoder tick. _tick_diff correctly unwraps a genuine 16-bit
+# rollover, but has no way to tell a real reading from a garbage one (serial noise
+# desyncing the Kobuki's binary protocol is the leading suspect) — it will happily
+# report ~18 m/s from a single bad sample, five orders of magnitude past anything the
+# robot can actually do (max_vel_x is 0.2). Measured live: one such spike reached
+# meas=18.114 and drove the PI controller to command L=-3541/R=-3562 mm/s against a
+# normal range of ~100-300 — a real, physical "sudden speed then drop" at the wheels,
+# invisible to anything watching /cmd_vel because it originates inside this control
+# loop, after the smoother. The same bad sample was also being integrated permanently
+# into _ox/_oy/_ot (dead-reckoning never self-corrects) and published on /odom, which
+# is exactly the mechanism behind RTAB-Map occasionally registering an offset/ghosted
+# duplicate of an already-mapped room — its pose input just jumped 0.36 m in one 20 ms
+# tick. Sized well above any real transient (5x max_vel_x) so it only catches readings
+# that are unambiguously impossible, not aggressive-but-real motion.
+MAX_PLAUSIBLE_SPEED_MPS = 1.0
+
 # Safety watchdog. The old passthrough had none: the last command was latched into the
 # motors forever, so if whatever was publishing cmd_vel died mid-drive the robot kept
 # going. Stop if no cmd_vel arrives within this window.
@@ -274,15 +290,29 @@ class KobukiBaseNode(Node):
 
         dl = self._tick_diff(L, self._prev_L) / TICKS_PER_M
         dr = self._tick_diff(R, self._prev_R) / TICKS_PER_M
-        self._prev_L, self._prev_R = L, R
 
         dt = (now - self._prev_odom_time).nanoseconds / 1e9
-        self._prev_odom_time = now
         if dt <= 0.0:
+            self._prev_L, self._prev_R = L, R
+            self._prev_odom_time = now
             return   # clock didn't advance (or went backwards) — skip this tick
 
         d      = (dl + dr) / 2.0
         dtheta = (dr - dl) / WHEEL_BASE_M
+
+        if abs(d / dt) > MAX_PLAUSIBLE_SPEED_MPS:
+            # Deliberately do NOT advance _prev_L/_prev_R/_prev_odom_time — see
+            # MAX_PLAUSIBLE_SPEED_MPS. The next good reading then diffs against the last
+            # known-good baseline, correctly folding in whatever real motion happened
+            # during the dropped tick instead of losing it or baking in the glitch.
+            self.get_logger().warn(
+                f'Rejecting implausible encoder tick: {d / dt:.2f} m/s over '
+                f'{dt * 1000:.1f} ms (L={L} R={R} prev_L={self._prev_L} '
+                f'prev_R={self._prev_R}) — corrupted read, not real motion.')
+            return
+
+        self._prev_L, self._prev_R = L, R
+        self._prev_odom_time = now
         self._stationary = abs(d) < STATIONARY_D_THRESHOLD_M and abs(dtheta) < STATIONARY_DTHETA_THRESHOLD_RAD
         self._ox += d * math.cos(self._ot + dtheta / 2.0)
         self._oy += d * math.sin(self._ot + dtheta / 2.0)
