@@ -136,3 +136,19 @@ def count_unswept_free(data, mask, width, height):
 def should_trigger_sweep(total_free, unswept_free, sweep_fraction):
     """Whether un-swept free area exceeds sweep_fraction of total known free area."""
     return total_free > 0 and (unswept_free / total_free) > sweep_fraction
+
+
+def build_coverage_grid_data(data, mask, width, height):
+    """Build OccupancyGrid.data values for visualizing swept coverage in RViz.
+
+    -1 (unknown) for any cell that isn't free in the base map, so walls and unknown
+    space pass through untouched rather than being overdrawn. 0 (free) for free cells
+    the camera has swept — renders white in RViz's default Map color scheme. 100
+    (occupied) for free cells still un-swept — renders black, making un-covered floor
+    visually obvious layered over the base /map.
+    """
+    out = [-1] * (width * height)
+    for i in range(width * height):
+        if 0 <= data[i] < OCCUPIED_THRESHOLD:
+            out[i] = 0 if mask[i] else 100
+    return out

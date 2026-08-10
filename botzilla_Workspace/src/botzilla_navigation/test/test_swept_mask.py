@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from botzilla_navigation.swept_mask import (  # noqa: E402,I100
+    build_coverage_grid_data,
     count_unswept_free,
     create_swept_mask,
     mark_swept_cells,
@@ -140,3 +141,15 @@ def test_should_trigger_sweep_threshold():
     assert should_trigger_sweep(100, 15, 0.15) is False  # exactly at threshold, not over
     assert should_trigger_sweep(100, 10, 0.15) is False
     assert should_trigger_sweep(0, 0, 0.15) is False
+
+
+def test_build_coverage_grid_data():
+    # Same layout as test_count_unswept_free: width=3, height=2.
+    # Row 0: free(0), occupied(100), unknown(-1). Row 1: free(50), free(0), occupied(100).
+    data = [0, 100, -1, 50, 0, 100]
+    mask = [True, False, False, False, True, False]
+    grid = build_coverage_grid_data(data, mask, 3, 2)
+    assert grid == [
+        0, -1, -1,    # swept-free -> 0, occupied -> -1, unknown -> -1
+        100, 0, -1,   # un-swept-free -> 100, swept-free -> 0, occupied -> -1
+    ]
