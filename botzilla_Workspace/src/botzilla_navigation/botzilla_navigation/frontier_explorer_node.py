@@ -157,12 +157,11 @@ rather than re-trying the same one.
 Coverage sweep: frontier exploration alone only ever drives to the *edges* of known
 space — once LiDAR has seen a room's walls, no frontier remains there even though the
 Kinect's narrow (~57 deg) FOV never got a camera view of the room's interior, so cubes
-away from the walls would never come within range of a camera-based detector. When
-frontiers_world comes back empty, this node no longer parks forever: it switches
-self._mode from 'FRONTIER' to 'SWEEPING', builds a boustrophedon waypoint queue from the
-now-complete /map via coverage_planning.generate_coverage_waypoints, and starts
-dispatching it (_dispatch_next_sweep_waypoint) one point at a time. Deliberately reuses
-every safety primitive already hardened above for frontier targets — costmap-snapping
+away from the walls would never come within range of a camera-based detector. This node
+switches self._mode from 'FRONTIER' to 'SWEEPING', builds a boustrophedon waypoint queue
+via coverage_planning.generate_coverage_waypoints, and starts dispatching it
+(_dispatch_next_sweep_waypoint) one point at a time. Deliberately reuses every safety
+primitive already hardened above for frontier targets — costmap-snapping
 (_snap_to_reachable), the reachability pre-check, the stall watchdog, and the
 self-clearance/BackUp/Spin recovery chain — rather than duplicating any of it: a sweep
 waypoint is, from Nav2's perspective, exactly the same kind of goal a frontier target is.
@@ -170,26 +169,64 @@ Sweep waypoints set self._frontier_origin = None, which every existing blacklist
 site already guards on — so a failed sweep waypoint is simply skipped (it was already
 popped) rather than entered into the cooldown/backoff bookkeeping meant for frontier
 clusters that get re-evaluated every tick; a one-pass queue has no "next tick" to
-re-blacklist against. Row spacing (SWEEP_ROW_SPACING_M) is a placeholder for this stage —
-no camera/cube-detection wiring is part of this milestone, so there is nothing yet to tune
-it against; that comes once cube detection is reintroduced on top of a validated sweep.
+re-blacklist against. A waypoint that fails reachability is still marked swept in
+self._swept_mask (mark_world_point_swept) before being skipped — the camera never
+actually covered that spot, but leaving an un-drivable pocket permanently un-swept would
+block mission completion forever over ground the robot genuinely cannot reach.
 
-Crucially the sweep is entered from TWO conditions, not one. "No frontier clusters exist
-at all" is the obvious trigger but almost never fires in a real bounded arena: the
-leftover frontiers there face unreachable space beyond the walls, so they are never
-consumed — they just accumulate permanent blacklist entries. Confirmed live in sim,
-frontier counts plateau in exactly that state. So the node also gives up on exploring
-after STUCK_RECOVERIES_BEFORE_SWEEP consecutive stuck-recoveries fail to make any
-frontier reachable again (see _handle_all_frontiers_blacklisted). Without that second
-trigger this whole phase is dead code — the node backs up forever and never sweeps.
+Interleaved, not sequential: the sweep is no longer a one-shot phase entered only once
+exploration is exhausted. Every tick, self._swept_mask (swept_mask.py) tracks which
+cells the camera's forward wedge (+/- half its FOV, out to its ~1m reliable detection
+range) has actually passed over, and swept_mask.should_trigger_sweep fires SWEEPING as
+soon as un-swept known-free area exceeds SWEEP_FRACTION of total known free area —
+deliberately a fraction, not a fixed square-meterage, so a small first room gets
+camera-checked almost immediately while a large already-mostly-swept arena isn't
+re-triggered by trivial new patches. This means a sweep can begin while frontiers still
+exist; exploration resumes afterward via the same mechanism, not by waiting for
+exploration to finish first.
 
-The mode is not one-way. find_frontiers runs every tick in BOTH modes, because sweeping
-drives through the room interior — precisely where pockets that were occluded from the
-walls come into view — so genuinely new frontiers can appear partway through a sweep.
-Mapping takes priority when they do: the node returns to 'FRONTIER', discards the queue,
-and rebuilds it against the larger map once frontiers are exhausted again. Resuming the
-old queue instead would be cheaper but would leave the newly-discovered floor uncovered,
-which is the exact failure this phase exists to prevent.
+The sweep is still entered from a SECOND condition, kept from the original design: "no
+reachable frontier candidate" — either frontiers_world is genuinely empty, or every
+candidate is currently blacklisted. Ghost frontiers just outside the arena walls never
+truly reach zero in a bounded arena, they just accumulate permanent blacklist entries
+(confirmed live in sim: frontier counts plateau in exactly that state) — so without the
+blacklist-escalation path (STUCK_RECOVERIES_BEFORE_SWEEP consecutive stuck-recoveries,
+see _handle_all_frontiers_blacklisted), a run where the dynamic trigger never quite
+crosses SWEEP_FRACTION (because the small residual un-swept area sits behind those same
+ghost frontiers) would back up forever and never sweep the last few percent. This path
+is kept as a secondary safety net specifically for that case, not removed now that the
+dynamic trigger handles the common case.
+
+Mission completion (_publish_coverage_complete, State.COVERAGE_COMPLETE) requires BOTH
+"no reachable frontier candidate" AND "swept_mask.count_unswept_free reports 0" — never
+just the swept count alone. COVERAGE_COMPLETE is a genuine dead end in this node
+(_evaluate returns unconditionally once in it, and _enabled_cb's reset explicitly leaves
+it alone across an executor pause/resume cycle), and the dynamic trigger is tuned to
+fire on a SMALL known-free area on purpose — checking only "is what we've swept so far
+100%" would let the very first, tiny sweep at mission start satisfy it while the rest of
+the arena is still completely unexplored.
+
+Returning from SWEEPING to FRONTIER — whether because the queue drained with un-swept
+area still remaining (new floor appeared passively mid-sweep) or because a new pocket
+was revealed (see below) — sets self._sweep_cooldown_until (SWEEP_RETRIGGER_COOLDOWN_S
+out), during which the dynamic trigger is not re-checked. Without it, the same ratio
+that just caused a return to FRONTIER would very likely still be true on the very next
+tick, re-triggering SWEEPING before a single frontier goal ever gets a chance to
+dispatch — the node would appear to explore but never actually move toward a frontier.
+
+The mode is not one-way, and the abort condition for "new pocket revealed mid-sweep" is
+count-based, not presence-based. find_frontiers runs every tick in BOTH modes, because
+sweeping drives through the room interior — precisely where pockets that were occluded
+from the walls come into view. Under the ORIGINAL one-shot design, sweeping only ever
+began once frontiers_world was already empty, so any non-empty frontiers_world during a
+sweep was unambiguously new. That assumption no longer holds once the dynamic trigger
+can start a sweep WHILE frontiers still exist (the whole point of interleaving) — a
+presence check would abort the sweep after its very first waypoint, every time. Instead,
+self._sweep_start_frontier_count snapshots len(frontiers_world) when a sweep begins, and
+the sweep is only aborted-and-replanned if the live count later exceeds that snapshot —
+i.e. a cluster appeared that wasn't there when this sweep started. Resuming the old
+queue instead of rebuilding would be cheaper but would leave the newly-discovered floor
+uncovered, which is the exact failure this phase exists to prevent.
 
 Snap/self-clearance agreement: COSTMAP_SAFE_COST (50) sits well below the inscribed
 cutoff SELF_CLEARANCE_MAX_COST (99), so any cell _snap_to_reachable accepts is by
@@ -212,6 +249,14 @@ from botzilla_navigation.frontier_detection import (
     in_collision,
     select_target,
     world_to_grid,
+)
+from botzilla_navigation.swept_mask import (
+    count_unswept_free,
+    create_swept_mask,
+    mark_swept_cells,
+    mark_world_point_swept,
+    resize_swept_mask,
+    should_trigger_sweep,
 )
 from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose, Spin
 from nav_msgs.msg import OccupancyGrid
@@ -330,11 +375,25 @@ COSTMAP_SEARCH_RADIUS_CELLS = 10
 # actually in collision," not "is this a comfortable place to aim for."
 SELF_CLEARANCE_MAX_COST = 99
 
-# Coverage sweep — see module docstring's "Coverage sweep" section. Placeholders: this
-# stage validates sweep navigation only, not camera coverage, so these aren't tuned
-# against the Kinect's FOV yet.
+# Coverage sweep — see module docstring's "Coverage sweep" section. Row spacing/min run
+# length aren't yet tuned against the Kinect's FOV (swept_mask.CAMERA_HALF_FOV_RAD /
+# CAMERA_MARK_RANGE_M) — that's a follow-up tuning pass once this interleaved design is
+# validated live, not part of this change.
 SWEEP_ROW_SPACING_M = 0.5
 SWEEP_MIN_RUN_M = 0.3
+
+# Sweep once un-swept known-free area exceeds this fraction of total known free area — a
+# fraction, not a fixed square-meterage, so a small first room gets camera-checked almost
+# immediately while a large mostly-swept arena isn't re-triggered by trivial new patches.
+# See module docstring's "Interleaved, not sequential" section.
+SWEEP_FRACTION = 0.15
+
+# After returning from SWEEPING to FRONTIER, don't re-check the dynamic trigger for this
+# long — otherwise the same un-swept ratio that just caused the return would very likely
+# still be true on the next tick, re-triggering SWEEPING before a single frontier goal
+# ever gets a chance to dispatch. 10 eval ticks: comfortably more than the 1-2 ticks a
+# target-selection/snap/reachability-check cycle normally takes. See module docstring.
+SWEEP_RETRIGGER_COOLDOWN_S = 20.0
 
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
@@ -396,6 +455,21 @@ class FrontierExplorerNode(Node):
         # sweeps instead. Reset whenever any frontier becomes actionable again.
         self._consecutive_recoveries = 0
 
+        # Swept mask — tracks which map cells the camera has actually passed over. None
+        # until the first /map arrives (needs known width/height to allocate). See
+        # swept_mask.py and module docstring's "Interleaved, not sequential" section.
+        self._swept_mask = None
+        self._swept_mask_width = 0
+        self._swept_mask_height = 0
+        self._swept_mask_origin_x = 0.0
+        self._swept_mask_origin_y = 0.0
+        # Frontier-cluster count snapshotted when the current sweep began — see module
+        # docstring's count-based (not presence-based) mid-sweep abort condition.
+        self._sweep_start_frontier_count = 0
+        # rclpy Time; while set and in the future, the dynamic sweep trigger is not
+        # re-checked — see SWEEP_RETRIGGER_COOLDOWN_S.
+        self._sweep_cooldown_until = None
+
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -442,6 +516,30 @@ class FrontierExplorerNode(Node):
 
     def _map_cb(self, msg: OccupancyGrid):
         self._latest_map = msg
+
+        # Keep the swept mask in step with the map's dimensions/origin. RTAB-Map's /map
+        # can grow on any edge as SLAM discovers more space, shifting its origin in x
+        # and/or y — not just extending outward from a fixed corner — so a plain resize
+        # isn't enough; existing True cells must be relocated too. See
+        # swept_mask.resize_swept_mask's docstring for why that's done via a coordinate
+        # round-trip rather than a hand-derived offset. Comparing against the cached
+        # _swept_mask_* values (set below) rather than a stale copy of the previous
+        # message avoids any ordering hazard from reading self._latest_map here.
+        new_w, new_h = msg.info.width, msg.info.height
+        new_ox, new_oy = msg.info.origin.position.x, msg.info.origin.position.y
+        if self._swept_mask is None:
+            self._swept_mask = create_swept_mask(new_w, new_h)
+        elif (new_w, new_h, new_ox, new_oy) != (
+            self._swept_mask_width, self._swept_mask_height,
+            self._swept_mask_origin_x, self._swept_mask_origin_y,
+        ):
+            self._swept_mask = resize_swept_mask(
+                self._swept_mask, self._swept_mask_width, self._swept_mask_height,
+                msg.info.resolution, self._swept_mask_origin_x, self._swept_mask_origin_y,
+                new_w, new_h, new_ox, new_oy,
+            )
+        self._swept_mask_width, self._swept_mask_height = new_w, new_h
+        self._swept_mask_origin_x, self._swept_mask_origin_y = new_ox, new_oy
 
     def _costmap_cb(self, msg: OccupancyGrid):
         self._latest_costmap = msg
@@ -542,7 +640,7 @@ class FrontierExplorerNode(Node):
         robot_pose = self._get_robot_pose()
         if robot_pose is None:
             return
-        robot_x, robot_y = robot_pose
+        robot_x, robot_y, robot_yaw = robot_pose
 
         if not self._is_self_clear(robot_x, robot_y):
             self.get_logger().warn(
@@ -571,31 +669,83 @@ class FrontierExplorerNode(Node):
             for (r, c, _size) in clusters
         ]
 
-        if not frontiers_world:
-            self._begin_coverage_sweep(msg, robot_x, robot_y, 'no frontiers remain')
-            return
+        # Swept-mask update — see module docstring's "Interleaved, not sequential"
+        # section. Runs every tick in both modes, same reasoning as frontier detection
+        # above: the robot's camera passes over new ground regardless of which mode is
+        # driving it.
+        if self._swept_mask is not None:
+            mark_swept_cells(
+                self._swept_mask, self._swept_mask_width, self._swept_mask_height,
+                msg.info.resolution, msg.info.origin.position.x, msg.info.origin.position.y,
+                robot_x, robot_y, robot_yaw,
+            )
+        total_free, unswept_free = count_unswept_free(
+            msg.data, self._swept_mask, msg.info.width, msg.info.height
+        )
+        self.get_logger().info(
+            f'Swept coverage: {total_free - unswept_free}/{total_free} free cells swept '
+            f'({100.0 * (1.0 - unswept_free / max(1, total_free)):.1f}%)',
+            throttle_duration_sec=10.0,
+        )
 
         if self._mode == 'SWEEPING':
-            # New frontiers appeared while sweeping. Map first, cover second: an unmapped
-            # pocket may contain floor the current queue doesn't even mention, so the
-            # queue is discarded rather than resumed, and rebuilt against the larger map
-            # once frontiers run out again. Costs some re-driving of already-swept ground;
-            # the alternative (resuming a queue that predates the new area) would leave
-            # that area uncovered, which is the one thing this whole phase exists to
-            # prevent.
-            self.get_logger().info(
-                f'{len(frontiers_world)} new frontier(s) appeared mid-sweep — returning '
-                f'to frontier exploration; the sweep will be replanned afterwards.'
-            )
-            self._mode = 'FRONTIER'
-            self._sweep_queue = []
+            if len(frontiers_world) > self._sweep_start_frontier_count:
+                # A genuinely new pocket became visible mid-sweep — count-based, not
+                # presence-based, see module docstring for why. Map first, cover second:
+                # an unmapped pocket may contain floor the current queue doesn't even
+                # mention, so the queue is discarded rather than resumed, and rebuilt
+                # against the larger map once frontiers are handled again.
+                self.get_logger().info(
+                    f'{len(frontiers_world)} frontier cluster(s) now known (was '
+                    f'{self._sweep_start_frontier_count} when this sweep began) — a new '
+                    f'pocket became visible mid-sweep; returning to frontier exploration, '
+                    f'the sweep will be replanned afterwards.'
+                )
+                self._mode = 'FRONTIER'
+                self._sweep_queue = []
+                self._sweep_cooldown_until = (
+                    self.get_clock().now() + Duration(seconds=SWEEP_RETRIGGER_COOLDOWN_S)
+                )
+                # Fall through to FRONTIER handling below, same tick.
+            else:
+                self._dispatch_next_sweep_waypoint(robot_x, robot_y, frontiers_world)
+                return
+
+        # --- FRONTIER mode from here (originally, or just switched above) ---
+
+        if not frontiers_world:
+            if unswept_free == 0:
+                self._publish_coverage_complete('nothing left to explore or sweep')
+            else:
+                self._begin_coverage_sweep(
+                    msg, robot_x, robot_y, frontiers_world, 'no frontiers remain',
+                    exploration_exhausted=True,
+                )
+            return
 
         candidates = self._filter_blacklisted(frontiers_world)
         if not candidates:
-            self._handle_all_frontiers_blacklisted(msg, robot_x, robot_y)
+            if unswept_free == 0:
+                self._publish_coverage_complete(
+                    'all known frontiers unreachable and coverage is complete'
+                )
+            else:
+                self._handle_all_frontiers_blacklisted(msg, robot_x, robot_y, frontiers_world)
             return
         self._stuck_since = None
         self._consecutive_recoveries = 0
+
+        cooldown_active = (
+            self._sweep_cooldown_until is not None
+            and self.get_clock().now() < self._sweep_cooldown_until
+        )
+        if not cooldown_active and should_trigger_sweep(total_free, unswept_free, SWEEP_FRACTION):
+            self._begin_coverage_sweep(
+                msg, robot_x, robot_y, frontiers_world,
+                f'un-swept area ({unswept_free}/{total_free} free cells) exceeds '
+                f'{SWEEP_FRACTION * 100:.0f}% of known free space',
+            )
+            return
 
         target = select_target(candidates, robot_x, robot_y)
 
@@ -687,7 +837,20 @@ class FrontierExplorerNode(Node):
             inscribed_cost=SELF_CLEARANCE_MAX_COST
         )
 
-    def _dispatch_next_sweep_waypoint(self, robot_x, robot_y):
+    def _publish_coverage_complete(self, reason):
+        """Declare the mission genuinely done.
+
+        See module docstring's "Mission completion" paragraph for why this requires both
+        no reachable frontier candidate AND full swept coverage, checked together at
+        every call site, never swept-ratio alone. State.COVERAGE_COMPLETE is a dead end
+        (_evaluate returns unconditionally once in it), so this must not be reachable
+        prematurely.
+        """
+        self._coverage_complete_pub.publish(Bool(data=True))
+        self._state = State.COVERAGE_COMPLETE
+        self.get_logger().info(f'Mission complete — {reason}.')
+
+    def _dispatch_next_sweep_waypoint(self, robot_x, robot_y, frontiers_world):
         """Pop and send the next coverage-sweep waypoint — see module docstring.
 
         Reuses the same snap/reachability pipeline as a frontier target
@@ -698,9 +861,25 @@ class FrontierExplorerNode(Node):
         re-evaluated every tick.
         """
         if not self._sweep_queue:
-            self._coverage_complete_pub.publish(Bool(data=True))
-            self._state = State.COVERAGE_COMPLETE
-            self.get_logger().info('Coverage sweep complete — every queued waypoint tried.')
+            candidates = self._filter_blacklisted(frontiers_world)
+            total_free, unswept_free = count_unswept_free(
+                self._latest_map.data, self._swept_mask,
+                self._latest_map.info.width, self._latest_map.info.height,
+            )
+            if not candidates and unswept_free == 0:
+                self._publish_coverage_complete(
+                    'sweep queue exhausted, no frontiers left, fully swept'
+                )
+            else:
+                self._mode = 'FRONTIER'
+                self._sweep_cooldown_until = (
+                    self.get_clock().now() + Duration(seconds=SWEEP_RETRIGGER_COOLDOWN_S)
+                )
+                self.get_logger().info(
+                    f'Sweep queue exhausted ({unswept_free} un-swept free cell(s), '
+                    f'{len(candidates)} frontier candidate(s) remain) — returning to '
+                    f'frontier mode.'
+                )
             return
 
         target = self._sweep_queue.pop(0)
@@ -712,8 +891,17 @@ class FrontierExplorerNode(Node):
         if nav_point is None:
             self.get_logger().info(
                 f'Sweep waypoint ({target[0]:.2f}, {target[1]:.2f}) has no low-cost cell '
-                f'nearby in the costmap; skipping it.'
+                f'nearby in the costmap; marking it swept-but-skipped so an un-drivable '
+                f'pocket cannot block coverage completion forever.'
             )
+            if self._swept_mask is not None:
+                mark_world_point_swept(
+                    self._swept_mask, self._swept_mask_width, self._swept_mask_height,
+                    self._latest_map.info.resolution,
+                    self._latest_map.info.origin.position.x,
+                    self._latest_map.info.origin.position.y,
+                    target[0], target[1],
+                )
             return
 
         nav_x, nav_y = nav_point
@@ -741,7 +929,7 @@ class FrontierExplorerNode(Node):
     # Stuck recovery — see module docstring
     # ------------------------------------------------------------------ #
 
-    def _handle_all_frontiers_blacklisted(self, msg, robot_x, robot_y):
+    def _handle_all_frontiers_blacklisted(self, msg, robot_x, robot_y, frontiers_world):
         now = self.get_clock().now()
         if self._stuck_since is None:
             self._stuck_since = now
@@ -763,9 +951,10 @@ class FrontierExplorerNode(Node):
         # permanently blacklisted, which the "no frontiers remain" branch never sees.
         if self._consecutive_recoveries >= STUCK_RECOVERIES_BEFORE_SWEEP:
             self._begin_coverage_sweep(
-                msg, robot_x, robot_y,
+                msg, robot_x, robot_y, frontiers_world,
                 f'every remaining frontier stayed unreachable across '
-                f'{self._consecutive_recoveries} recovery attempts'
+                f'{self._consecutive_recoveries} recovery attempts',
+                exploration_exhausted=True,
             )
             return
 
@@ -778,15 +967,20 @@ class FrontierExplorerNode(Node):
         )
         self._start_recovery_backup()
 
-    def _begin_coverage_sweep(self, msg, robot_x, robot_y, reason):
+    def _begin_coverage_sweep(
+        self, msg, robot_x, robot_y, frontiers_world, reason, exploration_exhausted=False,
+    ):
         """Enter (or continue) the coverage sweep — see module docstring "Coverage sweep".
 
-        Reached from two places: frontier detection returning nothing at all, and every
-        remaining frontier proving persistently unreachable. The second is the case that
-        actually happens in a bounded arena, where leftover frontiers face unreachable
-        space beyond the walls and simply stay blacklisted forever.
+        Reached from three places: frontier detection returning nothing at all, every
+        remaining frontier proving persistently unreachable, and the dynamic un-swept-area
+        trigger firing while frontiers are still being actively explored. Only the first
+        two mean frontier exploration is actually exhausted — the third is a normal
+        interleaving pause, not the end of exploration, so exploration_exhausted must be
+        passed True only by those first two call sites; it gates /exploration_complete,
+        which would otherwise fire misleadingly early on the very first small sweep.
         """
-        if not self._exploration_complete_published:
+        if exploration_exhausted and not self._exploration_complete_published:
             self._complete_pub.publish(Bool(data=True))
             self._exploration_complete_published = True
             self.get_logger().info(f'Exploration complete — {reason}.')
@@ -795,16 +989,18 @@ class FrontierExplorerNode(Node):
             self._blacklist = []
             self._stuck_since = None
             self._consecutive_recoveries = 0
+            self._sweep_start_frontier_count = len(frontiers_world)
             self._sweep_queue = generate_coverage_waypoints(
                 msg.data, msg.info.width, msg.info.height, msg.info.resolution,
                 msg.info.origin.position.x, msg.info.origin.position.y,
                 row_spacing_m=SWEEP_ROW_SPACING_M, min_run_m=SWEEP_MIN_RUN_M,
+                swept_mask=self._swept_mask,
             )
             self.get_logger().info(
                 f'Switching to coverage sweep ({reason}): {len(self._sweep_queue)} '
                 f'waypoint(s) queued over the known map.'
             )
-        self._dispatch_next_sweep_waypoint(robot_x, robot_y)
+        self._dispatch_next_sweep_waypoint(robot_x, robot_y, frontiers_world)
 
     def _start_recovery_backup(self):
         if not self._backup_client.wait_for_server(timeout_sec=2.0):
@@ -1031,6 +1227,7 @@ class FrontierExplorerNode(Node):
     # ------------------------------------------------------------------ #
 
     def _get_robot_pose(self):
+        """Return (x, y, yaw) of the robot in MAP_FRAME, or None."""
         try:
             t = self._tf_buffer.lookup_transform(
                 MAP_FRAME, ROBOT_FRAME, rclpy.time.Time(), Duration(seconds=0.5)
@@ -1039,7 +1236,9 @@ class FrontierExplorerNode(Node):
             msg = f'Could not get robot pose ({MAP_FRAME}->{ROBOT_FRAME}): {ex}'
             self.get_logger().warn(msg, throttle_duration_sec=5.0)
             return None
-        return t.transform.translation.x, t.transform.translation.y
+        q = t.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return t.transform.translation.x, t.transform.translation.y, yaw
 
     # ------------------------------------------------------------------ #
     # Nav2 ComputePathToPose action client — reachability pre-check

@@ -25,6 +25,16 @@ Nodes started:
   6. ekf_node              — robot_localization, fuses wheel velocity + IMU yaw
                               rate into /odometry/filtered (config/ekf_hardware.yaml
                               — see that file for why it differs from sim's ekf.yaml)
+  7. depth_image_proc      — converts /camera/depth/image_meters (real metric depth)
+                              into a 3D point cloud on /camera/points, for detecting
+                              low obstacles (chair/wheelchair bases) the LiDAR's 2D
+                              scan plane misses entirely.
+  8. pointcloud_to_laserscan — crushes /camera/points into a virtual 2D scan on
+                              /scan_camera, height-filtered to 0.05m-0.30m (above
+                              floor-noise level, up to the LiDAR's own 0.30m mount
+                              height — see botzilla_navigation/config/nav2_params.yaml
+                              for how this feeds the costmaps as a second
+                              observation source alongside /scan).
 
 Usage:
   ros2 launch botzilla_bringup hardware.launch.py
@@ -39,7 +49,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.descriptions import ComposableNode
 
 _NORESET = os.path.join(
     os.path.expanduser('~'), 'Desktop/Projects/sem5/final-project-botzilla/noreset.so'
@@ -159,6 +170,72 @@ def generate_launch_description():
         parameters=[ekf_config_file, {'use_sim_time': False}],
     )
 
+    # ------------------------------------------------------------------ #
+    # 7. depth_image_proc — /camera/depth/image_meters (real metric depth,
+    #    NOT /camera/depth/image_raw, which is kinect_bridge's mono8 preview
+    #    built for yolo_node) -> /camera/points (3D point cloud)
+    # ------------------------------------------------------------------ #
+    depth_to_pointcloud = ComposableNodeContainer(
+        name='depth_image_proc_container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container',
+        composable_node_descriptions=[
+            ComposableNode(
+                package='depth_image_proc',
+                plugin='depth_image_proc::PointCloudXyzNode',
+                name='point_cloud_xyz_node',
+                remappings=[
+                    ('image_rect', '/camera/depth/image_meters'),
+                    # image_transport::CameraSubscriber derives the info topic from the
+                    # image topic's own namespace (here: /camera/depth/camera_info), NOT
+                    # from a remap targeting the generic 'camera_info' name — confirmed
+                    # live: with only the 'camera_info' remap, point_cloud_xyz_node kept
+                    # subscribing to /camera/depth/camera_info (0 messages, since
+                    # kinect_bridge only publishes /camera/camera_info) and silently
+                    # produced zero synchronized pairs. Must remap the actual resolved
+                    # topic name.
+                    ('/camera/depth/camera_info', '/camera/camera_info'),
+                    ('points', '/camera/points'),
+                ],
+                parameters=[{'use_sim_time': False}],
+            )
+        ],
+        output='screen',
+    )
+
+    # ------------------------------------------------------------------ #
+    # 8. pointcloud_to_laserscan — /camera/points -> /scan_camera, a virtual
+    #    2D scan covering 0.05m-0.30m height (low obstacles like chair/
+    #    wheelchair bases the LiDAR's scan plane misses; 0.30m matches the
+    #    LiDAR's own mount height, so the two sensors cover ground-to-LiDAR
+    #    with no gap). Fed into nav2's costmaps as a second observation
+    #    source alongside /scan (see botzilla_navigation/config/nav2_params.yaml).
+    # ------------------------------------------------------------------ #
+    pointcloud_to_laserscan = Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        output='screen',
+        remappings=[
+            ('cloud_in', '/camera/points'),
+            ('scan', '/scan_camera'),
+        ],
+        parameters=[{
+            'use_sim_time': False,
+            'target_frame': 'base_link',
+            'transform_tolerance': 0.01,
+            'min_height': 0.05,
+            'max_height': 0.30,
+            'angle_min': -0.5,
+            'angle_max': 0.5,
+            'range_min': 0.55,
+            'range_max': 3.0,
+            'use_inf': True,
+            'inf_epsilon': 1.0,
+        }],
+    )
+
     return LaunchDescription([
         serial_port_arg,
         lidar_port_arg,
@@ -168,4 +245,6 @@ def generate_launch_description():
         rplidar_node,
         odom_covariance_relay,
         ekf_node,
+        depth_to_pointcloud,
+        pointcloud_to_laserscan,
     ])

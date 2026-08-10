@@ -88,3 +88,26 @@ def test_row_spacing_smaller_than_one_cell_clamps_to_every_row():
     visited_rows = {round(y / 0.05 - 0.5) for (_x, y) in waypoints}
     assert visited_rows == {0, 1, 2}
     assert len(waypoints) == 6
+
+
+def test_skips_fully_swept_runs():
+    rows = [[FREE] * 5]
+    data, w, h = grid(rows, 5)
+    swept_mask = [True] * 5
+    waypoints = generate_coverage_waypoints(
+        data, w, h, resolution=1.0, origin_x=0.0, origin_y=0.0,
+        row_spacing_m=1.0, min_run_m=1.0, swept_mask=swept_mask,
+    )
+    assert waypoints == []
+
+
+def test_keeps_partially_swept_runs():
+    rows = [[FREE] * 5]
+    data, w, h = grid(rows, 5)
+    # Every cell swept except one — the run as a whole is still un-covered ground.
+    swept_mask = [True, True, False, True, True]
+    waypoints = generate_coverage_waypoints(
+        data, w, h, resolution=1.0, origin_x=0.0, origin_y=0.0,
+        row_spacing_m=1.0, min_run_m=1.0, swept_mask=swept_mask,
+    )
+    assert waypoints == [(0.5, 0.5), (4.5, 0.5)]
