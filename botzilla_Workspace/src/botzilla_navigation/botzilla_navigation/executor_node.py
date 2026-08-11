@@ -33,6 +33,21 @@ DELIVERING, Nav2 is driving and this node stays silent; it hands exploration
 on and off via the latched /exploration_enabled topic, and frontier_explorer_node
 cancels its in-flight goal when disabled.
 
+That statement used to be aspirational rather than true: botzilla_control's
+velocity_smoother sits downstream of Nav2 (cmd_vel_nav -> cmd_vel) and publishes on
+its own 20 Hz timer for as long as nav2.launch.py is alive, with no awareness of
+this node's state at all — so it was a second, independent /cmd_vel publisher the
+entire time TARGETING/APPROACHING/CAPTURING/DETACHING were also publishing. Usually
+harmless-looking (it just decays to zero and idles there), but right after a
+NavigateToPose goal succeeds it can still be mid-decay of real leftover velocity at
+the exact moment DETACHING starts its own reverse ramp — hardware testing traced a
+vibration right at the instant reversing began to precisely that collision, on a
+build where DETACHING already had a settle delay on this node's own side (which
+cannot fix a race whose other half doesn't respect it). This node now toggles
+velocity_smoother's mute switch (/velocity_smoother_enabled, latched) on every
+transition — enabled only for EXPLORING/DELIVERING, disabled everywhere this node
+drives — so the ownership claim above is actually enforced, not just documented.
+
 Usage
 -----
     ros2 launch botzilla_navigation executor.launch.py
@@ -86,7 +101,18 @@ BLIND_SPOT_FRAMES = 2
 
 # ── Detach ───────────────────────────────────────────────────────────────────
 DETACH_SPEED = -0.10        # m/s, reverse
-DETACH_TIME_S = 1.8
+# 1.8s (~0.18m nominal) was measured on hardware to not reliably clear the grabber
+# arms — the cube sometimes stayed pinned. Raised to give real clearance margin.
+DETACH_TIME_S = 5.0
+# nav2_params.yaml's general_goal_checker only checks xy/yaw tolerance, not velocity
+# — NavigateToPose can report SUCCEEDED while the robot still has real residual
+# motion. DETACHING's slew-rate ramp (see MAX_LINEAR_ACCEL) assumes it starts from
+# rest, so handing off straight into the reverse ramp while Nav2's last motion
+# hasn't fully decayed collides a "smooth" setpoint with genuine leftover velocity —
+# hardware testing found this reproduces the same abrupt-transition vibration as the
+# unfixed APPROACHING case, right at the instant reversing starts. Command an
+# explicit stop for this long first, so the reverse ramp genuinely begins from rest.
+DETACH_SETTLE_S = 0.5
 
 # ── Command smoothing ────────────────────────────────────────────────────────
 # Unlike Nav2's path (controller_server -> velocity_smoother -> cmd_vel), this node
@@ -162,6 +188,11 @@ class ExecutorNode(Node):
         enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self._explore_pub = self.create_publisher(
             Bool, '/exploration_enabled', enable_qos
+        )
+        # See "Who owns cmd_vel" above — mutes velocity_smoother whenever this node
+        # is the one driving the base, so the two never race on the same topic.
+        self._smoother_enable_pub = self.create_publisher(
+            Bool, 'velocity_smoother_enabled', enable_qos
         )
         self._status_pub = self.create_publisher(String, '/mission/status', 10)
 
@@ -400,8 +431,11 @@ class ExecutorNode(Node):
             )
 
     def _do_detaching(self, cmd, now):
-        """Reverse to leave the cube behind."""
-        if (now - self._phase_start).nanoseconds / 1e9 < DETACH_TIME_S:
+        """Settle any residual motion, then reverse to leave the cube behind."""
+        elapsed = (now - self._phase_start).nanoseconds / 1e9
+        if elapsed < DETACH_SETTLE_S:
+            return  # cmd stays zero — see DETACH_SETTLE_S
+        if elapsed - DETACH_SETTLE_S < DETACH_TIME_S:
             cmd.linear.x = DETACH_SPEED
             return
         self._cubes_delivered += 1
@@ -507,6 +541,11 @@ class ExecutorNode(Node):
             # and is a harmless no-op on paths that never lowered it in the first
             # place (e.g. no Nav2 server available).
             self._set_nav2_reverse_allowed(True)
+        # See "Who owns cmd_vel" — only one of Nav2 (via velocity_smoother) or this
+        # node's own control loop may publish cmd_vel at a time.
+        self._smoother_enable_pub.publish(
+            Bool(data=new_state in (State.EXPLORING, State.DELIVERING))
+        )
 
     def _cube_timed_out(self, now):
         if self._cube_last_seen is None:

@@ -47,11 +47,29 @@ Safety
 A commanded stop is NOT rate-limited on the way down to zero when it comes from an empty
 input stream — see DECEL_TO_STOP_IMMEDIATELY. Ramping a stop would mean overshooting into
 whatever prompted it.
+
+Mute switch
+-----------
+This node publishes unconditionally on a timer "so /cmd_vel always has a live publisher" —
+which is exactly the problem when something else also legitimately owns /cmd_vel.
+executor_node.py drives the base directly during TARGETING/APPROACHING/CAPTURING/DETACHING,
+and this node kept running the whole time regardless, decaying whatever Nav2's last command
+was to zero on its own clock. That produced two independent publishers racing on /cmd_vel:
+most visibly right after a NavigateToPose goal succeeds, where this node is still mid-decay
+of real leftover velocity at the exact moment executor_node starts its own reverse ramp for
+DETACHING — hardware testing traced a vibration/jerk at the instant DETACHING's reverse
+began to precisely this collision, which no amount of delay on executor_node's own side
+could fix since this node keeps publishing regardless. The 'velocity_smoother_enabled'
+topic (latched, default True so this node behaves unchanged when run without executor_node)
+lets executor_node mute this node to a full stop of publishing — not a decay to zero, an
+actual absence of publishing — whenever it takes over the base itself.
 """
 
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool
 
 # Output rate. Matches nav2_params.yaml's controller_frequency (20 Hz) so the smoother
 # neither starves the base nor invents intermediate setpoints the controller never asked
@@ -161,6 +179,7 @@ class VelocitySmoother(Node):
 
         self._target = Twist()      # latest command from Nav2
         self._output = Twist()      # what we last published (the ramp's current state)
+        self._enabled = True        # see 'Mute switch' in the module docstring
         self._last_input_time = None
         self._input_count = 0
         self._output_count = 0
@@ -177,6 +196,14 @@ class VelocitySmoother(Node):
         self._sub = self.create_subscription(Twist, 'cmd_vel_nav', self._input_cb, 10)
         self._pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
+        # Latched, matching executor_node's /exploration_enabled pattern — a late
+        # subscriber (this node) must see the current value even if the publisher
+        # (executor_node) started first and already published before we came up.
+        enable_qos = QoSProfile(depth=1)
+        enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self._enabled_sub = self.create_subscription(
+            Bool, 'velocity_smoother_enabled', self._enabled_cb, enable_qos)
+
         self._period = 1.0 / PUBLISH_RATE_HZ
         self.create_timer(self._period, self._tick)
         self.create_timer(DIAGNOSTIC_PERIOD_S, self._diagnostics)
@@ -185,6 +212,21 @@ class VelocitySmoother(Node):
             f'velocity_smoother started: cmd_vel_nav -> cmd_vel at {PUBLISH_RATE_HZ:.0f} Hz, '
             f'accel limits x={MAX_ACCEL_X} theta={MAX_ACCEL_THETA}, '
             f'decel x={MAX_DECEL_X} theta={MAX_DECEL_THETA}')
+
+    def _enabled_cb(self, msg):
+        was_enabled = self._enabled
+        self._enabled = msg.data
+        if was_enabled and not self._enabled:
+            self.get_logger().info(
+                'Disabled — another controller owns /cmd_vel; going fully silent '
+                '(not even a decayed zero).')
+            # The robot is about to be driven by whoever just took over, not by our
+            # ramp resuming from wherever it happened to be — start the ramp state
+            # clean so a later re-enable doesn't resume from stale leftover velocity.
+            self._output = Twist()
+            self._flip_cycles = {'x': 0, 'theta': 0}
+        elif not was_enabled and self._enabled:
+            self.get_logger().info('Re-enabled — resuming cmd_vel_nav -> cmd_vel.')
 
     def _input_cb(self, msg):
         now = self.get_clock().now()
@@ -266,6 +308,8 @@ class VelocitySmoother(Node):
         return 0.0
 
     def _tick(self):
+        if not self._enabled:
+            return   # another controller owns /cmd_vel — see 'Mute switch' above
         if self._last_input_time is None:
             return   # never commanded — stay silent rather than publish zeros at boot
 
