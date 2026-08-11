@@ -48,6 +48,8 @@ from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.parameter_client import AsyncParameterClient
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from std_msgs.msg import Bool, String
 import tf2_ros
@@ -86,10 +88,33 @@ BLIND_SPOT_FRAMES = 2
 DETACH_SPEED = -0.10        # m/s, reverse
 DETACH_TIME_S = 1.8
 
+# ── Command smoothing ────────────────────────────────────────────────────────
+# Unlike Nav2's path (controller_server -> velocity_smoother -> cmd_vel), this node
+# publishes its P-control output straight to cmd_vel with no shaping at all — most
+# visibly, entering APPROACHING steps linear.x from 0 to APPROACH_SPEED in one 100ms
+# tick. Hardware testing traced a "go a bit, stop a bit" vibration during APPROACHING
+# to kobuki_base_node's encoder-tick-rejection bursts, which only ever showed up
+# under commands with abrupt transitions (direction/speed changes) — never under
+# steady-state driving or pure rotation. Ramping every published command limits how
+# fast the setpoint can change per tick, so state-entry steps become gradual instead
+# of instantaneous, without changing what any state ultimately asks for.
+MAX_LINEAR_ACCEL = 0.4      # m/s^2 -> 0 to APPROACH_SPEED in ~0.4s
+MAX_ANGULAR_ACCEL = 1.5     # rad/s^2 -> 0 to MAX_ANGULAR in ~0.25s
+
 # ── Delivery ─────────────────────────────────────────────────────────────────
 # Generous: the route home can span the whole arena and Nav2 may run recoveries.
 DELIVERY_TIMEOUT_S = 300.0
 HOME_TF_WAIT_S = 60.0       # how long to wait at STARTUP for map->base_link
+
+# nav2_params.yaml's FollowPath.min_vel_x is deliberately -0.10 (not 0.0) so DWB can
+# back out of a wedge during EXPLORING — that's load-bearing and must stay in place
+# for exploration/sweeping. But the grabber has no lock: hardware testing found that
+# any reverse motion while carrying a cube drops it, which was silently producing a
+# "second" cube detection that was actually the first one falling out mid-delivery.
+# So min_vel_x is pushed to 0.0 for the HOME goal only, and restored the moment
+# DELIVERING ends (success, failure, or timeout) — every other state, including
+# EXPLORING, keeps the wedge-escape behaviour untouched.
+NAV2_MIN_VEL_X_DEFAULT = -0.10  # must match FollowPath.min_vel_x in nav2_params.yaml
 
 CONTROL_PERIOD_S = 0.1      # 10 Hz
 MAP_FRAME = 'map'
@@ -119,6 +144,8 @@ class ExecutorNode(Node):
         self._phase_start = self.get_clock().now()
         self._startup_start = self.get_clock().now()
         self._cubes_delivered = 0
+        self._last_cmd_linear = 0.0   # for slew-limiting, see MAX_LINEAR_ACCEL
+        self._last_cmd_angular = 0.0
 
         self._nav_goal_handle = None
         self._nav_result = None      # None while in flight; GoalStatus once finished
@@ -141,6 +168,7 @@ class ExecutorNode(Node):
         self.create_subscription(Point, 'detected_cube', self._cube_cb, 10)
 
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._controller_param_client = AsyncParameterClient(self, 'controller_server')
 
         # Hold exploration off until HOME is latched — otherwise the robot could
         # drive away before we ever record where it started, and HOME would be
@@ -228,6 +256,13 @@ class ExecutorNode(Node):
 
         elif self._state == State.DETACHING:
             self._do_detaching(cmd, now)
+
+        max_dv = MAX_LINEAR_ACCEL * CONTROL_PERIOD_S
+        max_dw = MAX_ANGULAR_ACCEL * CONTROL_PERIOD_S
+        cmd.linear.x = self._slew_limit(cmd.linear.x, self._last_cmd_linear, max_dv)
+        cmd.angular.z = self._slew_limit(cmd.angular.z, self._last_cmd_angular, max_dw)
+        self._last_cmd_linear = cmd.linear.x
+        self._last_cmd_angular = cmd.angular.z
 
         self._cmd_pub.publish(cmd)
         self._publish_status()
@@ -390,6 +425,8 @@ class ExecutorNode(Node):
             self._transition(State.DETACHING, 'No Nav2 server.')
             return
 
+        self._set_nav2_reverse_allowed(False)
+
         x, y, yaw = self._home
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = MAP_FRAME
@@ -402,6 +439,13 @@ class ExecutorNode(Node):
         self._nav_sent_time = self.get_clock().now()
         self.get_logger().info(f'Sending NavigateToPose to HOME ({x:.2f}, {y:.2f}).')
         self._nav_client.send_goal_async(goal).add_done_callback(self._goal_response_cb)
+
+    def _set_nav2_reverse_allowed(self, allowed: bool):
+        """Push FollowPath.min_vel_x to 0.0 (or restore it) — see NAV2_MIN_VEL_X_DEFAULT."""
+        value = NAV2_MIN_VEL_X_DEFAULT if allowed else 0.0
+        self._controller_param_client.set_parameters(
+            [Parameter('FollowPath.min_vel_x', Parameter.Type.DOUBLE, value)]
+        )
 
     def _goal_response_cb(self, future):
         handle = future.result()
@@ -451,8 +495,18 @@ class ExecutorNode(Node):
         self.get_logger().info(f'[{self._state}] -> [{new_state}] | {reason}')
         self._state = new_state
         self._phase_start = self.get_clock().now()
+        # Every state entry ramps from rest — see MAX_LINEAR_ACCEL comment. Simpler
+        # and safer than trying to carry a velocity across a state boundary whose
+        # target profile (gain, speed) is about to change anyway.
+        self._last_cmd_linear = 0.0
+        self._last_cmd_angular = 0.0
         if new_state in (State.TARGETING, State.APPROACHING):
             self._blind_spot_frames = 0
+        if new_state == State.DETACHING:
+            # Covers every DELIVERING exit (arrived, failed, timed out) uniformly,
+            # and is a harmless no-op on paths that never lowered it in the first
+            # place (e.g. no Nav2 server available).
+            self._set_nav2_reverse_allowed(True)
 
     def _cube_timed_out(self, now):
         if self._cube_last_seen is None:
@@ -462,6 +516,10 @@ class ExecutorNode(Node):
     @staticmethod
     def _clamp_angular(value):
         return max(-MAX_ANGULAR, min(MAX_ANGULAR, value))
+
+    @staticmethod
+    def _slew_limit(target, last, max_delta):
+        return max(last - max_delta, min(last + max_delta, target))
 
     def _publish_status(self):
         home = (
