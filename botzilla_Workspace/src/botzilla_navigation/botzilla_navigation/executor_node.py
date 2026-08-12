@@ -88,6 +88,17 @@ CAPTURE_SPEED = 0.12        # m/s during the final push
 # 1.5 still rejects far-field noise, which in a measured frame topped out at 0.138
 # confidence versus 0.797 for the real cube.
 CUBE_MAX_RANGE_M = 1.5
+# Once DETACHING releases a cube, it sits right in front of the robot — well within
+# CUBE_MAX_RANGE_M — so EXPLORING immediately re-detects and re-collects the same
+# cube. A per-cube identity check isn't available (cubes aren't distinguishable), and
+# a time-based cooldown can expire before Nav2 actually starts moving the robot away
+# from HOME. So proximity to HOME is the signal instead: HOME is the drop-off point,
+# cubes are expected to accumulate there over a mission, and none of them should ever
+# be re-collected regardless of how long ago they were dropped. Estimated from Nav2's
+# xy_goal_tolerance (0.15m) + the DETACHING reverse distance (~0.5m) + margin —
+# confirm against where the cube actually ends up on hardware and retune if it's
+# clipping legitimate nearby cubes or not covering the dropped one.
+HOME_CUBE_SUPPRESS_RADIUS_M = 1.0
 # No detection for this long -> give up and resume exploring.
 CUBE_LOST_TIMEOUT_S = 5.0
 # In CAPTURING, how long without a detection counts as "the cube has genuinely left
@@ -221,6 +232,10 @@ class ExecutorNode(Node):
         # already carrying one, and a detection of the cube it is holding (or of the
         # next one) must not derail the delivery.
         if self._state in (State.STARTUP, State.DELIVERING, State.DETACHING):
+            return
+        # See HOME_CUBE_SUPPRESS_RADIUS_M — a cube dropped off at HOME must not be
+        # immediately re-collected once EXPLORING resumes.
+        if self._state == State.EXPLORING and self._near_home():
             return
 
         # z == 0.0 is the blind-spot sentinel from yolo_node, not a real distance, so
@@ -514,6 +529,17 @@ class ExecutorNode(Node):
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
         return (t.x, t.y, yaw)
+
+    def _near_home(self):
+        """True if the robot is currently within HOME_CUBE_SUPPRESS_RADIUS_M of HOME."""
+        if self._home is None:
+            return False
+        pose = self._get_robot_pose()
+        if pose is None:
+            return False
+        dx = pose[0] - self._home[0]
+        dy = pose[1] - self._home[1]
+        return (dx * dx + dy * dy) < HOME_CUBE_SUPPRESS_RADIUS_M ** 2
 
     def _publish_exploration_enabled(self, enabled: bool):
         self._explore_pub.publish(Bool(data=enabled))
