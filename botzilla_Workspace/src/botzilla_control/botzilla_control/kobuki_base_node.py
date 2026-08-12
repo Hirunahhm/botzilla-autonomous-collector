@@ -1,9 +1,11 @@
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 import math
+import time
 
 from .KobukiDriver import Kobuki
 
@@ -187,6 +189,12 @@ MEAS_FILTER_ALPHA = 0.25
 # is not a measurement of anything — it is an artifact of the polling mismatch.
 MIN_ODOM_DT_S = 0.005
 
+# Sanity bound on how stale a serial packet may be before _capture_stamp stops trusting
+# the age and falls back to "now". Generous next to the ~20ms packet period and the ~20ms
+# blocking read, so it only trips on a genuinely wedged reader or a monotonic-clock
+# surprise, never in normal operation.
+MAX_CAPTURE_AGE_S = 0.5
+
 # Guard against a corrupted encoder tick. _tick_diff correctly unwraps a genuine 16-bit
 # rollover, but has no way to tell a real reading from a garbage one (serial noise
 # desyncing the Kobuki's binary protocol is the leading suspect) — it will happily
@@ -281,7 +289,18 @@ class KobukiBaseNode(Node):
 
         L = enc['Left_encoder']
         R = enc['Right_encoder']
-        now = self.get_clock().now()
+        # Capture time, not poll time — and here it sets dt as well as the stamp, so it
+        # decides what velocity this node reports. The encoder delta spans the interval
+        # between the PACKETS the two readings came from; dividing it by the interval
+        # between TIMER FIRINGS is only the same number while the two rates agree. When
+        # they do not, this timer polls the same packet twice: the first poll sees delta=0
+        # and the next sees two packets' worth of ticks, still divided by one timer period
+        # — i.e. an apparent doubling. That is exactly the signature that trips
+        # MAX_PLAUSIBLE_SPEED_MPS below, so the "Rejecting implausible encoder tick"
+        # warnings were partly an artifact of this mismatch rather than corrupted reads.
+        # Timing off capture makes it self-correcting: re-reading one packet yields dt<=0
+        # and is skipped outright instead of inventing a velocity.
+        now = self._capture_stamp(self.robot.packet_monotonic)
 
         if self._prev_L is None:
             self._prev_L, self._prev_R = L, R
@@ -345,6 +364,26 @@ class KobukiBaseNode(Node):
         if dt >= MIN_ODOM_DT_S:
             self._meas_lin += MEAS_FILTER_ALPHA * ((d / dt) - self._meas_lin)
 
+    def _capture_stamp(self, capture_monotonic):
+        """ROS time at which `capture_monotonic` (a time.monotonic() value) happened.
+
+        The driver records packet arrival on the monotonic clock because it is plain
+        Python with no node handle; ROS time lives here. Rather than mix the two, measure
+        the data's AGE on the monotonic clock and subtract that from ROS "now", which is
+        correct regardless of any offset between the clocks.
+
+        Falls back to now() if the driver has not recorded an arrival yet, or if the age
+        comes out negative or implausibly large — a bad stamp is worse than a slightly
+        stale one, since TF lookups at a wrong time silently return a wrong pose.
+        """
+        now = self.get_clock().now()
+        if capture_monotonic is None:
+            return now
+        age = time.monotonic() - capture_monotonic
+        if not (0.0 <= age < MAX_CAPTURE_AGE_S):
+            return now
+        return now - Duration(seconds=age)
+
     # ── IMU (rate gyro only — see YAW_RATE_VARIANCE comment above) ───────────
 
     def _imu_update(self):
@@ -353,7 +392,15 @@ class KobukiBaseNode(Node):
             z_samples = gyro['angular velocity of z: ']
             if not z_samples:
                 return
-            yaw_rate_dps = z_samples[-1]
+            # MEAN of the packet's samples, not z_samples[-1]. The Kobuki reports the gyro
+            # faster than the 50 Hz feedback packet rate, so each packet carries several
+            # z-axis samples; taking only the last threw the rest away. What the EKF does
+            # with this value is integrate it over the interval to get heading
+            # (ekf_hardware.yaml fuses the yaw RATE and nothing else), and the integral of
+            # the interval is exactly the mean — a trailing point-sample is both noisier
+            # and, whenever the rate is changing across the packet, biased.
+            yaw_rate_dps = sum(z_samples) / len(z_samples)
+            capture_monotonic = self.robot.packet_monotonic
         except Exception:
             return   # __gyro not populated yet
 
@@ -372,7 +419,15 @@ class KobukiBaseNode(Node):
         yaw_rate_dps -= self._gyro_bias_dps
 
         msg = Imu()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        # Stamp when this gyro sample was CAPTURED, not when this timer got round to
+        # publishing it. This 50 Hz timer runs independently of the serial reader, so
+        # "now" overstates the data's freshness by however long the packet has been
+        # sitting there — and the EKF has no absolute yaw reference to correct against,
+        # so a rate attributed to the wrong instant integrates straight into a heading
+        # error that never washes out. Same defect, and same fix, as rplidar_node and
+        # kinect_bridge (see docs/ghost_map_investigation.md); the IMU was simply missed
+        # at the time, which mattered more than either, this being the only heading source.
+        msg.header.stamp = self._capture_stamp(capture_monotonic).to_msg()
         msg.header.frame_id = 'imu_link'
 
         # No absolute orientation available from this sensor: element 0 of the

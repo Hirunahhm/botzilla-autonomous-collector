@@ -2,6 +2,11 @@
 
 **Status:** fixed and verified on hardware (Jetson Orin Nano + Kobuki + RPLIDAR C1 + Kinect v1).
 
+> **If you are here because ghost maps came back:** this document covers the *first* cause (a
+> mirrored scan, fixed and since re-verified). A second, independent cause with the same visible
+> symptom was found later — stale Kobuki serial data putting the pose ~200ms behind the laser.
+> See **`ghost_map_sensor_latency.md`**, which also lists what is still outstanding.
+
 ## TL;DR
 
 `/scan` was **mirrored**. The RPLIDAR reports its angle increasing **clockwise**; a ROS

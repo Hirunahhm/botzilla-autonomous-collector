@@ -69,6 +69,13 @@ class Kobuki:
     __current = []
     __gyro = []
     __general_purpose_input = []
+    # time.monotonic() at which the packet currently held in the fields above finished
+    # arriving. Read by kobuki_base_node to stamp /imu and /odom with when the data was
+    # actually captured rather than with "now" at publish time — the polling timers run
+    # at 50 Hz independently of this thread, so without it every sample is up to a full
+    # timer period stale on top of the serial read latency, and claims not to be.
+    # None until the first packet has been parsed.
+    packet_monotonic = None
     global __th1
 
     def __getKobukiPort():
@@ -279,6 +286,8 @@ class Kobuki:
                 Kobuki.__cliffsensor = __in_buff[30:38]
                 Kobuki.__current = __in_buff[38:42]
                 Kobuki.__gyro = __in_buff[42 : 44 + __in_buff[43]]
+                # Last, so it is only advanced once every field above is consistent with it.
+                Kobuki.packet_monotonic = t.monotonic()
 
     def basic_sensor_data(self):
         sensor = {}
