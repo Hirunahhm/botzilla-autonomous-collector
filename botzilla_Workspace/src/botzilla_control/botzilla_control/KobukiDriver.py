@@ -5,6 +5,37 @@ import threading
 import serial.tools.list_ports as lsports
 
 
+# Bytes still to read once read_data()'s 2-byte sync has matched.
+#
+# Kobuki feedback framing is:  AA 55 <len> <len payload bytes> <checksum>
+# The sync matches the 2-byte little-endian value 333 == [77, 1], i.e. <len=77>
+# followed by sub-payload id 0x01 (Basic Sensor Data) — so this driver only ever
+# accepts the 77-byte-payload variant. Having consumed <len> and that 0x01, exactly
+# 77 bytes of the packet remain: 76 further payload bytes plus the checksum. Reading
+# precisely that many leaves the port positioned on the next packet's AA 55.
+#
+# This was `read(200)`, and because pyserial is opened with no timeout (so read(n)
+# blocks until all n bytes arrive) that had two compounding costs, both measured on
+# hardware:
+#   * it blocked ~49ms waiting for 200 bytes at the 50 Hz / 81-byte packet rate, so
+#     every sample handed to the EKF was already that stale before parsing began; and
+#   * 2 + 200 = 202 bytes is 2.56 packets, so it consumed two whole packets beyond the
+#     one it parsed and stopped 44 bytes into a third — mid-stream, forcing the 2-byte
+#     sync loop to hunt for the next header and discard the remainder. Net effect: the
+#     gyro and encoders actually refreshed at ~20 Hz, not the 50 Hz the node assumed.
+#
+# The lag this produced was measured directly by rotating in place and searching for
+# the time offset that best aligns each laser scan against a stationary reference scan
+# (the method in docs/ghost_map_investigation.md): the pose matching the laser data sat
+# ~200ms after the scan's own timestamp, consistently, at 0.15 and 0.3 rad/s and in both
+# directions, and identically under light and full CPU load — a fixed time lag, not a
+# scale or handedness error. During a turn that misregisters every scan by rate x 0.2s
+# (~3.4 deg at 0.3 rad/s), which is what left RTAB-Map's odometry edges disagreeing with
+# its scan-matched loop closures and made it reject every one of them, so the map never
+# self-corrected and accumulated ghost walls.
+PACKET_REMAINDER_BYTES = 77
+
+
 def gyro_bytes_to_signed_int16(byte_pair):
     """Combine a little-endian [lo, hi] byte pair from Kobuki's gyro feedback into one
     signed 16-bit value.
@@ -232,13 +263,16 @@ class Kobuki:
     def read_data():
         while 1:
             if int.from_bytes(Kobuki.seri.read(2), byteorder="little") == 333:
-                __temp = Kobuki.seri.read(200)
+                __temp = Kobuki.seri.read(PACKET_REMAINDER_BYTES)
                 __in_buff = [x for x in __temp]
+                if len(__in_buff) < PACKET_REMAINDER_BYTES:
+                    continue   # short read: don't parse a truncated packet, just resync
 
-                for data in range(0, len(__in_buff) - 1):
-                    if __in_buff[data] == 170 and __in_buff[data + 1] == 85:
-                        Kobuki.__general_purpose_input = __in_buff[data - 19 :]
-
+                # The scan for the next packet's AA 55 header that used to live here only
+                # worked because read(200) over-read into the following packet, which is
+                # exactly the staleness this now avoids — see PACKET_REMAINDER_BYTES. It
+                # fed __general_purpose_input, whose only reader, general_purpose_input_data(),
+                # is not called by any node in this workspace.
                 Kobuki.__basic_sensor = __in_buff[1:16]
                 Kobuki.__docking_IR = __in_buff[15:21]
                 Kobuki.__inertial_sensor = __in_buff[21:30]
