@@ -254,6 +254,8 @@ from botzilla_navigation.frontier_detection import (
 )
 from botzilla_navigation.swept_mask import (
     build_coverage_grid_data,
+    CAMERA_HALF_FOV_RAD,
+    CAMERA_MARK_RANGE_M,
     count_unswept_free,
     create_swept_mask,
     mark_swept_cells,
@@ -398,6 +400,12 @@ SWEEP_FRACTION = 0.15
 # target-selection/snap/reachability-check cycle normally takes. See module docstring.
 SWEEP_RETRIGGER_COOLDOWN_S = 20.0
 
+# Accepted values of the sweep_trigger_mode parameter — see __init__ for what each means.
+# 'interval' (sweep every N seconds) is deliberately not here yet: it is a third policy
+# arm with its own timer, not a re-labelling of existing behaviour, so it lands with that
+# work rather than being stubbed in now.
+SWEEP_TRIGGER_MODES = ('fraction', 'exhaustion')
+
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
 
@@ -413,6 +421,53 @@ class State:
 class FrontierExplorerNode(Node):
     def __init__(self):
         super().__init__('frontier_explorer_node')
+
+        # ── Tunables exposed as ROS parameters ──────────────────────────────
+        # Every default below is exactly the module constant it shadows, so an
+        # unparameterised launch behaves identically to before these existed. They are
+        # parameters so the coverage-policy experiment can vary ONE decision knob at a
+        # time across otherwise-identical stacks — changing the policy by editing
+        # constants would mean each arm ran different code, which is precisely what a
+        # policy comparison must not do.
+        #
+        # sweep_trigger_mode selects when frontier exploration yields to a coverage sweep:
+        #   'fraction'   — interleaved: sweep as soon as un-swept known-free area exceeds
+        #                  sweep_fraction of total known free area (the shipped behaviour).
+        #   'exhaustion' — sequential: never trigger on area; sweep only once no reachable
+        #                  frontier remains. This is the classic explore-then-sweep
+        #                  baseline, and it is what the motivating "how much of the mapped
+        #                  floor did the camera never inspect?" measurement must run under.
+        # 'exhaustion' does not disable sweeping — the "no frontiers remain" and
+        # "all frontiers blacklisted" paths below are untouched, so coverage still
+        # completes and the mission still terminates. It only removes the area-based
+        # interrupt.
+        self.declare_parameter('sweep_trigger_mode', 'fraction')
+        self.declare_parameter('sweep_fraction', SWEEP_FRACTION)
+        self.declare_parameter('sweep_retrigger_cooldown_s', SWEEP_RETRIGGER_COOLDOWN_S)
+        self.declare_parameter('camera_half_fov_rad', CAMERA_HALF_FOV_RAD)
+        self.declare_parameter('camera_mark_range_m', CAMERA_MARK_RANGE_M)
+
+        self._sweep_trigger_mode = self.get_parameter('sweep_trigger_mode').value
+        if self._sweep_trigger_mode not in SWEEP_TRIGGER_MODES:
+            self.get_logger().error(
+                f'Unknown sweep_trigger_mode {self._sweep_trigger_mode!r} — falling back '
+                f"to 'fraction'. Valid modes: {sorted(SWEEP_TRIGGER_MODES)}."
+            )
+            self._sweep_trigger_mode = 'fraction'
+        self._sweep_fraction = self.get_parameter('sweep_fraction').value
+        self._sweep_retrigger_cooldown_s = self.get_parameter(
+            'sweep_retrigger_cooldown_s'
+        ).value
+        self._camera_half_fov_rad = self.get_parameter('camera_half_fov_rad').value
+        self._camera_mark_range_m = self.get_parameter('camera_mark_range_m').value
+
+        self.get_logger().info(
+            f'Coverage policy: sweep_trigger_mode={self._sweep_trigger_mode} '
+            f'sweep_fraction={self._sweep_fraction} '
+            f'cooldown={self._sweep_retrigger_cooldown_s}s '
+            f'camera=+/-{math.degrees(self._camera_half_fov_rad):.1f}deg '
+            f'@{self._camera_mark_range_m}m'
+        )
 
         self._state = State.IDLE
         self._goal_handle = None
@@ -626,6 +681,8 @@ class FrontierExplorerNode(Node):
             self._swept_mask, self._swept_mask_width, self._swept_mask_height,
             msg.info.resolution, msg.info.origin.position.x, msg.info.origin.position.y,
             robot_x, robot_y, robot_yaw,
+            half_fov_rad=self._camera_half_fov_rad,
+            mark_range_m=self._camera_mark_range_m,
         )
 
         coverage_msg = OccupancyGrid()
@@ -773,11 +830,18 @@ class FrontierExplorerNode(Node):
             self._sweep_cooldown_until is not None
             and self.get_clock().now() < self._sweep_cooldown_until
         )
-        if not cooldown_active and should_trigger_sweep(total_free, unswept_free, SWEEP_FRACTION):
+        # 'exhaustion' mode skips the area-based interrupt entirely — sweeping then
+        # happens only via the "no frontiers remain" / "all frontiers blacklisted" paths
+        # above, i.e. classic explore-then-sweep. See sweep_trigger_mode in __init__.
+        if (
+            self._sweep_trigger_mode == 'fraction'
+            and not cooldown_active
+            and should_trigger_sweep(total_free, unswept_free, self._sweep_fraction)
+        ):
             self._begin_coverage_sweep(
                 msg, robot_x, robot_y, frontiers_world,
                 f'un-swept area ({unswept_free}/{total_free} free cells) exceeds '
-                f'{SWEEP_FRACTION * 100:.0f}% of known free space',
+                f'{self._sweep_fraction * 100:.0f}% of known free space',
             )
             return
 
@@ -907,7 +971,8 @@ class FrontierExplorerNode(Node):
             else:
                 self._mode = 'FRONTIER'
                 self._sweep_cooldown_until = (
-                    self.get_clock().now() + Duration(seconds=SWEEP_RETRIGGER_COOLDOWN_S)
+                    self.get_clock().now()
+                    + Duration(seconds=self._sweep_retrigger_cooldown_s)
                 )
                 self.get_logger().info(
                     f'Sweep queue exhausted ({unswept_free} un-swept free cell(s), '

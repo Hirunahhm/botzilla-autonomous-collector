@@ -30,8 +30,17 @@ from botzilla_navigation.frontier_detection import (
     world_to_grid,
 )
 
+# Defaults only. frontier_explorer_node declares both as ROS parameters (defaulting to
+# exactly these values) and passes them in, so an experiment can vary the camera envelope
+# without editing this file — and so the sensor-characterization pass can set them from
+# measurement rather than from the single-frame estimate in the module docstring. Kept as
+# module constants because they are also the honest default for any direct caller
+# (test/test_swept_mask.py included).
 CAMERA_HALF_FOV_RAD = 0.497  # ~28.5 deg, half of the Kinect's ~57 deg horizontal FOV
-CAMERA_MARK_RANGE_M = 1.0    # effective YOLO cube-detection range — see module docstring
+# Effective YOLO cube-detection range — see module docstring. Must stay equal to
+# executor_node.CUBE_MAX_RANGE_M, which gates which detections the mission actually acts
+# on; that constant's comment carries the reasoning and the regression to watch for.
+CAMERA_MARK_RANGE_M = 1.0
 
 
 def create_swept_mask(width, height):
@@ -41,16 +50,19 @@ def create_swept_mask(width, height):
 
 def mark_swept_cells(
     mask, width, height, resolution, origin_x, origin_y, robot_x, robot_y, robot_yaw,
+    half_fov_rad=CAMERA_HALF_FOV_RAD, mark_range_m=CAMERA_MARK_RANGE_M,
 ):
     """Mark cells within the camera's forward wedge of the robot's current pose as swept.
 
-    Scans a CAMERA_MARK_RANGE_M bounding box of grid cells around the robot (in cells,
-    not world units, so the scan cost is independent of map size) and marks each cell
-    True iff it is within CAMERA_MARK_RANGE_M of the robot AND within +/-
-    CAMERA_HALF_FOV_RAD of the robot's heading. Mutates mask in place. Returns the count
-    of cells newly marked this call (for logging).
+    Scans a mark_range_m bounding box of grid cells around the robot (in cells, not world
+    units, so the scan cost is independent of map size) and marks each cell True iff it is
+    within mark_range_m of the robot AND within +/- half_fov_rad of the robot's heading.
+    Mutates mask in place. Returns the count of cells newly marked this call (for logging).
+
+    half_fov_rad/mark_range_m default to the module constants so direct callers and the
+    unit tests need not pass them; frontier_explorer_node passes its ROS parameters.
     """
-    range_cells = max(1, math.ceil(CAMERA_MARK_RANGE_M / resolution))
+    range_cells = max(1, math.ceil(mark_range_m / resolution))
     center_row, center_col = world_to_grid(robot_x, robot_y, resolution, origin_x, origin_y)
 
     newly_marked = 0
@@ -68,11 +80,11 @@ def mark_swept_cells(
                 continue
             cell_x, cell_y = grid_to_world(row, col, resolution, origin_x, origin_y)
             dx, dy = cell_x - robot_x, cell_y - robot_y
-            if math.hypot(dx, dy) > CAMERA_MARK_RANGE_M:
+            if math.hypot(dx, dy) > mark_range_m:
                 continue
             relative_angle = math.atan2(dy, dx) - robot_yaw
             relative_angle = math.atan2(math.sin(relative_angle), math.cos(relative_angle))
-            if abs(relative_angle) > CAMERA_HALF_FOV_RAD:
+            if abs(relative_angle) > half_fov_rad:
                 continue
             mask[i] = True
             newly_marked += 1

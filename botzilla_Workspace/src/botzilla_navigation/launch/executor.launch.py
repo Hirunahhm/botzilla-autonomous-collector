@@ -48,6 +48,18 @@ def generate_launch_description():
     )
     use_sim_time = LaunchConfiguration('use_sim_time')
 
+    # Coverage-policy selector. 'fraction' is the shipped interleaved behaviour and the
+    # default, so a plain `ros2 launch botzilla_navigation executor.launch.py` — and
+    # run_full_mission.sh, which passes only use_sim_time — is unchanged. 'exhaustion'
+    # is the explore-then-sweep baseline used for the "how much mapped floor did the
+    # camera never inspect?" measurement. See frontier_explorer_node's sweep_trigger_mode.
+    sweep_trigger_mode_arg = DeclareLaunchArgument(
+        'sweep_trigger_mode',
+        default_value='fraction',
+        description="Coverage sweep policy: 'fraction' (interleaved) or 'exhaustion'.",
+    )
+    sweep_trigger_mode = LaunchConfiguration('sweep_trigger_mode')
+
     executor = Node(
         package='botzilla_navigation',
         executable='executor_node',
@@ -61,11 +73,15 @@ def generate_launch_description():
         executable='frontier_explorer_node',
         name='frontier_explorer_node',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'sweep_trigger_mode': sweep_trigger_mode,
+        }],
     )
 
     return LaunchDescription([
         use_sim_time_arg,
+        sweep_trigger_mode_arg,
         LogInfo(msg='[executor] Mission: explore -> collect cube -> deliver to HOME'),
         LogInfo(msg='[executor] HOME is latched at startup from map->base_link.'),
         LogInfo(msg='[executor] Place the robot at the drop-off point before starting.'),

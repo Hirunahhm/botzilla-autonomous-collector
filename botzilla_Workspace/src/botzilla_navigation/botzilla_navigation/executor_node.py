@@ -81,13 +81,27 @@ ALIGNMENT_THRESHOLD = 0.03  # normalized; below this we consider the cube centre
 APPROACH_SPEED = 0.15       # m/s while driving toward the cube
 CAPTURE_SPEED = 0.12        # m/s during the final push
 # Ignore detections beyond this, so one noisy frame can't send the robot chasing a
-# cube across the arena. Raised 1.0 -> 1.5 after hardware measurement: a cube sitting
-# a normal distance in front of the robot ranged at 1.09 m and was silently dropped by
-# the old gate while YOLO was reporting it confidently every frame. 1.0 came from
-# final_test_node's scripted small-arena search and is too tight for open exploration.
-# 1.5 still rejects far-field noise, which in a measured frame topped out at 0.138
-# confidence versus 0.797 for the real cube.
-CUBE_MAX_RANGE_M = 1.5
+# cube across the arena. Deliberately EQUAL to swept_mask.CAMERA_MARK_RANGE_M: these two
+# are the same physical quantity — how far the camera can actually find a cube — and they
+# must not disagree. While they did (this was 1.5 while the mask marked at 1.0), a cube at
+# 1.2 m was collectible on ground the coverage map never counted as inspected, which makes
+# "un-swept area" mean two different things depending on which node you ask. If you change
+# one, change the other.
+#
+# History, because this value has moved before and the evidence should not be lost:
+# 1.0 (from final_test_node's scripted small-arena search) -> 1.5, after a hardware
+# measurement where a cube a normal distance in front of the robot ranged at 1.09 m and
+# was silently dropped by the 1.0 gate while YOLO reported it confidently every frame.
+# Far-field noise in that same frame topped out at 0.138 confidence versus 0.797 for the
+# real cube, so 1.5 was safe against false positives.
+#
+# Now back to 1.0 to agree with the mask. WATCH FOR the 1.09 m regression returning:
+# a cube visible in /detected_cube with 1.0 < z < 1.5 that the executor never acts on.
+# The clean fix is not to widen this again unilaterally — it is to set BOTH from the
+# measured detection-probability-vs-range curve. Both are ROS parameters
+# (cube_max_range_m here, camera_mark_range_m on frontier_explorer_node), so that can be
+# tested with a launch argument rather than a rebuild.
+CUBE_MAX_RANGE_M = 1.0
 # Once DETACHING releases a cube, it sits right in front of the robot — well within
 # CUBE_MAX_RANGE_M — so EXPLORING immediately re-detects and re-collects the same
 # cube. A per-cube identity check isn't available (cubes aren't distinguishable), and
@@ -172,6 +186,26 @@ class ExecutorNode(Node):
     def __init__(self):
         super().__init__('executor_node')
 
+        # ── Tunables exposed as ROS parameters ──────────────────────────────
+        # Defaults are exactly the module constants they shadow, so an unparameterised
+        # launch is unchanged. Exposed because the coverage experiment needs to vary the
+        # detection envelope without editing code, and because cube_max_range_m and
+        # frontier_explorer_node's camera_mark_range_m are the same physical quantity and
+        # must be varied together — see CUBE_MAX_RANGE_M's comment for why they are now
+        # both 1.0 m and what to watch for.
+        self.declare_parameter('cube_max_range_m', CUBE_MAX_RANGE_M)
+        self.declare_parameter(
+            'home_cube_suppress_radius_m', HOME_CUBE_SUPPRESS_RADIUS_M
+        )
+        self._cube_max_range_m = self.get_parameter('cube_max_range_m').value
+        self._home_cube_suppress_radius_m = self.get_parameter(
+            'home_cube_suppress_radius_m'
+        ).value
+        self.get_logger().info(
+            f'Cube gating: max_range={self._cube_max_range_m}m '
+            f'home_suppress_radius={self._home_cube_suppress_radius_m}m'
+        )
+
         self._state = State.STARTUP
         self._home = None            # (x, y, yaw) in MAP_FRAME, latched at STARTUP
         self._target_cube = None     # geometry_msgs/Point: x=norm offset, z=metres
@@ -241,7 +275,7 @@ class ExecutorNode(Node):
         # z == 0.0 is the blind-spot sentinel from yolo_node, not a real distance, so
         # it must bypass the range gate — it is precisely the signal that the cube is
         # close enough to capture.
-        if msg.z > CUBE_MAX_RANGE_M:
+        if msg.z > self._cube_max_range_m:
             return
 
         self._target_cube = msg
@@ -539,7 +573,7 @@ class ExecutorNode(Node):
             return False
         dx = pose[0] - self._home[0]
         dy = pose[1] - self._home[1]
-        return (dx * dx + dy * dy) < HOME_CUBE_SUPPRESS_RADIUS_M ** 2
+        return (dx * dx + dy * dy) < self._home_cube_suppress_radius_m ** 2
 
     def _publish_exploration_enabled(self, enabled: bool):
         self._explore_pub.publish(Bool(data=enabled))
