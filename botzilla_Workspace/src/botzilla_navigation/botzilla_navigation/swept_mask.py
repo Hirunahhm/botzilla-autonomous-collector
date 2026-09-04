@@ -43,6 +43,27 @@ CAMERA_HALF_FOV_RAD = 0.497  # ~28.5 deg, half of the Kinect's ~57 deg horizonta
 CAMERA_MARK_RANGE_M = 1.0
 
 
+def is_in_frustum(
+    robot_x, robot_y, robot_yaw, point_x, point_y,
+    half_fov_rad=CAMERA_HALF_FOV_RAD, mark_range_m=CAMERA_MARK_RANGE_M,
+):
+    """Whether world point (point_x, point_y) is inside the camera's detection cone.
+
+    The single definition of "the camera could have seen this spot": within mark_range_m
+    of the robot AND within +/- half_fov_rad of its heading. mark_swept_cells uses it per
+    grid cell to build the coverage map, and mission_metrics_node uses it per ground-truth
+    cube to timestamp first inspection. Those two must agree exactly — a coverage figure
+    and a per-cube inspection time computed from different geometry would not be
+    comparable — so the test lives here once rather than being written twice.
+    """
+    dx, dy = point_x - robot_x, point_y - robot_y
+    if math.hypot(dx, dy) > mark_range_m:
+        return False
+    relative_angle = math.atan2(dy, dx) - robot_yaw
+    relative_angle = math.atan2(math.sin(relative_angle), math.cos(relative_angle))
+    return abs(relative_angle) <= half_fov_rad
+
+
 def create_swept_mask(width, height):
     """Return a flat row-major boolean grid, same dimensions as an OccupancyGrid, all False."""
     return [False] * (width * height)
@@ -79,12 +100,9 @@ def mark_swept_cells(
             if mask[i]:
                 continue
             cell_x, cell_y = grid_to_world(row, col, resolution, origin_x, origin_y)
-            dx, dy = cell_x - robot_x, cell_y - robot_y
-            if math.hypot(dx, dy) > mark_range_m:
-                continue
-            relative_angle = math.atan2(dy, dx) - robot_yaw
-            relative_angle = math.atan2(math.sin(relative_angle), math.cos(relative_angle))
-            if abs(relative_angle) > half_fov_rad:
+            if not is_in_frustum(
+                robot_x, robot_y, robot_yaw, cell_x, cell_y, half_fov_rad, mark_range_m
+            ):
                 continue
             mask[i] = True
             newly_marked += 1
