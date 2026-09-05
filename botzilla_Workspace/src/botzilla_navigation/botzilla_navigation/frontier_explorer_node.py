@@ -230,7 +230,7 @@ modes (so it's already known by the time the sweep queue drains), and
 _dispatch_next_sweep_waypoint's empty-queue check re-evaluates against the live map,
 so a fresh sweep covering the new area can begin immediately once this one finishes.
 
-Snap/self-clearance agreement: COSTMAP_SAFE_COST (50) sits well below the inscribed
+Snap/self-clearance agreement: COSTMAP_SAFE_COST (75) sits well below the inscribed
 cutoff SELF_CLEARANCE_MAX_COST (99), so any cell _snap_to_reachable accepts is by
 construction not a colliding pose. The snap and the arrival check therefore agree, and a
 goal this node picks cannot be one the robot declares itself stuck at on arrival.
@@ -369,22 +369,83 @@ BLACKLIST_COOLDOWN_MAX_S = 3600.0
 # frontier_detection.find_low_cost_point. Well under the 99 inscribed-inflated cutoff so
 # the result is a point Nav2 can actually plan into, not one that merely scrapes under
 # the lethal threshold.
-COSTMAP_SAFE_COST = 50
+#
+# 50 -> 75 (2026-09-05). At 50 the robot would not enter a doorway. Measured live on
+# hardware (run_logs/20260905-180831): every frontier beyond a door was rejected with
+# "no low-cost cell within 10 cells", min costs 53, 53, 66, 74, 77, 80 — all just over
+# the cutoff, with ZERO cells in the region above 80, so nothing there was lethal or
+# even circumscribed. The robot sat idle with 29 frontier clusters visible and 23
+# blacklisted, unable to leave the room it was in.
+#
+# The published costmap is 0-100, not 0-255 (Nav2's cost_translation_table maps internal
+# 253 -> 99 and 254 -> 100), so these numbers convert back to clearance via the inflation
+# curve 252*exp(-3*(d - 0.165)):
+#
+#     published   clearance   vs robot
+#        50        0.391 m    > circumscribed radius 0.419 m ... nearly: can rotate
+#        66        0.298 m    > half-width 0.215 m: fits, 8 cm margin
+#        77        0.246 m    > half-width: fits, 3 cm margin
+#        84        0.215 m    == half-width EXACTLY: no margin
+#        90        0.194 m    < half-width: does NOT fit
+#
+# So 50 was not arbitrary — it approximates the CIRCUMSCRIBED radius (0.419 m), i.e.
+# "somewhere the robot could also spin in place". That is the right rule for open floor
+# and the wrong one for a doorway, which you drive straight through without rotating.
+# 75 gives ~0.26 m clearance: comfortably wider than the 0.215 m half-width, with ~4.5 cm
+# of margin per side, while staying well below the 84 at which the robot stops fitting.
+#
+# This is a pre-filter to avoid spending a path-check on hopeless targets, NOT the safety
+# mechanism: Nav2's planner still does full polygon collision checking, and a target it
+# genuinely cannot reach fails the reachability check and gets blacklisted as before.
+COSTMAP_SAFE_COST = 75
 COSTMAP_SEARCH_RADIUS_CELLS = 10
 
 # Self-clearance check — see module docstring's "Self-clearance" section. This is the
 # published-OccupancyGrid value of INSCRIBED_INFLATED_OBSTACLE: a cell reaches it exactly
 # when a lethal obstacle lies within the robot's inscribed radius, so for the circular
 # footprint nav2_params.yaml configures, "centre cell >= 99" IS the collision test the
-# planner itself uses. Deliberately not COSTMAP_SAFE_COST's stricter 50 — this asks "am I
+# planner itself uses. Deliberately not COSTMAP_SAFE_COST's stricter 75 — this asks "am I
 # actually in collision," not "is this a comfortable place to aim for."
 SELF_CLEARANCE_MAX_COST = 99
 
-# Coverage sweep — see module docstring's "Coverage sweep" section. Row spacing/min run
-# length aren't yet tuned against the Kinect's FOV (swept_mask.CAMERA_HALF_FOV_RAD /
-# CAMERA_MARK_RANGE_M) — that's a follow-up tuning pass once this interleaved design is
-# validated live, not part of this change.
-SWEEP_ROW_SPACING_M = 0.5
+# Coverage sweep — see module docstring's "Coverage sweep" section.
+#
+# 0.5 -> 0.85 (2026-09-05). The old value was an explicit placeholder ("aren't yet tuned
+# against the Kinect's FOV — a follow-up tuning pass once this interleaved design is
+# validated live"). This is that pass, and the placeholder was costing ~47% of the sweep's
+# distance to redundant re-coverage.
+#
+# Derivation. While the robot drives in a straight line, the union of its camera frustums
+# is a band whose half-width is CAMERA_MARK_RANGE_M * sin(CAMERA_HALF_FOV_RAD) — the
+# widest lateral offset any frustum reaches. With the shipped 1.0 m / 28.5 deg that is
+# 0.470 m, so the continuous swept swath is 0.940 m wide. Verified by sampling
+# swept_mask.is_in_frustum along a straight path rather than trusting the algebra: max
+# lateral reach 0.470 m, matching 2*R*sin(halfFOV) = 0.954 m to within a cell.
+#
+#     spacing   overlap   path length vs zero-overlap
+#      0.50 m     47%        1.88x     <- previous value
+#      0.70 m     26%        1.34x
+#      0.85 m     10%        1.11x     <- chosen
+#      0.94 m      0%        1.00x
+#
+# 0.85 keeps ~10% overlap as margin for pose error and for yaw wobble at waypoints (the
+# robot does not arrive perfectly aligned with the row), which matters here because
+# RTAB-Map is accepting no loop closures and the map frame is drift-accumulating
+# odometry. Going to the full 0.94 m would assume a pose accuracy this stack has not
+# demonstrated.
+#
+# Measured impact this was correcting: arm D's coverage efficiency FELL as runs got
+# longer — 0.71 %/m at 48 m (run_logs/20260905-192431) but 0.52 %/m at 117 m
+# (20260905-211626) — because a larger share of later distance went into re-covering
+# ground already inspected. Arm A, which never reaches the sweep, held 0.71 %/m. The
+# untuned stride was therefore not a minor inefficiency but was inverting the
+# arm-A-vs-arm-D comparison the experiment exists to make.
+#
+# Derived from the camera constants rather than hardcoded, so changing camera_mark_range_m
+# or camera_half_fov_rad cannot silently leave the stride stale the way it just did.
+SWEEP_SWATH_WIDTH_M = 2.0 * CAMERA_MARK_RANGE_M * math.sin(CAMERA_HALF_FOV_RAD)
+SWEEP_ROW_OVERLAP = 0.10
+SWEEP_ROW_SPACING_M = round(SWEEP_SWATH_WIDTH_M * (1.0 - SWEEP_ROW_OVERLAP), 2)  # 0.86 m
 SWEEP_MIN_RUN_M = 0.3
 
 # Sweep once un-swept known-free area exceeds this fraction of total known free area — a
@@ -446,6 +507,8 @@ class FrontierExplorerNode(Node):
         self.declare_parameter('sweep_retrigger_cooldown_s', SWEEP_RETRIGGER_COOLDOWN_S)
         self.declare_parameter('camera_half_fov_rad', CAMERA_HALF_FOV_RAD)
         self.declare_parameter('camera_mark_range_m', CAMERA_MARK_RANGE_M)
+        self.declare_parameter('costmap_safe_cost', COSTMAP_SAFE_COST)
+        self.declare_parameter('sweep_row_spacing_m', SWEEP_ROW_SPACING_M)
 
         self._sweep_trigger_mode = self.get_parameter('sweep_trigger_mode').value
         if self._sweep_trigger_mode not in SWEEP_TRIGGER_MODES:
@@ -460,6 +523,8 @@ class FrontierExplorerNode(Node):
         ).value
         self._camera_half_fov_rad = self.get_parameter('camera_half_fov_rad').value
         self._camera_mark_range_m = self.get_parameter('camera_mark_range_m').value
+        self._costmap_safe_cost = self.get_parameter('costmap_safe_cost').value
+        self._sweep_row_spacing_m = self.get_parameter('sweep_row_spacing_m').value
 
         self.get_logger().info(
             f'Coverage policy: sweep_trigger_mode={self._sweep_trigger_mode} '
@@ -897,7 +962,7 @@ class FrontierExplorerNode(Node):
         See COSTMAP_SAFE_COST module comment for why this is necessary. Returns a world
         (x, y) tuple, or None if no low-cost cell exists within COSTMAP_SEARCH_RADIUS_CELLS.
 
-        COSTMAP_SAFE_COST (50) is comfortably below the inscribed cutoff, so a cell that
+        COSTMAP_SAFE_COST (75) is comfortably below the inscribed cutoff, so a cell that
         passes this snap is by construction not a colliding pose either — the snap and
         _is_self_clear agree rather than pulling against each other.
         """
@@ -908,7 +973,8 @@ class FrontierExplorerNode(Node):
         )
         snapped = find_low_cost_point(
             cm.data, cm.info.width, cm.info.height, row, col,
-            max_cost=COSTMAP_SAFE_COST, search_radius=COSTMAP_SEARCH_RADIUS_CELLS
+            max_cost=self._costmap_safe_cost,
+            search_radius=COSTMAP_SEARCH_RADIUS_CELLS,
         )
         if snapped is None:
             return None
@@ -1092,7 +1158,7 @@ class FrontierExplorerNode(Node):
             self._sweep_queue = generate_coverage_waypoints(
                 msg.data, msg.info.width, msg.info.height, msg.info.resolution,
                 msg.info.origin.position.x, msg.info.origin.position.y,
-                row_spacing_m=SWEEP_ROW_SPACING_M, min_run_m=SWEEP_MIN_RUN_M,
+                row_spacing_m=self._sweep_row_spacing_m, min_run_m=SWEEP_MIN_RUN_M,
                 swept_mask=self._swept_mask,
             )
             self.get_logger().info(

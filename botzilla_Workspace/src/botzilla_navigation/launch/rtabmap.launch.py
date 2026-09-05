@@ -85,7 +85,24 @@ def generate_launch_description():
         'qos_camera_info': 2,
         'qos_scan': 2,
         'qos_odom': 1,
-        'Reg/Strategy': '1',       # ICP + Visual (best obstacle avoidance + loop closure)
+        # RTAB-Map's own enum (librtabmap_core 0.22.1): 0=Vis, 1=Icp, 2=VisIcp.
+        # This was '1' with the comment "ICP + Visual" next to it — the comment described
+        # strategy 2 while the value selected ICP alone, so visual registration never
+        # contributed to loop closure verification.
+        #
+        # Measured on hardware 2026-09-05 (run_logs/20260905-174127, 921s, 31.2m travelled):
+        # 19 loop closures DETECTED, 0 ACCEPTED. Place recognition was working — candidates
+        # came with 72-85 feature matches — but geometric verification produced two distinct
+        # failure populations: nine hard 0/20 inliers, and near-misses at 14/20 and 16/20.
+        # A map frame with zero closures is drift-accumulating odometry, which matters here
+        # beyond navigation: the camera-coverage mask is painted at those poses, so pose
+        # drift smears the very quantity the research measures.
+        'Reg/Strategy': '2',       # Vis+Icp
+        # Default is 20, which rejected the 14- and 16-inlier near-misses above. Lowered to
+        # convert those without opening the door to the 0-inlier population, which is a
+        # different failure (bad geometry, not a strict threshold) and stays rejected either
+        # way. If false closures start warping the map, raise this first.
+        'Vis/MinInliers': '15',
         'Reg/Force3DoF': 'true',   # ground robot: x, y, yaw only
         'Grid/RangeMax': '10.0',
         # value_type=str is required: RTAB-Map's own parameters are all strings, but a
