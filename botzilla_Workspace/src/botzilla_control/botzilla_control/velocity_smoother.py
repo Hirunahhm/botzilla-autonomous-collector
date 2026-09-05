@@ -169,6 +169,24 @@ REVERSAL_CONFIRM_CYCLES = 3
 REVERSAL_DEADBAND_X = 0.025       # m/s
 REVERSAL_DEADBAND_THETA = 0.05    # rad/s
 
+# BOTH of the above are sized against the PHYSICAL base's mechanical deadband (measured:
+# 0.009 m/s linear, 0.121 rad/s angular). That is what makes discarding a smaller command
+# free on hardware — the wheels would not have turned for it anyway.
+#
+# Simulation has no mechanical deadband: Gazebo delivers 0.021 rad/s exactly. There the
+# same collapse throws away a command the robot COULD have executed, and that deadlocks
+# it. Observed live in Gazebo: DWB needing a small heading correction emits alternating
+# +/-0.021 rad/s, every one is a reversal under REVERSAL_DEADBAND_THETA and is collapsed
+# to zero, the robot never rotates, the heading error never shrinks, so DWB emits the same
+# correction forever. From outside that looks like a robot frozen in open floor with no
+# obstacle in front of it — confirmed at the time with 2.37 m of clear space ahead, zero
+# ObstacleFootprint vetoes (0/9828 forward trajectories) and cost 0 across the whole
+# footprint. Nothing else was wrong; only this.
+#
+# So both are ROS parameters, defaulting to exactly the constants above (hardware
+# behaviour is unchanged), and nav2.launch.py passes near-zero values when
+# use_sim_time:=true. See SIM_REVERSAL_DEADBAND_* there.
+
 
 class VelocitySmoother(Node):
     """Acceleration-limits 'cmd_vel_nav' onto 'cmd_vel' — see the module docstring."""
@@ -176,6 +194,19 @@ class VelocitySmoother(Node):
     def __init__(self):
         """Wire up the input subscription, output publisher, and the two timers."""
         super().__init__('velocity_smoother')
+
+        # Deadbands below which an opposing command is treated as dithering and collapsed
+        # to zero. Defaults are the hardware-measured constants, so an unparameterised
+        # launch behaves exactly as before; sim passes near-zero. See the constants' block
+        # comment for why the two platforms must differ here.
+        self.declare_parameter('reversal_deadband_x', REVERSAL_DEADBAND_X)
+        self.declare_parameter('reversal_deadband_theta', REVERSAL_DEADBAND_THETA)
+        self._reversal_deadband_x = self.get_parameter('reversal_deadband_x').value
+        self._reversal_deadband_theta = self.get_parameter('reversal_deadband_theta').value
+        self.get_logger().info(
+            f'Reversal deadbands: x={self._reversal_deadband_x} m/s '
+            f'theta={self._reversal_deadband_theta} rad/s'
+        )
 
         self._target = Twist()      # latest command from Nav2
         self._output = Twist()      # what we last published (the ramp's current state)
@@ -329,9 +360,10 @@ class VelocitySmoother(Node):
                 return
 
         goal_x = self._confirm_reversal(
-            'x', self._output.linear.x, self._target.linear.x, REVERSAL_DEADBAND_X)
+            'x', self._output.linear.x, self._target.linear.x, self._reversal_deadband_x)
         goal_th = self._confirm_reversal(
-            'theta', self._output.angular.z, self._target.angular.z, REVERSAL_DEADBAND_THETA)
+            'theta', self._output.angular.z, self._target.angular.z,
+            self._reversal_deadband_theta)
 
         self._output.linear.x = self._ramp(
             self._output.linear.x, goal_x, MAX_ACCEL_X, MAX_DECEL_X, self._period)

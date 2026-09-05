@@ -55,6 +55,20 @@ from launch_ros.actions import Node
 
 SIM_PARAMS_FILENAME = 'nav2_params_sim.yaml'
 
+# velocity_smoother collapses an opposing command smaller than its reversal deadband to
+# zero, on the reasoning that the physical base could not have executed it anyway (measured
+# mechanical deadband: 0.009 m/s, 0.121 rad/s). Simulation has no such deadband, so those
+# same commands ARE executable there and discarding them deadlocks the robot: DWB emits
+# alternating +/-0.021 rad/s heading corrections, every one is collapsed, the robot never
+# turns, and the correction never stops being needed. Confirmed live in Gazebo with 2.37 m
+# of clear floor ahead and zero ObstacleFootprint vetoes — the robot simply stops.
+#
+# Near-zero rather than exactly zero: the reversal-confirmation path (3 cycles) is still
+# wanted for genuine direction changes, and only the "too small to be real intent"
+# shortcut needs disabling. Hardware keeps the node's own defaults.
+SIM_REVERSAL_DEADBAND_X = 0.002       # m/s
+SIM_REVERSAL_DEADBAND_THETA = 0.005   # rad/s
+
 
 def _resolve_param_files(context):
     """Build the ordered params list, appending the sim overlay when running on sim time.
@@ -121,12 +135,18 @@ def _launch_nav2(context, *_args, **_kwargs):
     # Deliberately not a lifecycle node: it must be transporting velocity before and after
     # the managed nodes transition, and adding it to lifecycle_nodes would make the whole
     # navigation bringup fail if it were absent.
+    # Reversal deadbands are overridden ONLY on sim time — see SIM_REVERSAL_DEADBAND_*.
+    # On hardware the parameters are left unset so the node's own measured defaults apply.
+    smoother_params = {'use_sim_time': use_sim_time}
+    if use_sim_time:
+        smoother_params['reversal_deadband_x'] = SIM_REVERSAL_DEADBAND_X
+        smoother_params['reversal_deadband_theta'] = SIM_REVERSAL_DEADBAND_THETA
     nodes.append(Node(
         package='botzilla_control',
         executable='velocity_smoother',
         name='velocity_smoother',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
+        parameters=[smoother_params],
     ))
 
     nodes.append(Node(

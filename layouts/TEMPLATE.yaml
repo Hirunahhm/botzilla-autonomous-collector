@@ -1,0 +1,48 @@
+# Ground-truth cube positions for a measurement run.
+#
+#   ./run_full_mission.sh --policy exhaustion --layout layouts/arena_a.yaml
+#
+# Copy this file per physical arrangement (arena_a.yaml, arena_b.yaml, ...). Each
+# one is a "layout" in the experiment design: every policy arm is run against the
+# same set of layouts so the comparison is paired.
+#
+# ─── THE FRAME. READ THIS BEFORE MEASURING ANYTHING ──────────────────────────
+#
+# Coordinates are in the `map` frame, and RTAB-Map puts the map origin at
+# WHEREVER THE ROBOT HAPPENED TO BE WHEN SLAM STARTED. There is no external
+# reference. So:
+#
+#   * Tape a mark on the floor for the robot's start position AND heading, and
+#     start every run of the campaign from it. A start pose that drifts between
+#     runs silently invalidates every layout file.
+#   * +x is straight ahead of the robot at that start pose.
+#   * +y is to its LEFT (ROS REP-103, right-handed, z up).
+#   * Units are metres.
+#
+# Measure cube positions relative to that taped mark, not to a wall or a corner.
+#
+# ─── WHAT THIS IS FOR ────────────────────────────────────────────────────────
+#
+# mission_metrics_node uses these positions to record `cube_inspected` — the first
+# moment each cube entered the camera frustum, whether or not YOLO detected it and
+# whether or not the robot went on to collect it.
+#
+# That separation is the point of the experiment. `cube_inspected` measures what
+# the exploration policy did; `cube_detected` measures what YOLO managed to do with
+# it. Inspection is the primary metric precisely because collection is gated behind
+# detector gaps and TARGETING aborts whose failure rate would otherwise swamp any
+# difference between policies.
+#
+# A missing or mistyped layout is NOT a crash — the node warns and keeps going, so
+# it can never take down a mission. run_full_mission.sh checks the path up front
+# instead, because a run recorded with zero ground-truth cubes looks completely
+# healthy right up until you try to analyse it.
+#
+# `id` is optional (defaults to position in the list) but worth setting explicitly:
+# it is the key in `inspection_times_s`, so stable ids let one cube be tracked
+# across layouts.
+
+cubes:
+  - {id: 1, x: 2.0, y: 0.5}
+  - {id: 2, x: -1.0, y: 1.5}
+  - {id: 3, x: 0.5, y: -2.2}
