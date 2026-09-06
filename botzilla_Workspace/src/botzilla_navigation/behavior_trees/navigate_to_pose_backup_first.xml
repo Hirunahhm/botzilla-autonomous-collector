@@ -1,33 +1,41 @@
 <!--
-  Copy of Nav2's stock navigate_to_pose_w_replanning_and_recovery.xml with exactly
-  one change: ComputePathToPose's planner_id is hard-coded to "SweepStraight"
-  instead of reading {selected_planner}, and the PlannerSelector node that would
-  have written that blackboard entry is gone.
+  Nav2's stock navigate_to_pose_w_replanning_and_recovery.xml with exactly one
+  change: the RecoveryActions RoundRobin tries BackUp BEFORE Spin, instead of
+  Spin -> Wait -> BackUp.
 
-  Used only for the row-traversal legs of the camera-coverage sweep, selected
-  per-goal via NavigateToPose's `behavior_tree` field (see
-  frontier_explorer_node._send_goal). Doing it per-goal matters: the obvious
-  alternative — publishing to PlannerSelector's `planner_selector` topic — is
-  global mutable state shared by every goal sender on the robot, so a sweep leg
-  would silently leave SweepStraight selected for executor_node's next
-  DELIVERING goal to HOME and try to plan a straight line through the walls.
-  The `behavior_tree` field travels with the goal, so it cannot leak that way.
+  Why: this robot cannot pivot in a tight spot. The footprint's circumscribed
+  radius is sqrt(0.36^2 + 0.215^2) = 0.419 m, so an in-place turn needs 0.84 m of
+  clear DIAMETER — and that is dominated by the 0.36 m arm reach, not by the
+  footprint padding, so it cannot be tuned away. Measured live in run 18
+  (2026-09-06) at a deadlock: Spin aborted with "Collision Ahead - Exiting Spin"
+  5 times, while rear clearance was 0.934 m and the footprint reversed 0.30 m
+  scored cost 80 — comfortably drivable. Spin-first therefore spends two of the
+  three round-robin slots (Spin, then Wait) on manoeuvres the geometry forbids
+  before reaching the one that works.
 
-  Everything else (1 Hz replanning, the planner/controller recovery subtrees) is
-  deliberately identical to the stock tree so sweep legs degrade the same way
-  normal navigation does — including the recovery RoundRobin, which now tries
-  BackUp before Spin here exactly as it does in navigate_to_pose_backup_first.xml
-  (see that file for the measurements; the two must stay in step or sweep legs
-  and ordinary goals would recover differently).
+  Backing up also RELIEVES the geometry rather than fighting it: once the robot
+  has 0.30 m more room, the subsequent Spin has a chance of succeeding, so the
+  reorder makes the later slots more useful too.
+
+  Set as bt_navigator's default_nav_to_pose_bt_xml. That matters — in run 18,
+  32 of 41 goals (78%) used the DEFAULT tree, not the sweep tree, so reordering
+  only navigate_to_pose_sweep_straight.xml would have missed most of them.
+-->
+
+<!--
+  This Behavior Tree replans the global path periodically at 1 Hz and it also has
+  recovery actions specific to planning / control as well as general system issues.
+  This will be continuous if a kinematically valid planner is selected.
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <ComputePathToPose goal="{goal}" path="{path}" planner_id="SweepStraight" error_code_id="{compute_path_error_code}"/>
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
             <Sequence>
               <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
               <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>

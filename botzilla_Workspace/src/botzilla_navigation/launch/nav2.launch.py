@@ -113,9 +113,26 @@ def _launch_nav2(context, *_args, **_kwargs):
     # planner_server/bt_navigator publish no velocity, so remapping them is harmless but
     # pointless — keep the remap targeted so the topic graph stays readable.
     velocity_publishers = {'controller_server', 'behavior_server'}
+    # Recovery order: BackUp before Spin. Set here rather than in nav2_params.yaml
+    # because the value has to be an absolute path, which only resolves at launch.
+    # Scoped to bt_navigator alone for the same reason the cmd_vel remap is scoped —
+    # keep per-node settings off nodes that have no use for them.
+    #
+    # Without this, bt_navigator falls back to nav2's built-in tree and the reorder
+    # reaches almost nothing: in run 18, 32 of 41 goals (78%) went through the DEFAULT
+    # tree, and only 9 through navigate_to_pose_sweep_straight.xml. See that file and
+    # navigate_to_pose_backup_first.xml for why Spin-first is wrong on this robot.
+    default_bt = os.path.join(
+        get_package_share_directory('botzilla_navigation'),
+        'behavior_trees', 'navigate_to_pose_backup_first.xml',
+    )
     nodes = [
         Node(
-            package=pkg, executable=exe, name=exe, output='screen', parameters=params,
+            package=pkg, executable=exe, name=exe, output='screen',
+            parameters=(
+                params + [{'default_nav_to_pose_bt_xml': default_bt}]
+                if exe == 'bt_navigator' else params
+            ),
             remappings=([('cmd_vel', 'cmd_vel_nav')] if exe in velocity_publishers else []),
         )
         for pkg, exe in servers

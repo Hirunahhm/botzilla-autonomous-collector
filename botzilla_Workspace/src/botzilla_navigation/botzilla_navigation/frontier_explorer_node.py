@@ -296,6 +296,29 @@ EVAL_PERIOD_S = 2.0
 NO_PROGRESS_TIMEOUT_S = 30.0
 PROGRESS_EPSILON_M = 0.15
 
+# A Nav2 recovery (BackUp/Spin/Wait) deliberately does not reduce distance_remaining,
+# so the no-progress watchdog above reads a running recovery as a stall and cancels the
+# goal — killing the one mechanism built to break the deadlock it is reacting to.
+# Observed in run 18 (2026-09-06): 47 recoveries were attempted (23 spin, 19 backup,
+# 5 wait) across a run in which 19 stalls consumed 63% of the mission wall-clock.
+#
+# NavigateToPose feedback carries number_of_recoveries, so a recovery starting is
+# directly observable without subscribing to the behavior server. Each increment
+# refreshes the progress clock, and the whole recovery phase is bounded by a TIME
+# budget measured from the first recovery of the current goal.
+#
+# A time budget, not a count of graces. Counting was tried first and failed in run 19:
+# number_of_recoveries also increments for the ClearingActions costmap-clear subtree,
+# which completes instantly, so 7 increments landed in ~9 s and burned every grace
+# before the first real motion behaviour (`Running backup`) had even started. Elapsed
+# time is the honest currency — fast clear-driven increments just refresh the same
+# window instead of consuming a scarce one.
+#
+# 90 s covers many rounds of the RoundRobin (BackUp ~2.6 s measured, Spin ~7 s, Wait
+# 5 s) while keeping the worst case at 90 + NO_PROGRESS_TIMEOUT_S = 120 s, far below
+# GOAL_ABS_TIMEOUT_S (420 s). A goal still recovering after 90 s is not recovering.
+RECOVERY_BUDGET_S = 90.0
+
 # Absolute backstop regardless of the progress signal, for the degenerate case where
 # feedback never arrives at all. Set well above the ~300s worst-case Nav2-internal abort
 # latency observed live, so it only ever fires if the progress watchdog itself is broken.
@@ -642,6 +665,8 @@ class FrontierExplorerNode(Node):
         self._goal_epoch = 0  # bumped per NavigateToPose attempt; guards stale callbacks
         self._cancel_requested = False  # avoid re-issuing cancel_goal_async every tick
         self._last_progress_distance = None  # smallest distance_remaining seen so far
+        self._recoveries_seen = 0        # last number_of_recoveries from feedback
+        self._first_recovery_time = None  # start of this goal's recovery phase
         self._last_progress_time = None  # rclpy.time.Time it was last improved
         self._blacklist = []  # list of (x, y, expiry_time: rclpy.time.Time) — active bans
         # Snapped sweep nav points that failed: (x, y, expiry). See
@@ -823,6 +848,8 @@ class FrontierExplorerNode(Node):
         self._goal_start_time = None
         self._path_check_start_time = None
         self._last_progress_distance = None
+        self._recoveries_seen = 0
+        self._first_recovery_time = None
         self._last_progress_time = None
         self._stuck_since = None
         self._recovery_start_time = None
@@ -1537,6 +1564,8 @@ class FrontierExplorerNode(Node):
             self._frontier_origin = None
             self._goal_start_time = None
             self._last_progress_distance = None
+            self._recoveries_seen = 0
+            self._first_recovery_time = None
             self._last_progress_time = None
             self._state = State.IDLE
             return
@@ -1831,6 +1860,8 @@ class FrontierExplorerNode(Node):
         self._goal_start_time = self.get_clock().now()
         self._cancel_requested = False
         self._last_progress_distance = None
+        self._recoveries_seen = 0
+        self._first_recovery_time = None
         self._last_progress_time = None
         self._goal_epoch += 1
         epoch = self._goal_epoch
@@ -1848,6 +1879,34 @@ class FrontierExplorerNode(Node):
         ):
             self._last_progress_distance = remaining
             self._last_progress_time = self.get_clock().now()
+            return
+
+        # No distance progress this tick. Before treating that as a stall, check whether
+        # Nav2 has just entered a recovery — see RECOVERY_BUDGET_S. A recovery holds
+        # distance_remaining flat by design, so without this the watchdog cancels the
+        # goal partway through the manoeuvre that was about to unstick it.
+        recoveries = feedback_msg.feedback.number_of_recoveries
+        if recoveries <= self._recoveries_seen:
+            return
+        self._recoveries_seen = recoveries
+        now = self.get_clock().now()
+        if self._first_recovery_time is None:
+            self._first_recovery_time = now
+        spent_s = (now - self._first_recovery_time).nanoseconds / 1e9
+        if spent_s <= RECOVERY_BUDGET_S:
+            self._last_progress_time = now
+            self.get_logger().info(
+                f'Nav2 recovery #{recoveries}; holding off the stall watchdog '
+                f'({spent_s:.0f}/{RECOVERY_BUDGET_S:.0f}s of recovery budget used).',
+                throttle_duration_sec=5.0,
+            )
+        else:
+            self.get_logger().warn(
+                f'Nav2 recovery #{recoveries} but this goal has been recovering for '
+                f'{spent_s:.0f}s (budget {RECOVERY_BUDGET_S:.0f}s); letting the stall '
+                f'watchdog run.',
+                throttle_duration_sec=10.0,
+            )
 
     def _goal_response_cb(self, future, epoch):
         goal_handle = future.result()
@@ -1871,6 +1930,8 @@ class FrontierExplorerNode(Node):
             self._frontier_origin = None
             self._goal_start_time = None
             self._last_progress_distance = None
+            self._recoveries_seen = 0
+            self._first_recovery_time = None
             self._last_progress_time = None
             return
         self._goal_handle = goal_handle
@@ -1899,6 +1960,8 @@ class FrontierExplorerNode(Node):
         self._goal_start_time = None
         self._cancel_requested = False
         self._last_progress_distance = None
+        self._recoveries_seen = 0
+        self._first_recovery_time = None
         self._last_progress_time = None
         self._state = State.IDLE
 
