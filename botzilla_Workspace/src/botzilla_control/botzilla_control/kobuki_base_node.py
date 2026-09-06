@@ -3,7 +3,8 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import BatteryState, Imu
+from std_msgs.msg import Int16MultiArray
 import math
 import time
 
@@ -247,6 +248,26 @@ class KobukiBaseNode(Node):
         self._gyro_calibrated = False
         self.create_timer(0.02, self._imu_update)     # 50 Hz
 
+        # ── Drivetrain health ────────────────────────────────────────────────
+        # The base already reports both of these on every basic-sensor packet and
+        # nothing was surfacing them, which left a real failure mode invisible: the
+        # yaw feed-forward below models this unit's mechanical deadband as
+        # actual = YAW_FF_GAIN * (cmd - YAW_FF_DEADBAND), fitted at R^2 = 0.997, but
+        # that fit is only valid for the battery state it was measured at. Motor
+        # torque falls as the pack drains, which raises effective stiction, so the
+        # curve silently stops describing the hardware and commanded rotation is
+        # under-delivered. Measured live on 2026-09-06: a commanded 0.400 rad/s came
+        # out of the base at 0.092 rad/s with the whole software chain verified
+        # faithful end to end, and there was no way to correlate it against voltage.
+        #
+        # PWM matters as much as voltage here, because together they separate the two
+        # explanations: high PWM with little motion means the wheels are loaded or
+        # stuck, while low PWM means the driver never asked for enough in the first
+        # place. 5 Hz is plenty for both — they are trend signals, not control inputs.
+        self._battery_pub = self.create_publisher(BatteryState, 'battery', 10)
+        self._pwm_pub = self.create_publisher(Int16MultiArray, 'wheel_pwm', 10)
+        self.create_timer(0.2, self._diagnostics_update)   # 5 Hz
+
         # ── Closed-loop velocity control (see CONTROL_PERIOD_S comment block) ──
         # Declared as parameters so the deadband curve can be re-measured and tuned without
         # a rebuild — set feedforward gains to 0 and kp/ki to 0 to characterise open loop.
@@ -258,6 +279,15 @@ class KobukiBaseNode(Node):
         self.declare_parameter('yaw_ki', YAW_RATE_KI_DEFAULT)
         self.declare_parameter('lin_kp', LIN_VEL_KP_DEFAULT)
         self.declare_parameter('lin_ki', LIN_VEL_KI_DEFAULT)
+
+        # Turn radius below which the driver pivots instead of arcing — see the
+        # rotate_flag block in _control_update for why the distinction matters.
+        # Exposed as a parameter so the threshold can be A/B'd against the old
+        # behaviour on the same battery state without a rebuild: setting it to a
+        # near-zero epsilon reproduces the original `linear == 0.0` test exactly,
+        # because a pure-rotation command has a turn radius of 0 and everything
+        # else has a radius comfortably above any epsilon.
+        self.declare_parameter('pivot_radius_m', WHEEL_BASE_M / 2.0)
 
         self._cmd_lin = 0.0          # setpoint from cmd_vel
         self._cmd_ang = 0.0
@@ -455,6 +485,40 @@ class KobukiBaseNode(Node):
 
     # ── Velocity command ─────────────────────────────────────────────────────
 
+    def _diagnostics_update(self):
+        """Publish battery voltage and per-wheel PWM — see the publisher setup comment."""
+        try:
+            sensor = self.robot.basic_sensor_data()
+        except Exception:
+            return   # __basic_sensor not populated yet, same guard as _odom_update
+
+        raw_v = sensor.get('Batteryvolt')
+        if raw_v is not None:
+            msg = BatteryState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            # Kobuki reports battery in 0.1 V units in a single byte.
+            msg.voltage = float(raw_v) * 0.1
+            # 4S Li-ion: ~16.5 V charged, ~13.2 V is the documented low-battery point.
+            # Reported as a rough fraction only, for trend watching, not for gating.
+            msg.percentage = max(0.0, min(1.0, (msg.voltage - 13.2) / (16.5 - 13.2)))
+            msg.present = True
+            msg.power_supply_status = (
+                BatteryState.POWER_SUPPLY_STATUS_CHARGING
+                if str(sensor.get('Charger', '')).endswith('CHARGING')
+                else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+            )
+            self._battery_pub.publish(msg)
+
+        left, right = sensor.get('LeftPWM'), sensor.get('RightPWM')
+        if left is not None and right is not None:
+            # Signed 8-bit: the base reports these as raw bytes.
+            pwm = Int16MultiArray()
+            pwm.data = [
+                left - 256 if left > 127 else left,
+                right - 256 if right > 127 else right,
+            ]
+            self._pwm_pub.publish(pwm)
+
     def cmd_vel_callback(self, msg):
         """Store the velocity setpoint; _control_update does the hardware write."""
         self._cmd_lin = msg.linear.x    # Forward/Backward speed (m/s)
@@ -565,7 +629,48 @@ class KobukiBaseNode(Node):
         # velocity, not the post-correction output: out_lin can pick up a small nonzero
         # value from the controller during an in-place turn, and that must not silently
         # switch the driver out of rotation mode.
-        rotate_flag = 1 if self._cmd_lin == 0.0 and angular_z != 0.0 else 0
+        #
+        # The test is the turn RADIUS, not "linear is exactly zero". This used to read
+        # `self._cmd_lin == 0.0`, which meant any linear component at all — however
+        # tiny — dropped the base into arc mode, and the two branches of Kobuki.move()
+        # scale their speed argument completely differently:
+        #   rotation: botspeed = |R - L| / 2      the TANGENTIAL WHEEL speed  (~66 mm/s)
+        #   arc:      botspeed = (L + R) / 2      the ROBOT CENTRE speed      (~20 mm/s)
+        # For a near-pivot those describe near-identical motion, but the arc form asks
+        # for a fraction of the magnitude, and the base's own low-speed threshold then
+        # swallows it. At lin 0.0105 / ang 0.400 the rotation branch asks for 46 mm/s
+        # and the arc branch for 10.5 mm/s — same intended motion, 4.4x less command.
+        #
+        # A/B measured on the bench 2026-09-06, both arms back to back at 15.9 V, yaw
+        # read from the gyro (independent of the wheel model under test), achieved
+        # rad/s as a fraction of commanded:
+        #     lin      ang     radius   old test   radius test
+        #   0.0000    0.400     0.000     1.01        1.04
+        #   0.0105   -0.400     0.026     0.16        1.03
+        #   0.0300    0.400     0.075     0.36        1.01
+        #   0.0600   -0.400     0.150     0.79        0.78   <- true arc, unchanged
+        #   0.0105    0.800     0.013     0.09        1.01
+        # The 0.150 m row is the control: it is a genuine arc under both tests, and it
+        # comes out identical, so the change is confined to the near-pivot regime.
+        # Note the loss worsens as commanded yaw rises (0.09 at 0.800 rad/s) — that is
+        # precisely DWB's turn-hard regime.
+        #
+        # Nav2 emits exactly that combination constantly — DWB rarely outputs a linear
+        # velocity of precisely 0.0 while turning — so in a mission almost every turn was
+        # taking the degraded path. That is what produced the repeated "no progress for
+        # 31s" stalls: the robot was commanded to turn, reported as turning by the
+        # controller, and physically barely moved. Reproducing at 15.9 V also rules out
+        # the battery-droop explanation that was chased first.
+        #
+        # Radius below half the wheelbase means the turn centre lies inside the robot's
+        # own footprint, i.e. it is a pivot in all but name, so the linear term being
+        # discarded by the rotation branch is negligible — and far cheaper than losing
+        # most of the commanded yaw.
+        turn_radius = (
+            abs(self._cmd_lin / self._cmd_ang) if self._cmd_ang != 0.0 else float('inf')
+        )
+        pivot_radius = self.get_parameter('pivot_radius_m').value
+        rotate_flag = 1 if angular_z != 0.0 and turn_radius < pivot_radius else 0
 
         self.robot.move(int(left_wheel_speed), int(right_wheel_speed), rotate_flag)
         self.get_logger().debug(
@@ -585,7 +690,10 @@ def main(args=None):
         node.robot.move(0, 0, 0) 
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # rclpy may already have shut the context down on Ctrl-C; calling shutdown()
+        # again raises RCLError and turns a clean stop into a -9/exit-1 in the logs.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

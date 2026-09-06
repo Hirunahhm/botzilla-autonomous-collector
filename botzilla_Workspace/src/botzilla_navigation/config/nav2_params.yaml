@@ -177,6 +177,51 @@ controller_server:
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
+      # KEEP AT 1.7. Lowering this to shorten the swept footprint was tried and measured
+      # WORSE, so do not retry it without new evidence.
+      #
+      # The reasoning that motivated the attempt: ObstacleFootprintCritic tests the full
+      # footprint polygon at every pose along a trajectory and rejects outright on a
+      # lethal or unknown cell (pass/fail on those — inflated values 1-252 only add score
+      # and never veto, so inflation_radius is not a lever here either). At 1.7 s and
+      # max_vel_x 0.2 that projects 0.34 m ahead of a footprint already reaching 0.36 m,
+      # so the swept polygon runs ~0.70 m forward and near a wall every candidate clips
+      # something — "No valid trajectories out of 440!".
+      #
+      # Measured A/B on hardware, cleared arena, NoMachine killed, single variable:
+      #   1.7  (run_logs/20260906-191025): 0.82 stalls/min, 30 no-valid-trajectory bursts
+      #   1.0  (run_logs/20260906-191922): 0.95 stalls/min, 98 no-valid-trajectory bursts
+      # Vetoes more than TRIPLED. A shorter horizon gives DWB less room to curve around an
+      # obstacle, so more of the sample set is pruned, not less — the opposite of the
+      # predicted effect.
+      #
+      # The stalls that motivated this are not a navigation problem at all, so do not look
+      # for them here. Sampled live during one (run_logs/20260906-193047): controller
+      # commanded th=+0.400 rad/s, collision monitor passed +0.400, velocity_smoother
+      # passed +0.400, and the base achieved +0.092. The whole software chain is faithful;
+      # the base does not deliver the commanded rotation.
+      #
+      # Everything plausible was tested and rejected, each on hardware, single-variable:
+      #   CPU starvation      killing NoMachine lifted the planner loop 2.56 -> 11.93 Hz
+      #                       and the control loop to 20 Hz; stall rate unchanged.
+      #   sim_time            see the A/B above; measurably worse.
+      #   lidar seeing arms   /scan sampled by sector: nothing returns inside the
+      #                       footprint (range_min is 0.05 m, so it would show).
+      #   physical contact    ruled out by direct observation of the robot.
+      #   collision monitor   run_logs/20260906-193047: stalls 0.82 -> 1.41/min and
+      #                       distance 3.1 -> 1.6 m/min. Its "approach" action scales
+      #                       commands DOWN near obstacles, pushing yaw further below the
+      #                       base's rotation deadband. Left off by default.
+      #
+      # What is left: kobuki_base_node's yaw feed-forward models this base's mechanical
+      # deadband as actual = 0.891 * (cmd - 0.121), fitted at R^2 = 0.997, and its runtime
+      # parameters were confirmed set to those values. Under that model 0.400 should come
+      # out as ~0.400, not 0.092 — so the fitted curve no longer describes the hardware.
+      # The untested candidate is battery state: motor torque falls as the pack drains,
+      # which raises effective stiction and would degrade over a day of running exactly as
+      # observed. Kobuki.py already parses Batteryvolt (basic sensor byte 13) but
+      # kobuki_base_node never publishes it, so this cannot currently be correlated.
+      # Next step is a bench measurement, not another mission run.
       sim_time: 1.7
       linear_granularity: 0.05
       angular_granularity: 0.025

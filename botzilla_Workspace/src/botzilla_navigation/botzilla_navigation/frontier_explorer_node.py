@@ -359,6 +359,28 @@ PATH_CHECK_TIMEOUT_S = 15.0
 # excluded until its cooldown expires (see module docstring).
 BLACKLIST_RADIUS_M = 0.5
 
+# A sweep waypoint's SNAPPED nav point — not the raw queue point — is what Nav2 is
+# actually sent, and _snap_to_reachable can map two different queue points onto the
+# same reachable cell. Measured in run 18 (2026-09-06): row (3.96, 1.92) and the
+# transit (4.06, 1.92) immediately after it both snapped to (4.04, 1.86), so the
+# second goal re-sent the robot to the point it had just failed to reach, and stalled
+# for another full NO_PROGRESS_TIMEOUT_S. Five consecutive waypoints along one row
+# behaved this way; across that run 19 stalls burned 63% of the mission wall-clock.
+#
+# Sweep waypoints are deliberately NOT blacklisted (see the module docstring and
+# _mark_sweep_waypoint_unreachable — a one-pass queue has no next tick to re-evaluate,
+# and banning the raw point would strand coverage completion). This is the narrower
+# guard that failure actually calls for: remember the snapped points that failed, and
+# refuse to dispatch a new waypoint that lands on one of them again.
+#
+# 0.30 m is two Nav2 xy_goal_tolerances (0.15): closer than this, two goals are the
+# same goal as far as the goal checker is concerned. The asymmetry is deliberate — a
+# false skip costs one cell marked swept-but-skipped, a false dispatch costs 32 s.
+SWEEP_FAILURE_RADIUS_M = 0.30
+# Long enough to cover the rest of a row (waypoints arrive seconds to a couple of
+# minutes apart), short enough that a genuine later revisit is not poisoned.
+SWEEP_FAILURE_MEMORY_S = 120.0
+
 # Exponential backoff: cooldown = min(BASE * 2^(failure_count - 1), MAX). BASE is set well
 # above the ~300s single-attempt failure latency observed live (see module docstring).
 BLACKLIST_COOLDOWN_BASE_S = 360.0
@@ -622,6 +644,9 @@ class FrontierExplorerNode(Node):
         self._last_progress_distance = None  # smallest distance_remaining seen so far
         self._last_progress_time = None  # rclpy.time.Time it was last improved
         self._blacklist = []  # list of (x, y, expiry_time: rclpy.time.Time) — active bans
+        # Snapped sweep nav points that failed: (x, y, expiry). See
+        # SWEEP_FAILURE_RADIUS_M — distinct from _blacklist, which is frontier-only.
+        self._sweep_failures = []
         self._failure_history = []  # list of [x, y, count] — persists across cooldowns
 
         # Stuck recovery — see module docstring. Set the first tick every known frontier
@@ -1190,6 +1215,28 @@ class FrontierExplorerNode(Node):
             return
 
         nav_x, nav_y = nav_point
+
+        # Both guards below test the SNAPPED point. The pre-snap check above tests the
+        # raw queue point, and _snap_to_reachable can move it far enough to invalidate
+        # that result — onto the robot, or onto a point that just failed.
+        if distance(robot_x, robot_y, nav_x, nav_y) < MIN_TARGET_DISTANCE_M:
+            self.get_logger().info(
+                f'Sweep {target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT} waypoint '
+                f'({target[0]:.2f}, {target[1]:.2f}) snapped to ({nav_x:.2f}, {nav_y:.2f}), '
+                f'which the robot is already standing on; marking it swept and skipping.'
+            )
+            self._mark_sweep_waypoint_unreachable(nav_x, nav_y)
+            return
+        if self._recently_failed_sweep_point(nav_x, nav_y):
+            self.get_logger().info(
+                f'Sweep {target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT} waypoint '
+                f'({target[0]:.2f}, {target[1]:.2f}) snapped to ({nav_x:.2f}, {nav_y:.2f}), '
+                f'within {SWEEP_FAILURE_RADIUS_M}m of a sweep point that just failed; '
+                f'skipping instead of spending another {NO_PROGRESS_TIMEOUT_S:.0f}s on it.'
+            )
+            self._mark_sweep_waypoint_unreachable(nav_x, nav_y)
+            return
+
         leg = target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT
 
         # A row leg is only the straight line it was planned as when the robot is
@@ -1554,6 +1601,7 @@ class FrontierExplorerNode(Node):
         (which requires unswept_free == 0) becomes permanently unreachable over one
         un-drivable pocket. Centralized here rather than duplicated at each call site.
         """
+        self._record_sweep_failure(x, y)
         if self._swept_mask is None or self._latest_map is None:
             return
         mark_world_point_swept(
@@ -1562,6 +1610,26 @@ class FrontierExplorerNode(Node):
             self._latest_map.info.origin.position.x,
             self._latest_map.info.origin.position.y,
             x, y,
+        )
+
+    def _record_sweep_failure(self, x, y):
+        """Remember a snapped sweep nav point that failed — see SWEEP_FAILURE_RADIUS_M."""
+        now = self.get_clock().now()
+        self._sweep_failures = [f for f in self._sweep_failures if f[2] > now]
+        expiry = now + Duration(seconds=SWEEP_FAILURE_MEMORY_S)
+        for i, (fx, fy, _exp) in enumerate(self._sweep_failures):
+            if distance(x, y, fx, fy) < SWEEP_FAILURE_RADIUS_M:
+                self._sweep_failures[i] = (fx, fy, expiry)   # refresh, don't duplicate
+                return
+        self._sweep_failures.append((x, y, expiry))
+
+    def _recently_failed_sweep_point(self, x, y):
+        """True if (x, y) is effectively a sweep nav point that just failed."""
+        now = self.get_clock().now()
+        self._sweep_failures = [f for f in self._sweep_failures if f[2] > now]
+        return any(
+            distance(x, y, fx, fy) < SWEEP_FAILURE_RADIUS_M
+            for (fx, fy, _exp) in self._sweep_failures
         )
 
     def _blacklist_target(self, x, y):

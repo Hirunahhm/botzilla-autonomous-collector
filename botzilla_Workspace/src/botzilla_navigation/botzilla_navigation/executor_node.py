@@ -657,9 +657,14 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node._cmd_pub.publish(Twist())  # stop the base on the way out
+        # Ctrl-C tears the context down before this runs, so the stop command has to be
+        # guarded: publishing on a dead context raises RCLError and the node exits 1,
+        # which reads as a crash in the run logs and masks real failures.
+        if rclpy.ok():
+            node._cmd_pub.publish(Twist())  # stop the base on the way out
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
