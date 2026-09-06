@@ -30,6 +30,12 @@
 #                                  control arm, planning them the way every run
 #                                  before botzilla_straightline_planner did.
 #                                  Transit legs always use GridBased either way.
+#   --collision-monitor            splice nav2_collision_monitor into the cmd_vel
+#                                  chain: an independent, scan-based stop-before-
+#                                  contact using the robot's real (asymmetric)
+#                                  footprint. Off by default because it changes the
+#                                  cmd_vel chain; the arms stop the bumpers from
+#                                  triggering, so this is the only contact guard.
 #   --metrics                      start mission_metrics_node, writing
 #                                  <logdir>/metrics.jsonl. It is subscribe-only by
 #                                  construction, so it cannot perturb the mission.
@@ -69,6 +75,7 @@ FORCE_CLEAN=0
 RUN_METRICS=0
 POLICY=""          # empty => don't pass it; executor.launch.py keeps its own default
 ROW_PLANNER=""     # empty => launch default (SweepStraight)
+COLLISION_MONITOR=0
 LAYOUT=""
 
 # Printed by --help: the contiguous comment block at the top of this file. Derived
@@ -88,6 +95,7 @@ while [ $# -gt 0 ]; do
         --policy=*)    POLICY="${1#*=}" ;;
         --row-planner) ROW_PLANNER="${2:-}"; shift ;;
         --row-planner=*) ROW_PLANNER="${1#*=}" ;;
+        --collision-monitor) COLLISION_MONITOR=1 ;;
         --layout)      LAYOUT="${2:-}"; shift ;;
         --layout=*)    LAYOUT="${1#*=}" ;;
         -h|--help)     usage; exit 0 ;;
@@ -401,7 +409,9 @@ wait_for_log "$LOG_DIR/rtabmap.log" "rtabmap \([0-9]+\)" 90 "RTAB-Map processing
 
 # ── 4. Nav2 ──────────────────────────────────────────────────────────────────
 next_step "Nav2"
-start_bg "$LOG_DIR/nav2.log" ros2 launch botzilla_navigation nav2.launch.py
+NAV2_ARGS=()
+[ "$COLLISION_MONITOR" = 1 ] && NAV2_ARGS+=("collision_monitor:=true")
+start_bg "$LOG_DIR/nav2.log" ros2 launch botzilla_navigation nav2.launch.py "${NAV2_ARGS[@]}"
 wait_for_log "$LOG_DIR/nav2.log" "Managed nodes are active" 90 "Nav2 lifecycle active"
 
 # ── 5. YOLO ──────────────────────────────────────────────────────────────────

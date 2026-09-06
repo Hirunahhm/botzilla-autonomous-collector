@@ -5,6 +5,7 @@ Pure pytest for botzilla_navigation.frontier_detection — no ROS imports, runna
 with `python3 -m pytest` without sourcing a ROS environment.
 """
 
+import math
 import os
 import sys
 
@@ -14,6 +15,7 @@ from botzilla_navigation.frontier_detection import (  # noqa: E402,I100
     distance,
     find_frontiers,
     find_low_cost_point,
+    footprint_clear,
     grid_to_world,
     in_collision,
     select_target,
@@ -261,3 +263,80 @@ def test_in_collision_out_of_bounds_is_not_a_collision():
     rows = [[0, 0], [0, 0]]
     data, w, h = grid(rows, 2)
     assert in_collision(data, w, h, row=9, col=9) is False
+
+
+# ── Footprint-aware goal validation ──────────────────────────────────────────
+# The robot outline reaches 0.36 m ahead of base_link but only 0.22 m behind, which
+# Nav2's inflation model (built on the inscribed circle) cannot represent. These
+# exercise the orientation dependence that motivated footprint_clear.
+
+def _blank(width, height, value=0):
+    return [value] * (width * height)
+
+
+def test_footprint_clear_open_floor():
+    """Nothing lethal anywhere: clear at every heading."""
+    grid = _blank(40, 40)
+    for yaw in (0.0, math.pi / 2, math.pi, -math.pi / 2):
+        assert footprint_clear(grid, 40, 40, 20, 20, yaw, 0.05) is True
+
+
+def test_footprint_clear_is_orientation_dependent():
+    """The same cell is clear side-on and blocked nose-on.
+
+    This is the whole point of the check: a scalar costmap threshold has one answer
+    per cell, but an asymmetric robot's clearance genuinely depends on its heading.
+    A lethal cell 0.30 m ahead in +x is inside the 0.36 m forward reach when facing
+    +x (yaw 0), and outside the 0.215 m lateral half-width when facing +y.
+    """
+    width = height = 40
+    grid = _blank(width, height)
+    # 0.30 m at 0.05 m/cell = 6 cells in +x (i.e. +col) of the centre cell.
+    grid[20 * width + 26] = 100
+
+    assert footprint_clear(grid, width, height, 20, 20, 0.0, 0.05) is False
+    assert footprint_clear(grid, width, height, 20, 20, math.pi / 2, 0.05) is True
+
+
+def test_footprint_clear_ignores_inflation_band():
+    """Only lethal cells block; the inscribed band (99) must not.
+
+    Scoring the polygon against 99 would demand footprint_extent + inscribed_radius
+    of clearance — the double-counting in_collision's docstring records as having
+    pinned the robot in open floor.
+    """
+    width = height = 40
+    grid = _blank(width, height)
+    grid[20 * width + 24] = 99
+    assert footprint_clear(grid, width, height, 20, 20, 0.0, 0.05) is True
+
+
+def test_footprint_clear_off_map_is_clear():
+    """Cells past the map edge are not evidence of an obstacle."""
+    grid = _blank(10, 10)
+    assert footprint_clear(grid, 10, 10, 0, 0, 0.0, 0.05) is True
+
+
+def test_find_low_cost_point_rejects_cells_failing_footprint():
+    """A cell can pass the cost threshold and still be refused by the polygon test."""
+    width = height = 40
+    grid = _blank(width, height)
+    # Everything is cheap by cost, so without a footprint gate the BFS returns the
+    # seed cell immediately.
+    assert find_low_cost_point(grid, width, height, 20, 20, max_cost=75) == (20, 20)
+
+    # With a gate that rejects only the seed, the BFS must move on to a neighbour.
+    result = find_low_cost_point(
+        grid, width, height, 20, 20, max_cost=75,
+        footprint_ok=lambda r, c: (r, c) != (20, 20),
+    )
+    assert result is not None and result != (20, 20)
+
+
+def test_find_low_cost_point_none_when_footprint_never_clears():
+    """No cell within the radius passes: genuinely unreachable, not searched forever."""
+    grid = _blank(40, 40)
+    assert find_low_cost_point(
+        grid, 40, 40, 20, 20, max_cost=75, search_radius=3,
+        footprint_ok=lambda r, c: False,
+    ) is None

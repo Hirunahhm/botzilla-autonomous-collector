@@ -92,6 +92,9 @@ def _launch_nav2(context, *_args, **_kwargs):
     param_files, use_sim_time = _resolve_param_files(context)
     autostart = LaunchConfiguration('autostart')
     params = param_files + [{'use_sim_time': use_sim_time}]
+    collision_monitor = (
+        LaunchConfiguration('collision_monitor').perform(context).lower() == 'true'
+    )
 
     lifecycle_nodes = [
         'controller_server',
@@ -141,13 +144,36 @@ def _launch_nav2(context, *_args, **_kwargs):
     if use_sim_time:
         smoother_params['reversal_deadband_x'] = SIM_REVERSAL_DEADBAND_X
         smoother_params['reversal_deadband_theta'] = SIM_REVERSAL_DEADBAND_THETA
+    # With the collision monitor enabled it is spliced in ahead of the smoother, so the
+    # smoother's input moves from 'cmd_vel_nav' to the monitor's checked output. With it
+    # disabled nothing is remapped and the chain is exactly as it was.
+    smoother_remaps = [('cmd_vel_nav', 'cmd_vel_safe')] if collision_monitor else []
     nodes.append(Node(
         package='botzilla_control',
         executable='velocity_smoother',
         name='velocity_smoother',
         output='screen',
         parameters=[smoother_params],
+        remappings=smoother_remaps,
     ))
+
+    # COLLISION MONITOR (opt-in): 'cmd_vel_nav' -> 'cmd_vel_safe'. See
+    # config/collision_monitor.yaml for why it is off by default and what it guards
+    # against — chiefly that the arms stop the bumpers from ever triggering, so without
+    # it nothing checks for contact independently of the costmap.
+    if collision_monitor:
+        monitor_params = os.path.join(
+            get_package_share_directory('botzilla_navigation'),
+            'config', 'collision_monitor.yaml',
+        )
+        nodes.append(Node(
+            package='nav2_collision_monitor',
+            executable='collision_monitor',
+            name='collision_monitor',
+            output='screen',
+            parameters=[monitor_params, {'use_sim_time': use_sim_time}],
+        ))
+        lifecycle_nodes.append('collision_monitor')
 
     nodes.append(Node(
         package='nav2_lifecycle_manager',
@@ -186,10 +212,20 @@ def generate_launch_description():
         default_value='true',
         description='Automatically bring the lifecycle nodes up to the active state',
     )
+    collision_monitor_arg = DeclareLaunchArgument(
+        'collision_monitor',
+        default_value='false',
+        description=(
+            'Splice nav2_collision_monitor into the cmd_vel chain as an independent, '
+            'scan-based stop before contact. Off by default: it changes the chain that '
+            "this file's docstring records a third-party node silently breaking."
+        ),
+    )
 
     return LaunchDescription([
         use_sim_time_arg,
         params_file_arg,
         autostart_arg,
+        collision_monitor_arg,
         OpaqueFunction(function=_launch_nav2),
     ])

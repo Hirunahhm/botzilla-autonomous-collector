@@ -1,0 +1,63 @@
+# nav2_collision_monitor — opt-in last line of defence against driving into things.
+#
+# Why this exists: the Kobuki's bumpers are the robot's only contact sensor, and with
+# the collection arms fitted they no longer trigger — the arms reach past the bumper, so
+# the robot can be pressed against an obstacle with the bumper reading clear. That left
+# the stack with no independent collision check at all; everything upstream (planner
+# goal selection, DWB's ObstacleFootprint critic) reasons about the costmap, so a
+# costmap that is wrong or stale is believed all the way into the wall.
+#
+# The monitor closes that by working from the live /scan rather than the costmap, and by
+# using the real published footprint rather than an inscribed circle. That distinction
+# matters on this robot specifically: the body reaches 0.36 m ahead of base_link but only
+# 0.22 m behind, and every inflation-derived test in Nav2 is built on the inscribed
+# circle (~0.215 m), which cannot see the forward overhang.
+#
+# OPT-IN ON PURPOSE. It is inserted into the cmd_vel chain, and nav2.launch.py's header
+# records that the last third-party node placed there (nav2_velocity_smoother) silently
+# stopped republishing and left /cmd_vel with no publisher while every node reported
+# healthy. So it stays off unless asked for: run_full_mission.sh --collision-monitor.
+# When off, the chain is byte-identical to before this file existed.
+#
+# Chain when enabled:
+#   controller_server -> cmd_vel_nav -> collision_monitor -> cmd_vel_safe
+#                     -> velocity_smoother -> cmd_vel -> kobuki_base_node
+collision_monitor:
+  ros__parameters:
+    use_sim_time: False
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_nav"
+    cmd_vel_out_topic: "cmd_vel_safe"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 0.5
+    # /scan was measured at ~60 ms median latency (14 ms jitter) on this Jetson, so a 1 s
+    # timeout is ~16 scan periods of slack. If the lidar does stop, the monitor treats the
+    # source as stale and stops the robot, which is the correct direction to fail.
+    source_timeout: 1.0
+    base_shift_correction: True
+    stop_pub_timeout: 2.0
+
+    polygons: ["FootprintApproach"]
+    # "approach" projects the ACTUAL footprint forward along the commanded velocity and
+    # scales the command down so the robot stops short of contact, rather than tripping a
+    # fixed keep-out box. Using footprint_topic (not a hardcoded polygon) means it tracks
+    # whatever nav2_params.yaml declares, so the two cannot drift apart.
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: "/local_costmap/published_footprint"
+      # At the tuned 0.26 m/s max forward speed this is ~0.26 m of look-ahead — slightly
+      # under the 0.36 m forward reach, so it intervenes late enough not to fight the
+      # doorway traversal the costmap threshold was raised to allow.
+      time_before_collision: 1.0
+      simulation_time_step: 0.1
+      min_points: 6
+      visualize: False
+      enabled: True
+
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "/scan"
+      enabled: True

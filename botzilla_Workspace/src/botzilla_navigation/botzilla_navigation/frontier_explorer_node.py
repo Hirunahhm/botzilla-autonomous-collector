@@ -246,9 +246,11 @@ from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from botzilla_navigation.coverage_planning import generate_coverage_waypoints
 from botzilla_navigation.frontier_detection import (
+    DEFAULT_FOOTPRINT_M,
     distance,
     find_frontiers,
     find_low_cost_point,
+    footprint_clear,
     grid_to_world,
     in_collision,
     select_target,
@@ -468,6 +470,20 @@ SWEEP_PLANNER_ID = 'SweepStraight'
 SWEEP_LEG_TRANSIT = 'transit'
 SWEEP_LEG_ROW = 'row'
 
+# How close to a row's entry point the robot must actually be for the following ROW
+# leg to be the straight line it was planned as. A row leg is only straight relative
+# to the row's own start; dispatched from somewhere else it is just an arbitrary line
+# across the map that will cross whatever lies between. Nothing guarantees the robot
+# arrives: the transit before it is a normal Nav2 goal and gets cancelled whenever
+# executor_node takes the base to chase a cube. Measured in run_logs/20260906-155048,
+# where a burst of cube interrupts cancelled every transit in the run (12 CANCELED, 0
+# SUCCEEDED) and straight-row conversion collapsed from ~79%% to 33%% — every row leg
+# firing from wherever the robot happened to be stranded, failing the straight-line
+# pre-check, and costing a wasted ComputePathToPose before falling back.
+# Nav2's xy_goal_tolerance is 0.15 m, so this is ~3x the tolerance a completed
+# transit leaves behind — loose enough never to trip on a normal arrival.
+ROW_ENTRY_TOLERANCE_M = 0.5
+
 # Sweep once un-swept known-free area exceeds this fraction of total known free area — a
 # fraction, not a fixed square-meterage, so a small first room gets camera-checked almost
 # immediately while a large mostly-swept arena isn't re-triggered by trivial new patches.
@@ -534,6 +550,13 @@ class FrontierExplorerNode(Node):
         # did before botzilla_straightline_planner existed, so an A/B pair can be
         # collected without rebuilding or editing code between runs.
         self.declare_parameter('sweep_row_planner_id', SWEEP_PLANNER_ID)
+        # Flat [x0,y0,x1,y1,...] in base_link metres. MUST match nav2_params.yaml's
+        # `footprint` — if the two disagree, this node will happily pick goals the
+        # controller's ObstacleFootprint critic then refuses to drive to.
+        self.declare_parameter(
+            'footprint',
+            [coord for vertex in DEFAULT_FOOTPRINT_M for coord in vertex],
+        )
 
         self._sweep_trigger_mode = self.get_parameter('sweep_trigger_mode').value
         if self._sweep_trigger_mode not in SWEEP_TRIGGER_MODES:
@@ -551,6 +574,17 @@ class FrontierExplorerNode(Node):
         self._costmap_safe_cost = self.get_parameter('costmap_safe_cost').value
         self._sweep_row_spacing_m = self.get_parameter('sweep_row_spacing_m').value
         self._sweep_row_planner_id = self.get_parameter('sweep_row_planner_id').value
+        flat_footprint = self.get_parameter('footprint').value
+        if len(flat_footprint) < 6 or len(flat_footprint) % 2:
+            self.get_logger().error(
+                f'footprint needs an even count of at least 3 (x, y) pairs, got '
+                f'{len(flat_footprint)} values — falling back to the built-in outline.'
+            )
+            flat_footprint = [c for v in DEFAULT_FOOTPRINT_M for c in v]
+        self._footprint_m = tuple(
+            (flat_footprint[i], flat_footprint[i + 1])
+            for i in range(0, len(flat_footprint), 2)
+        )
 
         self.get_logger().info(
             f'Coverage policy: sweep_trigger_mode={self._sweep_trigger_mode} '
@@ -558,7 +592,9 @@ class FrontierExplorerNode(Node):
             f'cooldown={self._sweep_retrigger_cooldown_s}s '
             f'camera=+/-{math.degrees(self._camera_half_fov_rad):.1f}deg '
             f'@{self._camera_mark_range_m}m '
-            f'row_planner={self._sweep_row_planner_id}'
+            f'row_planner={self._sweep_row_planner_id} '
+            f'footprint={len(self._footprint_m)}pt '
+            f'fwd={max(v[0] for v in self._footprint_m):.2f}m'
         )
 
         self._state = State.IDLE
@@ -599,6 +635,13 @@ class FrontierExplorerNode(Node):
         # Coverage sweep — see module docstring's "Coverage sweep" section.
         self._mode = 'FRONTIER'  # 'FRONTIER' | 'SWEEPING'
         self._sweep_queue = []  # (x, y, SWEEP_LEG_TRANSIT | SWEEP_LEG_ROW)
+        # Where the last dispatched TRANSIT leg was headed, i.e. the entry point of
+        # the row that follows it — see ROW_ENTRY_TOLERANCE_M.
+        self._pending_row_entry = None
+        # Rows dispatched without the robot having reached their entry. Logged so the
+        # interrupt sensitivity this guards against stays measurable rather than
+        # silently degrading conversion.
+        self._rows_off_entry = 0
         # planner_server plugin the in-flight goal is pre-checked and executed with.
         # Set per dispatch; only a sweep ROW leg ever raises it to SWEEP_PLANNER_ID.
         self._active_planner_id = DEFAULT_PLANNER_ID
@@ -962,7 +1005,7 @@ class FrontierExplorerNode(Node):
             self.get_logger().debug('Nearest frontier is too close, waiting for next map update.')
             return
 
-        nav_point = self._snap_to_reachable(target)
+        nav_point = self._snap_to_reachable(target, robot_x, robot_y)
         if nav_point is None:
             self.get_logger().info(
                 f'Frontier ({target[0]:.2f}, {target[1]:.2f}) has no low-cost cell within '
@@ -1005,25 +1048,53 @@ class FrontierExplorerNode(Node):
         self._sweep_row_retry = None
         self._check_reachability(nav_x, nav_y, yaw)
 
-    def _snap_to_reachable(self, target_world):
+    def _snap_to_reachable(self, target_world, robot_x=None, robot_y=None):
         """Move a raw frontier point to the nearest costmap cell Nav2 can plan into.
 
         See COSTMAP_SAFE_COST module comment for why this is necessary. Returns a world
         (x, y) tuple, or None if no low-cost cell exists within COSTMAP_SEARCH_RADIUS_CELLS.
 
-        COSTMAP_SAFE_COST (75) is comfortably below the inscribed cutoff, so a cell that
-        passes this snap is by construction not a colliding pose either — the snap and
-        _is_self_clear agree rather than pulling against each other.
+        When the robot's pose is supplied, each candidate must additionally clear a real
+        footprint test at the heading the robot would actually arrive on — see
+        footprint_clear. That check exists because COSTMAP_SAFE_COST alone cannot express
+        an asymmetric robot: it is an inflation-derived scalar, inflation is built on the
+        inscribed circle (~0.215 m), and this body reaches 0.36 m forward of base_link.
+        Measured against the tuned inflation (cost_scaling_factor 3.0), a threshold of 75
+        accepts cells only ~0.31 m from an obstacle, so goals were being placed where the
+        robot's nose is already inside the wall and Nav2 then drove it in. The polygon
+        test also dissolves the tension that made 75 attractive in the first place: a
+        doorway the robot genuinely fits through still passes, so clearance no longer has
+        to be traded against doorway access by picking a number.
         """
         cm = self._latest_costmap
         row, col = world_to_grid(
             target_world[0], target_world[1], cm.info.resolution,
             cm.info.origin.position.x, cm.info.origin.position.y
         )
+
+        def check_footprint(cand_row, cand_col):
+            cand_x, cand_y = grid_to_world(
+                cand_row, cand_col, cm.info.resolution,
+                cm.info.origin.position.x, cm.info.origin.position.y
+            )
+            # The goal yaw _send_goal will use: face the direction of approach.
+            yaw = math.atan2(cand_y - robot_y, cand_x - robot_x)
+            return footprint_clear(
+                cm.data, cm.info.width, cm.info.height, cand_row, cand_col,
+                yaw, cm.info.resolution, footprint_m=self._footprint_m,
+            )
+
+        # Without a robot pose there is no approach heading to test against, so the
+        # scalar threshold is all that can be applied — callers that have the pose
+        # always pass it.
+        has_pose = robot_x is not None and robot_y is not None
+        footprint_ok = check_footprint if has_pose else None
+
         snapped = find_low_cost_point(
             cm.data, cm.info.width, cm.info.height, row, col,
             max_cost=self._costmap_safe_cost,
             search_radius=COSTMAP_SEARCH_RADIUS_CELLS,
+            footprint_ok=footprint_ok,
         )
         if snapped is None:
             return None
@@ -1091,17 +1162,24 @@ class FrontierExplorerNode(Node):
                 )
                 self.get_logger().info(
                     f'Sweep queue exhausted ({unswept_free} un-swept free cell(s), '
-                    f'{len(candidates)} frontier candidate(s) remain) — returning to '
-                    f'frontier mode.'
+                    f'{len(candidates)} frontier candidate(s) remain, '
+                    f'{self._rows_off_entry} row(s) dispatched off-entry) — returning '
+                    f'to frontier mode.'
                 )
             return
 
         target = self._sweep_queue.pop(0)
         if distance(robot_x, robot_y, target[0], target[1]) < MIN_TARGET_DISTANCE_M:
             self.get_logger().debug('Sweep waypoint too close to the robot; skipping it.')
+            # Skipping a transit because the robot is already standing on it still
+            # establishes the row entry — the robot is at it. Leaving the previous
+            # cycle's entry in place here would make the row that follows compare
+            # against a stale point and wrongly report itself off-entry.
+            if (target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT) == SWEEP_LEG_TRANSIT:
+                self._pending_row_entry = (target[0], target[1])
             return
 
-        nav_point = self._snap_to_reachable(target)
+        nav_point = self._snap_to_reachable(target, robot_x, robot_y)
         if nav_point is None:
             self.get_logger().info(
                 f'Sweep waypoint ({target[0]:.2f}, {target[1]:.2f}) has no low-cost cell '
@@ -1113,9 +1191,37 @@ class FrontierExplorerNode(Node):
 
         nav_x, nav_y = nav_point
         leg = target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT
-        self._active_planner_id = (
-            self._sweep_row_planner_id if leg == SWEEP_LEG_ROW else DEFAULT_PLANNER_ID
-        )
+
+        # A row leg is only the straight line it was planned as when the robot is
+        # standing at that row's entry. See ROW_ENTRY_TOLERANCE_M: the transit before it
+        # is an ordinary Nav2 goal and is cancelled whenever executor_node takes the base
+        # to chase a cube, which strands the robot mid-map. Asking the straight-line
+        # planner for a line from there is asking it to cross whatever lies between, so
+        # it fails, and the fallback spends a second ComputePathToPose arriving at the
+        # obstacle-avoiding plan that was always going to be needed. Detect it up front
+        # instead: plan the leg the way it will actually have to be driven.
+        off_entry = False
+        if leg == SWEEP_LEG_ROW and self._pending_row_entry is not None:
+            entry_dist = distance(
+                robot_x, robot_y, self._pending_row_entry[0], self._pending_row_entry[1]
+            )
+            off_entry = entry_dist > ROW_ENTRY_TOLERANCE_M
+            if off_entry:
+                self._rows_off_entry += 1
+                self.get_logger().info(
+                    f'Row entry ({self._pending_row_entry[0]:.2f}, '
+                    f'{self._pending_row_entry[1]:.2f}) never reached — robot is '
+                    f'{entry_dist:.2f}m away (tolerance {ROW_ENTRY_TOLERANCE_M}m), so this '
+                    f'row cannot be driven as a straight line. Planning it as a transit '
+                    f'instead ({self._rows_off_entry} so far this run).'
+                )
+
+        if leg == SWEEP_LEG_ROW and not off_entry:
+            self._active_planner_id = self._sweep_row_planner_id
+        else:
+            self._active_planner_id = DEFAULT_PLANNER_ID
+        # Remember where a transit is headed: that is the entry of the row after it.
+        self._pending_row_entry = (nav_x, nav_y) if leg == SWEEP_LEG_TRANSIT else None
         self._sweep_row_retry = None
         self.get_logger().info(
             f'Sweep {leg} waypoint ({target[0]:.2f}, {target[1]:.2f}) -> snapped to '
@@ -1222,6 +1328,8 @@ class FrontierExplorerNode(Node):
                 (wx, wy, SWEEP_LEG_ROW if i % 2 else SWEEP_LEG_TRANSIT)
                 for i, (wx, wy) in enumerate(raw_waypoints)
             ]
+            # The previous cycle's entry says nothing about this queue's first row.
+            self._pending_row_entry = None
             self.get_logger().info(
                 f'Switching to coverage sweep ({reason}): {len(self._sweep_queue)} '
                 f'waypoint(s) queued over the known map.'

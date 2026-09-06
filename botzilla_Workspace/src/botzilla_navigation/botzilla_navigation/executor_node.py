@@ -275,6 +275,21 @@ class ExecutorNode(Node):
         # z == 0.0 is the blind-spot sentinel from yolo_node, not a real distance, so
         # it must bypass the range gate — it is precisely the signal that the cube is
         # close enough to capture.
+        #
+        # But it may only bypass it for a cube ALREADY being chased. yolo_node emits
+        # z == 0.0 both for "closer than KINECT_MIN_RANGE_M" and for "depth lookup
+        # failed", and those are indistinguishable here — so from EXPLORING the sentinel
+        # is a detection carrying no distance evidence whatsoever, and letting it through
+        # meant any depth-less false positive could seize the base. Measured on a
+        # deliberately emptied arena (run_logs/20260906-161239): 5 detections, every one
+        # at x ~ -0.85 (the extreme left edge of frame) with z == 0.00, each suspending
+        # exploration and cancelling an in-flight sweep goal before being lost seconds
+        # later. A real cube is measured at range first and only then enters the blind
+        # spot, so requiring a real range to START a chase costs nothing: TARGETING and
+        # APPROACHING are only ever reached via a ranged detection, and the capture path
+        # below still relies on the sentinel exactly as before.
+        if msg.z == 0.0 and self._state == State.EXPLORING:
+            return
         if msg.z > self._cube_max_range_m:
             return
 

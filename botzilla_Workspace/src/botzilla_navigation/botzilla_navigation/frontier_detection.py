@@ -100,7 +100,8 @@ def find_frontiers(data, width, height, min_cluster_size=4):
     return clusters
 
 
-def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_radius=10):
+def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_radius=10,
+                        footprint_ok=None):
     """Find the nearest cell to (row, col) whose inflated costmap cost is safely low.
 
     A frontier cell is, by definition, adjacent to unknown space — and unknown space in
@@ -120,6 +121,14 @@ def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_ra
     costmap. search_radius bounds the BFS in cells — a frontier with no low-cost cell
     anywhere nearby is treated as genuinely unreachable rather than searched forever.
 
+    `footprint_ok`, when given, is called as footprint_ok(row, col) on each candidate
+    that already passes the cost test, and the cell is only accepted if it also returns
+    True. This is where the robot's real, asymmetric outline gets a say: max_cost is an
+    inflation-derived scalar and inflation is built on the inscribed circle, so on its
+    own it will happily hand back a cell whose clearance is less than the body's forward
+    reach. Ordering matters — the cheap scalar test runs first and rejects most cells, so
+    the polygon test only runs on the few that survive.
+
     Returns (row, col) of the nearest qualifying cell, or None if none exists within
     search_radius.
     """
@@ -136,7 +145,7 @@ def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_ra
         r, c = queue[head]
         head += 1
         cost = costmap[idx(r, c)]
-        if 0 <= cost < max_cost:
+        if 0 <= cost < max_cost and (footprint_ok is None or footprint_ok(r, c)):
             return (r, c)
         if abs(r - row) >= search_radius or abs(c - col) >= search_radius:
             continue
@@ -147,6 +156,90 @@ def find_low_cost_point(costmap, width, height, row, col, max_cost=50, search_ra
                 queue.append((nr, nc))
 
     return None
+
+
+# Robot outline in base_link metres, (x forward, y left), matching the `footprint`
+# in nav2_params.yaml. It is deliberately NOT a circle: the body reaches 0.36 m ahead
+# of base_link but only 0.22 m behind, and Nav2's inflation model cannot represent
+# that — inflation is driven by the inscribed radius (the largest circle that fits,
+# ~0.215 m here), which ignores the forward overhang entirely. Any scalar cost
+# threshold therefore inherits a blind spot in front of the robot; see
+# footprint_clear for the test that closes it.
+DEFAULT_FOOTPRINT_M = (
+    (0.36, 0.215),
+    (0.36, -0.215),
+    (-0.22, -0.215),
+    (-0.22, 0.215),
+)
+
+# A footprint test must score against LETHAL cells only, never the inscribed band (99).
+# A cell is 99 exactly when a lethal obstacle lies within the inscribed radius of it, so
+# testing the whole polygon against >=99 demands footprint_extent + inscribed_radius of
+# clearance — the same double-counting that in_collision's docstring records as having
+# pinned the robot in open floor in an endless backup/spin loop. Nav2's own
+# FootprintCollisionChecker scores the polygon against lethal for this reason.
+LETHAL_COST = 100
+
+
+def _point_in_polygon(x, y, polygon):
+    """Ray-casting point-in-polygon test. polygon is a sequence of (x, y) vertices."""
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if (yi > y) != (yj > y):
+            x_cross = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def footprint_clear(
+    costmap, width, height, row, col, yaw, resolution,
+    footprint_m=DEFAULT_FOOTPRINT_M, lethal_cost=LETHAL_COST,
+):
+    """Whether the robot's actual polygon, centred on this cell at heading `yaw`, is clear.
+
+    This is the orientation-aware test that a scalar costmap threshold cannot express.
+    The footprint is rotated by `yaw`, converted from metres to cell offsets, and every
+    grid cell whose centre falls inside the resulting polygon is checked for a lethal
+    obstacle. Because the outline is asymmetric, the answer genuinely depends on which
+    way the robot is pointing — a goal 0.30 m from a wall is fine approached side-on and
+    a collision approached nose-first.
+
+    Cells outside the map are treated as clear: unknown space past the map edge is not
+    evidence of an obstacle, matching in_collision and find_low_cost_point. Unknown
+    cells (< 0) inside the map are likewise not treated as lethal.
+
+    `costmap` is the published /global_costmap/costmap 0-100 scale (see
+    find_low_cost_point). Returns True when nothing lethal lies under the footprint.
+    """
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    # Rotate into world axes, then express in cell offsets from the centre cell. Cell
+    # centres are one resolution apart, so a world offset of d metres is d/resolution
+    # cells — no half-cell term, since both ends are centres (see grid_to_world).
+    polygon = []
+    for px, py in footprint_m:
+        wx = px * cos_yaw - py * sin_yaw
+        wy = px * sin_yaw + py * cos_yaw
+        polygon.append((wx / resolution, wy / resolution))
+
+    d_cols = [p[0] for p in polygon]
+    d_rows = [p[1] for p in polygon]
+    for d_row in range(int(math.floor(min(d_rows))), int(math.ceil(max(d_rows))) + 1):
+        for d_col in range(int(math.floor(min(d_cols))), int(math.ceil(max(d_cols))) + 1):
+            if not _point_in_polygon(d_col, d_row, polygon):
+                continue
+            r, c = row + d_row, col + d_col
+            if not (0 <= r < height and 0 <= c < width):
+                continue
+            if costmap[r * width + c] >= lethal_cost:
+                return False
+    return True
 
 
 def in_collision(costmap, width, height, row, col, inscribed_cost=99):
