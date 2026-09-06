@@ -1,0 +1,62 @@
+<!--
+  Copy of Nav2's stock navigate_to_pose_w_replanning_and_recovery.xml with exactly
+  one change: ComputePathToPose's planner_id is hard-coded to "SweepStraight"
+  instead of reading {selected_planner}, and the PlannerSelector node that would
+  have written that blackboard entry is gone.
+
+  Used only for the row-traversal legs of the camera-coverage sweep, selected
+  per-goal via NavigateToPose's `behavior_tree` field (see
+  frontier_explorer_node._send_goal). Doing it per-goal matters: the obvious
+  alternative — publishing to PlannerSelector's `planner_selector` topic — is
+  global mutable state shared by every goal sender on the robot, so a sweep leg
+  would silently leave SweepStraight selected for executor_node's next
+  DELIVERING goal to HOME and try to plan a straight line through the walls.
+  The `behavior_tree` field travels with the goal, so it cannot leak that way.
+
+  Everything else (1 Hz replanning, the planner/controller recovery subtrees,
+  spin/backup/wait round-robin) is deliberately identical to the stock tree so
+  sweep legs degrade the same way normal navigation does.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="SweepStraight" error_code_id="{compute_path_error_code}"/>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated/>
+          <RoundRobin name="RecoveryActions">
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <Spin spin_dist="1.57" error_code_id="{spin_error_code}"/>
+            <Wait wait_duration="5.0"/>
+            <BackUp backup_dist="0.30" backup_speed="0.15" error_code_id="{backup_code_id}"/>
+          </RoundRobin>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

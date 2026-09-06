@@ -23,6 +23,13 @@
 #                                  'fraction' (default) is the shipped interleaved
 #                                  behaviour; 'exhaustion' is the explore-then-sweep
 #                                  baseline the go/no-go gate is measured under.
+#   --row-planner SweepStraight|GridBased
+#                                  planner used for coverage-sweep ROW legs.
+#                                  'SweepStraight' (default) drives the lawnmower
+#                                  rows as straight lines; 'GridBased' is the
+#                                  control arm, planning them the way every run
+#                                  before botzilla_straightline_planner did.
+#                                  Transit legs always use GridBased either way.
 #   --metrics                      start mission_metrics_node, writing
 #                                  <logdir>/metrics.jsonl. It is subscribe-only by
 #                                  construction, so it cannot perturb the mission.
@@ -61,6 +68,7 @@ DO_BUILD=0
 FORCE_CLEAN=0
 RUN_METRICS=0
 POLICY=""          # empty => don't pass it; executor.launch.py keeps its own default
+ROW_PLANNER=""     # empty => launch default (SweepStraight)
 LAYOUT=""
 
 # Printed by --help: the contiguous comment block at the top of this file. Derived
@@ -78,6 +86,8 @@ while [ $# -gt 0 ]; do
         --metrics)     RUN_METRICS=1 ;;
         --policy)      POLICY="${2:-}"; shift ;;
         --policy=*)    POLICY="${1#*=}" ;;
+        --row-planner) ROW_PLANNER="${2:-}"; shift ;;
+        --row-planner=*) ROW_PLANNER="${1#*=}" ;;
         --layout)      LAYOUT="${2:-}"; shift ;;
         --layout=*)    LAYOUT="${1#*=}" ;;
         -h|--help)     usage; exit 0 ;;
@@ -92,6 +102,14 @@ done
 # a campaign, because nothing about the resulting data looks wrong.
 if [ -n "$POLICY" ] && [ "$POLICY" != "exhaustion" ] && [ "$POLICY" != "fraction" ]; then
     echo "ERROR: --policy must be 'exhaustion' or 'fraction' (got: '$POLICY')" >&2; exit 2
+fi
+# Same reasoning: a typo'd planner id is accepted by rclpy, then rejected by Nav2 on
+# every single goal (InvalidPlanner), which looks like a dead robot rather than a
+# bad flag. Fail here instead.
+if [ -n "$ROW_PLANNER" ] && [ "$ROW_PLANNER" != "SweepStraight" ] \
+   && [ "$ROW_PLANNER" != "GridBased" ]; then
+    echo "ERROR: --row-planner must be 'SweepStraight' or 'GridBased' (got: '$ROW_PLANNER')" >&2
+    exit 2
 fi
 
 # A layout is only meaningful if something is recording, so it implies --metrics.
@@ -423,6 +441,7 @@ if [ "$RUN_MISSION" = 1 ]; then
     # command line it always did.
     EXEC_ARGS=(use_sim_time:=false)
     [ -n "$POLICY" ] && EXEC_ARGS+=("sweep_trigger_mode:=$POLICY")
+    [ -n "$ROW_PLANNER" ] && EXEC_ARGS+=("sweep_row_planner_id:=$ROW_PLANNER")
     start_bg "$LOG_DIR/executor.log" \
         ros2 launch botzilla_navigation executor.launch.py "${EXEC_ARGS[@]}"
     wait_for_log "$LOG_DIR/executor.log" "HOME latched" 90 "HOME latched — mission running"

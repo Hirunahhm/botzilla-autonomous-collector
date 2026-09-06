@@ -60,6 +60,16 @@ def generate_launch_description():
     )
     sweep_trigger_mode = LaunchConfiguration('sweep_trigger_mode')
 
+    # Control arm for the straight-line sweep planner: 'GridBased' makes row legs
+    # plan exactly as they did before botzilla_straightline_planner existed, so the
+    # A/B pair is a launch argument rather than a code edit between runs.
+    sweep_row_planner_id_arg = DeclareLaunchArgument(
+        'sweep_row_planner_id',
+        default_value='SweepStraight',
+        description="Planner for sweep row legs: 'SweepStraight' or 'GridBased'.",
+    )
+    sweep_row_planner_id = LaunchConfiguration('sweep_row_planner_id')
+
     executor = Node(
         package='botzilla_navigation',
         executable='executor_node',
@@ -76,12 +86,14 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,
             'sweep_trigger_mode': sweep_trigger_mode,
+            'sweep_row_planner_id': sweep_row_planner_id,
         }],
     )
 
     return LaunchDescription([
         use_sim_time_arg,
         sweep_trigger_mode_arg,
+        sweep_row_planner_id_arg,
         LogInfo(msg='[executor] Mission: explore -> collect cube -> deliver to HOME'),
         LogInfo(msg='[executor] HOME is latched at startup from map->base_link.'),
         LogInfo(msg='[executor] Place the robot at the drop-off point before starting.'),

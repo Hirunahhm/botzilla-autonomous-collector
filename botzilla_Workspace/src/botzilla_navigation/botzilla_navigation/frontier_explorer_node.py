@@ -240,8 +240,10 @@ Usage:
 """
 
 import math
+import os
 
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
 from botzilla_navigation.coverage_planning import generate_coverage_waypoints
 from botzilla_navigation.frontier_detection import (
     distance,
@@ -448,6 +450,24 @@ SWEEP_ROW_OVERLAP = 0.10
 SWEEP_ROW_SPACING_M = round(SWEEP_SWATH_WIDTH_M * (1.0 - SWEEP_ROW_OVERLAP), 2)  # 0.86 m
 SWEEP_MIN_RUN_M = 0.3
 
+# planner_server plugin ids (nav2_params.yaml -> planner_server.planner_plugins).
+# DEFAULT_PLANNER_ID must be sent explicitly on every ComputePathToPose goal: nav2 only
+# infers "the one plugin" when exactly one is registered, and SweepStraight makes two.
+DEFAULT_PLANNER_ID = 'GridBased'
+SWEEP_PLANNER_ID = 'SweepStraight'
+
+# generate_coverage_waypoints emits each boustrophedon run as two points in order —
+# the entry endpoint then the exit endpoint — so even queue positions are TRANSIT legs
+# (get to the start of the next row, from wherever the robot happens to be, around
+# whatever is in the way) and odd positions are ROW legs (drive the row itself, along
+# ground already known free). Only the ROW legs are straight by construction, so only
+# they get SweepStraight; planning a transit leg as a straight line would drive it into
+# a wall and, worse, have the pre-check reject the row as unreachable and drop it from
+# the sweep entirely. The role is tagged at queue-build time rather than inferred from
+# the live index, because unreachable waypoints get skipped and would shift the parity.
+SWEEP_LEG_TRANSIT = 'transit'
+SWEEP_LEG_ROW = 'row'
+
 # Sweep once un-swept known-free area exceeds this fraction of total known free area — a
 # fraction, not a fixed square-meterage, so a small first room gets camera-checked almost
 # immediately while a large mostly-swept arena isn't re-triggered by trivial new patches.
@@ -509,6 +529,11 @@ class FrontierExplorerNode(Node):
         self.declare_parameter('camera_mark_range_m', CAMERA_MARK_RANGE_M)
         self.declare_parameter('costmap_safe_cost', COSTMAP_SAFE_COST)
         self.declare_parameter('sweep_row_spacing_m', SWEEP_ROW_SPACING_M)
+        # Planner used for sweep ROW legs. Set to DEFAULT_PLANNER_ID to run the
+        # straight-line planner's control arm — every leg then plans exactly as it
+        # did before botzilla_straightline_planner existed, so an A/B pair can be
+        # collected without rebuilding or editing code between runs.
+        self.declare_parameter('sweep_row_planner_id', SWEEP_PLANNER_ID)
 
         self._sweep_trigger_mode = self.get_parameter('sweep_trigger_mode').value
         if self._sweep_trigger_mode not in SWEEP_TRIGGER_MODES:
@@ -525,13 +550,15 @@ class FrontierExplorerNode(Node):
         self._camera_mark_range_m = self.get_parameter('camera_mark_range_m').value
         self._costmap_safe_cost = self.get_parameter('costmap_safe_cost').value
         self._sweep_row_spacing_m = self.get_parameter('sweep_row_spacing_m').value
+        self._sweep_row_planner_id = self.get_parameter('sweep_row_planner_id').value
 
         self.get_logger().info(
             f'Coverage policy: sweep_trigger_mode={self._sweep_trigger_mode} '
             f'sweep_fraction={self._sweep_fraction} '
             f'cooldown={self._sweep_retrigger_cooldown_s}s '
             f'camera=+/-{math.degrees(self._camera_half_fov_rad):.1f}deg '
-            f'@{self._camera_mark_range_m}m'
+            f'@{self._camera_mark_range_m}m '
+            f'row_planner={self._sweep_row_planner_id}'
         )
 
         self._state = State.IDLE
@@ -571,7 +598,14 @@ class FrontierExplorerNode(Node):
 
         # Coverage sweep — see module docstring's "Coverage sweep" section.
         self._mode = 'FRONTIER'  # 'FRONTIER' | 'SWEEPING'
-        self._sweep_queue = []
+        self._sweep_queue = []  # (x, y, SWEEP_LEG_TRANSIT | SWEEP_LEG_ROW)
+        # planner_server plugin the in-flight goal is pre-checked and executed with.
+        # Set per dispatch; only a sweep ROW leg ever raises it to SWEEP_PLANNER_ID.
+        self._active_planner_id = DEFAULT_PLANNER_ID
+        # A row leg whose straight-line pre-check failed is retried once as a normal
+        # obstacle-avoiding goal before being written off, so introducing the straight
+        # planner can only ever add successful rows, never subtract them.
+        self._sweep_row_retry = None
         self._exploration_complete_published = False
         # Back-to-back stuck-recoveries with no frontier becoming reachable again; once
         # this hits STUCK_RECOVERIES_BEFORE_SWEEP the node stops trying to explore and
@@ -632,6 +666,18 @@ class FrontierExplorerNode(Node):
         self._path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
         self._backup_client = ActionClient(self, BackUp, 'backup')
         self._spin_client = ActionClient(self, Spin, 'spin')
+        # Behavior tree used for sweep row legs so they plan with SweepStraight
+        # instead of GridBased — see navigate_to_pose_sweep_straight.xml. Passed
+        # per-goal through NavigateToPose's `behavior_tree` field rather than by
+        # publishing to PlannerSelector's topic, because that topic is global state
+        # every goal sender shares: a sweep leg would leave SweepStraight selected
+        # for executor_node's next DELIVERING goal and try to drive a straight line
+        # home through the walls.
+        self._sweep_bt_path = os.path.join(
+            get_package_share_directory('botzilla_navigation'),
+            'behavior_trees',
+            'navigate_to_pose_sweep_straight.xml',
+        )
 
         self.create_timer(EVAL_PERIOD_S, self._evaluate)
         # Separate timer, deliberately not folded into _evaluate() — see
@@ -954,6 +1000,9 @@ class FrontierExplorerNode(Node):
         )
         yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
         self._frontier_origin = target
+        # Frontier targets always need obstacle-aware planning.
+        self._active_planner_id = DEFAULT_PLANNER_ID
+        self._sweep_row_retry = None
         self._check_reachability(nav_x, nav_y, yaw)
 
     def _snap_to_reachable(self, target_world):
@@ -1063,9 +1112,15 @@ class FrontierExplorerNode(Node):
             return
 
         nav_x, nav_y = nav_point
+        leg = target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT
+        self._active_planner_id = (
+            self._sweep_row_planner_id if leg == SWEEP_LEG_ROW else DEFAULT_PLANNER_ID
+        )
+        self._sweep_row_retry = None
         self.get_logger().info(
-            f'Sweep waypoint ({target[0]:.2f}, {target[1]:.2f}) -> snapped to reachable '
-            f'point ({nav_x:.2f}, {nav_y:.2f}); {len(self._sweep_queue)} remaining.'
+            f'Sweep {leg} waypoint ({target[0]:.2f}, {target[1]:.2f}) -> snapped to '
+            f'reachable point ({nav_x:.2f}, {nav_y:.2f}); '
+            f'{len(self._sweep_queue)} remaining.'
         )
         yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
         self._frontier_origin = None
@@ -1155,12 +1210,18 @@ class FrontierExplorerNode(Node):
             # to force-clear them just because a sweep is starting.
             self._stuck_since = None
             self._consecutive_recoveries = 0
-            self._sweep_queue = generate_coverage_waypoints(
+            raw_waypoints = generate_coverage_waypoints(
                 msg.data, msg.info.width, msg.info.height, msg.info.resolution,
                 msg.info.origin.position.x, msg.info.origin.position.y,
                 row_spacing_m=self._sweep_row_spacing_m, min_run_m=SWEEP_MIN_RUN_M,
                 swept_mask=self._swept_mask,
             )
+            # Tag entry/exit role now — see SWEEP_LEG_TRANSIT. Keeping the planning
+            # module's output a plain point list leaves its unit tests untouched.
+            self._sweep_queue = [
+                (wx, wy, SWEEP_LEG_ROW if i % 2 else SWEEP_LEG_TRANSIT)
+                for i, (wx, wy) in enumerate(raw_waypoints)
+            ]
             self.get_logger().info(
                 f'Switching to coverage sweep ({reason}): {len(self._sweep_queue)} '
                 f'waypoint(s) queued over the known map.'
@@ -1450,6 +1511,14 @@ class FrontierExplorerNode(Node):
         goal.goal.pose.orientation.z = math.sin(yaw / 2.0)
         goal.goal.pose.orientation.w = math.cos(yaw / 2.0)
         goal.use_start = False  # plan from the robot's current pose
+        # MUST be set explicitly. planner_server only falls back to "the one loaded
+        # plugin" when exactly one is configured; with SweepStraight registered
+        # alongside GridBased an empty planner_id raises InvalidPlanner instead, so
+        # every reachability check failed with error_code 201 (INVALID_PLANNER — not
+        # NO_VALID_PATH, which is 208) and the robot never moved at all. It also has
+        # to be the SAME planner that will execute the goal, or the pre-check answers
+        # a different question than the one being asked.
+        goal.planner_id = self._active_planner_id
 
         self._state = State.CHECKING_PATH
         self._current_target = (x, y)
@@ -1506,6 +1575,25 @@ class FrontierExplorerNode(Node):
                 f'({len(result.result.path.poses)} waypoints); sending NavigateToPose.'
             )
         if not reachable:
+            # A row leg only fails this check because the straight line between the
+            # robot and the row crosses something — usually because the transit leg
+            # before it was skipped, so the robot never reached the row's entry point.
+            # Fall back to the normal obstacle-avoiding planner once before writing the
+            # row off, so the straight-line planner can only add rows, never lose them.
+            if (
+                self._active_planner_id == SWEEP_PLANNER_ID
+                and self._sweep_row_retry is None
+                and self._pending_yaw is not None
+            ):
+                self.get_logger().info(
+                    f'Sweep row leg to ({x:.2f}, {y:.2f}) has no straight-line path '
+                    f'(error_code={result.result.error_code}); retrying it with '
+                    f'{DEFAULT_PLANNER_ID}.'
+                )
+                self._sweep_row_retry = (x, y)
+                self._active_planner_id = DEFAULT_PLANNER_ID
+                self._check_reachability(x, y, self._pending_yaw)
+                return
             self.get_logger().info(
                 f'Target ({x:.2f}, {y:.2f}) has no valid path '
                 f'(error_code={result.result.error_code}); skipping without spending a '
@@ -1540,9 +1628,17 @@ class FrontierExplorerNode(Node):
             self._frontier_origin = None
             self._state = State.IDLE
             return
-        self.get_logger().info(f'Sending NavigateToPose goal to ({x:.2f}, {y:.2f}).')
+        self.get_logger().info(
+            f'Sending NavigateToPose goal to ({x:.2f}, {y:.2f}) '
+            f'via {self._active_planner_id}.'
+        )
 
         goal = NavigateToPose.Goal()
+        # Only a sweep ROW leg gets the straight-line tree; everything else (frontier
+        # targets, and sweep TRANSIT legs to the start of a row) keeps the stock tree
+        # and GridBased. Empty string means "use bt_navigator's default tree".
+        if self._active_planner_id == SWEEP_PLANNER_ID:
+            goal.behavior_tree = self._sweep_bt_path
         goal.pose.header.frame_id = MAP_FRAME
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = x
