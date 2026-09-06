@@ -314,10 +314,19 @@ PROGRESS_EPSILON_M = 0.15
 # time is the honest currency — fast clear-driven increments just refresh the same
 # window instead of consuming a scarce one.
 #
-# 90 s covers many rounds of the RoundRobin (BackUp ~2.6 s measured, Spin ~7 s, Wait
-# 5 s) while keeping the worst case at 90 + NO_PROGRESS_TIMEOUT_S = 120 s, far below
-# GOAL_ABS_TIMEOUT_S (420 s). A goal still recovering after 90 s is not recovering.
-RECOVERY_BUDGET_S = 90.0
+# 90 s -> 20 s, measured. 90 s was chosen to cover many RoundRobin rounds, and run 20
+# (2026-09-06) showed that is the wrong trade: stalls fell 1.02 -> 0.23/min but
+# coverage was ~2.5x SLOWER than run 18 (20% coverage at 6.5 min vs 2.3 min, 30% never
+# reached). Six goals consumed the whole budget plus the watchdog, ~120 s each, in a
+# 12.9 min run. The 30 s cancellation being "wasted" was doing real work: abandoning a
+# hopeless goal quickly and moving to a reachable one. Stall count was a bad proxy —
+# it fell mostly because that time stopped being COUNTED as a stall.
+#
+# 20 s is one full RoundRobin cycle with margin (clear ~0 s + BackUp 2.6 s + Spin 7 s
+# + Wait 5 s ~= 15 s), which is all this needs to do: stop a single behaviour being
+# cancelled mid-manoeuvre, the original complaint. Worst case per goal is now
+# 20 + NO_PROGRESS_TIMEOUT_S = 50 s rather than 120 s.
+RECOVERY_BUDGET_S = 20.0
 
 # Absolute backstop regardless of the progress signal, for the degenerate case where
 # feedback never arrives at all. Set well above the ~300s worst-case Nav2-internal abort
@@ -595,6 +604,13 @@ class FrontierExplorerNode(Node):
         # did before botzilla_straightline_planner existed, so an A/B pair can be
         # collected without rebuilding or editing code between runs.
         self.declare_parameter('sweep_row_planner_id', SWEEP_PLANNER_ID)
+        # Planner for every non-sweep-row goal (frontier targets, sweep transits, and
+        # the fallback when a straight-line row plan fails). Parameterised so
+        # GridBased/NavFn and the cost-aware SmacGrid can be A/B'd across runs without
+        # a rebuild — see nav2_params.yaml's SmacGrid block for why a cost-aware global
+        # planner is the actual fix for obstacle hugging. Default is unchanged, so a
+        # bare run plans exactly as every run before this one.
+        self.declare_parameter('default_planner_id', DEFAULT_PLANNER_ID)
         # Flat [x0,y0,x1,y1,...] in base_link metres. MUST match nav2_params.yaml's
         # `footprint` — if the two disagree, this node will happily pick goals the
         # controller's ObstacleFootprint critic then refuses to drive to.
@@ -619,6 +635,7 @@ class FrontierExplorerNode(Node):
         self._costmap_safe_cost = self.get_parameter('costmap_safe_cost').value
         self._sweep_row_spacing_m = self.get_parameter('sweep_row_spacing_m').value
         self._sweep_row_planner_id = self.get_parameter('sweep_row_planner_id').value
+        self._default_planner_id = self.get_parameter('default_planner_id').value
         flat_footprint = self.get_parameter('footprint').value
         if len(flat_footprint) < 6 or len(flat_footprint) % 2:
             self.get_logger().error(
@@ -637,6 +654,7 @@ class FrontierExplorerNode(Node):
             f'cooldown={self._sweep_retrigger_cooldown_s}s '
             f'camera=+/-{math.degrees(self._camera_half_fov_rad):.1f}deg '
             f'@{self._camera_mark_range_m}m '
+            f'planner={self._default_planner_id} '
             f'row_planner={self._sweep_row_planner_id} '
             f'footprint={len(self._footprint_m)}pt '
             f'fwd={max(v[0] for v in self._footprint_m):.2f}m'
@@ -694,7 +712,7 @@ class FrontierExplorerNode(Node):
         self._rows_off_entry = 0
         # planner_server plugin the in-flight goal is pre-checked and executed with.
         # Set per dispatch; only a sweep ROW leg ever raises it to SWEEP_PLANNER_ID.
-        self._active_planner_id = DEFAULT_PLANNER_ID
+        self._active_planner_id = self._default_planner_id
         # A row leg whose straight-line pre-check failed is retried once as a normal
         # obstacle-avoiding goal before being written off, so introducing the straight
         # planner can only ever add successful rows, never subtract them.
@@ -1096,7 +1114,7 @@ class FrontierExplorerNode(Node):
         yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
         self._frontier_origin = target
         # Frontier targets always need obstacle-aware planning.
-        self._active_planner_id = DEFAULT_PLANNER_ID
+        self._active_planner_id = self._default_planner_id
         self._sweep_row_retry = None
         self._check_reachability(nav_x, nav_y, yaw)
 
@@ -1293,7 +1311,7 @@ class FrontierExplorerNode(Node):
         if leg == SWEEP_LEG_ROW and not off_entry:
             self._active_planner_id = self._sweep_row_planner_id
         else:
-            self._active_planner_id = DEFAULT_PLANNER_ID
+            self._active_planner_id = self._default_planner_id
         # Remember where a transit is headed: that is the entry of the row after it.
         self._pending_row_entry = (nav_x, nav_y) if leg == SWEEP_LEG_TRANSIT else None
         self._sweep_row_retry = None
@@ -1793,10 +1811,10 @@ class FrontierExplorerNode(Node):
                 self.get_logger().info(
                     f'Sweep row leg to ({x:.2f}, {y:.2f}) has no straight-line path '
                     f'(error_code={result.result.error_code}); retrying it with '
-                    f'{DEFAULT_PLANNER_ID}.'
+                    f'{self._default_planner_id}.'
                 )
                 self._sweep_row_retry = (x, y)
-                self._active_planner_id = DEFAULT_PLANNER_ID
+                self._active_planner_id = self._default_planner_id
                 self._check_reachability(x, y, self._pending_yaw)
                 return
             self.get_logger().info(

@@ -70,6 +70,15 @@ def generate_launch_description():
     )
     sweep_row_planner_id = LaunchConfiguration('sweep_row_planner_id')
 
+    # Global planner for every non-sweep-row goal. Same reasoning as above: the
+    # GridBased/NavFn vs cost-aware SmacGrid comparison is an argument, not an edit.
+    default_planner_id_arg = DeclareLaunchArgument(
+        'default_planner_id',
+        default_value='GridBased',
+        description="Planner for frontier/transit goals: 'GridBased' or 'SmacGrid'.",
+    )
+    default_planner_id = LaunchConfiguration('default_planner_id')
+
     executor = Node(
         package='botzilla_navigation',
         executable='executor_node',
@@ -87,6 +96,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'sweep_trigger_mode': sweep_trigger_mode,
             'sweep_row_planner_id': sweep_row_planner_id,
+            'default_planner_id': default_planner_id,
         }],
     )
 
@@ -94,6 +104,7 @@ def generate_launch_description():
         use_sim_time_arg,
         sweep_trigger_mode_arg,
         sweep_row_planner_id_arg,
+        default_planner_id_arg,
         LogInfo(msg='[executor] Mission: explore -> collect cube -> deliver to HOME'),
         LogInfo(msg='[executor] HOME is latched at startup from map->base_link.'),
         LogInfo(msg='[executor] Place the robot at the drop-off point before starting.'),

@@ -30,6 +30,14 @@
 #                                  control arm, planning them the way every run
 #                                  before botzilla_straightline_planner did.
 #                                  Transit legs always use GridBased either way.
+#   --planner GridBased|SmacGrid   global planner for frontier targets and sweep
+#                                  transit legs. 'GridBased' (default) is NavFn,
+#                                  exactly as every run so far. 'SmacGrid' is
+#                                  SmacPlanner2D, which scores costmap cost
+#                                  explicitly and routes down the middle of free
+#                                  space instead of hugging walls — the measured
+#                                  cause of the obstacle-hugging deadlock. See
+#                                  config/nav2_params.yaml's SmacGrid block.
 #   --collision-monitor            splice nav2_collision_monitor into the cmd_vel
 #                                  chain: an independent, scan-based stop-before-
 #                                  contact using the robot's real (asymmetric)
@@ -75,6 +83,7 @@ FORCE_CLEAN=0
 RUN_METRICS=0
 POLICY=""          # empty => don't pass it; executor.launch.py keeps its own default
 ROW_PLANNER=""     # empty => launch default (SweepStraight)
+PLANNER=""         # empty => launch default (GridBased)
 COLLISION_MONITOR=0
 LAYOUT=""
 
@@ -95,6 +104,8 @@ while [ $# -gt 0 ]; do
         --policy=*)    POLICY="${1#*=}" ;;
         --row-planner) ROW_PLANNER="${2:-}"; shift ;;
         --row-planner=*) ROW_PLANNER="${1#*=}" ;;
+        --planner)     PLANNER="${2:-}"; shift ;;
+        --planner=*)   PLANNER="${1#*=}" ;;
         --collision-monitor) COLLISION_MONITOR=1 ;;
         --layout)      LAYOUT="${2:-}"; shift ;;
         --layout=*)    LAYOUT="${1#*=}" ;;
@@ -117,6 +128,13 @@ fi
 if [ -n "$ROW_PLANNER" ] && [ "$ROW_PLANNER" != "SweepStraight" ] \
    && [ "$ROW_PLANNER" != "GridBased" ]; then
     echo "ERROR: --row-planner must be 'SweepStraight' or 'GridBased' (got: '$ROW_PLANNER')" >&2
+    exit 2
+fi
+# Same reasoning again: an unregistered planner id is only rejected by Nav2, per goal,
+# as InvalidPlanner — which presents as a robot that never moves rather than as a bad
+# flag. Both names below must exist in nav2_params.yaml's planner_plugins.
+if [ -n "$PLANNER" ] && [ "$PLANNER" != "GridBased" ] && [ "$PLANNER" != "SmacGrid" ]; then
+    echo "ERROR: --planner must be 'GridBased' or 'SmacGrid' (got: '$PLANNER')" >&2
     exit 2
 fi
 
@@ -452,6 +470,7 @@ if [ "$RUN_MISSION" = 1 ]; then
     EXEC_ARGS=(use_sim_time:=false)
     [ -n "$POLICY" ] && EXEC_ARGS+=("sweep_trigger_mode:=$POLICY")
     [ -n "$ROW_PLANNER" ] && EXEC_ARGS+=("sweep_row_planner_id:=$ROW_PLANNER")
+    [ -n "$PLANNER" ] && EXEC_ARGS+=("default_planner_id:=$PLANNER")
     start_bg "$LOG_DIR/executor.log" \
         ros2 launch botzilla_navigation executor.launch.py "${EXEC_ARGS[@]}"
     wait_for_log "$LOG_DIR/executor.log" "HOME latched" 90 "HOME latched — mission running"

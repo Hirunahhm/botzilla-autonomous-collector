@@ -347,7 +347,52 @@ planner_server:
     # botzilla_straightline_planner for why: GridBased/NavFn curves off pre-validated
     # straight rows toward locally-cheaper cells, which reads as the robot wandering
     # during the boustrophedon sweep instead of tracing it.
-    planner_plugins: ["GridBased", "SweepStraight"]
+    planner_plugins: ["GridBased", "SweepStraight", "SmacGrid"]
+    # SmacGrid is the cost-aware alternative to GridBased/NavFn, selectable per run
+    # with run_full_mission.sh --planner SmacGrid. NOT the default: a bare run still
+    # uses GridBased, so the shipped behaviour is unchanged.
+    #
+    # Why it exists. NavFn weights costmap cost only weakly, so it produces paths that
+    # graze corners and hug walls, and DWB follows them there. Measured in run 18
+    # (2026-09-06) at a deadlock: the footprint sat on cost 253 (INSCRIBED) in 54 of 64
+    # consecutive costmap_raw samples — i.e. the robot travelled essentially always
+    # inside the inscribed band, with the real lethal cells just beyond. From there
+    # DWB's ObstacleFootprint vetoed every trajectory heading into the obstacle
+    # (60 cycles at 1.00 ObstacleFootprint, vetoing all 440 by itself) while the
+    # Oscillation critic banned the reversal that would have turned away. That is the
+    # obstacle-hugging deadlock, and it is a PLANNING problem: the controller was
+    # asked to follow a path that ran through the band.
+    #
+    # SmacPlanner2D scores cost explicitly via cost_travel_multiplier, so it routes
+    # down the middle of free space instead. This addresses the cause; the recovery
+    # and watchdog work done before it only changed how long the robot waited before
+    # giving up (run 20 measured that trade as a net loss: stalls 1.02 -> 0.23/min but
+    # coverage ~2.5x slower).
+    SmacGrid:
+      plugin: "nav2_smac_planner::SmacPlanner2D"
+      # Both matched to GridBased so the arms differ ONLY in the search, not in what
+      # counts as a legal goal. See GridBased below for why each value is what it is —
+      # especially tolerance, where 0.5 let unreachable goals "succeed" without moving.
+      tolerance: 0.1
+      allow_unknown: false
+      # The knob this whole plugin is here for: higher steers harder away from
+      # high-cost cells. 2.0 is the library default; 3.0 leans into clearance
+      # deliberately, since hugging is the failure being targeted. If it proves too
+      # conservative (goals rejected that GridBased could reach), lower it toward 2.0
+      # before concluding the planner does not help.
+      cost_travel_multiplier: 3.0
+      # Arena is small and the global costmap is already 0.05 m, so downsampling would
+      # trade the resolution the asymmetric footprint depends on for speed we do not
+      # need.
+      downsample_costmap: false
+      downsampling_factor: 1
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      # Smac2D searches more than NavFn. The explorer pre-checks every target with
+      # ComputePathToPose and gives up on it after PATH_CHECK_TIMEOUT_S, so this must
+      # stay well under that or reachability checks would time out rather than answer.
+      max_planning_time: 2.0
+      use_final_approach_orientation: false
     SweepStraight:
       plugin: "botzilla_straightline_planner::StraightLinePlanner"
       interpolation_resolution: 0.05
