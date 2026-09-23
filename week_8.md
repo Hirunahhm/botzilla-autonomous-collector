@@ -1,19 +1,30 @@
 # Week 8 Progress Report: Drivetrain Root Cause, Custom Nav2 Plugins, and the Obstacle-Hugging Deadlock
 
 This document covers Week 8 of the Semester 5 project (*Interleaved Exploration and Coverage
-for Target Retrieval under Short-Range Perception*), all of it on the `research` branch.
+for Target Retrieval under Short-Range Perception*), across the full series of commits on the
+`research` branch (`dc97d37` through `6be1fc1`).
 
-Two results dominate the week:
+Five core developments define the week's work:
 
 1. **A one-line condition in the Kobuki driver was destroying up to 91% of every commanded
    turn.** It had been present for the entire project and was invisible to every layer above
    it — the controller commanded a turn, the driver reported sending it, and the robot
-   physically barely moved. Found by bench measurement, not by reading code.
-2. **The repeated "no progress for 30s" stalls are a *planning* problem, not a control
+   physically barely moved. Found by bench measurement, not by reading code (§1).
+2. **`botzilla_straightline_planner` — the workspace's first C++ plugin.** Bypassed NavFn's
+   corner-cutting during boustrophedon sweeps to enforce strict geometric lines with forward-facing
+   headings, boosting row completion from 61% to 91% (§2).
+3. **Perception-autonomy gating and row-entry verification.** Eliminated phantom cube interrupts
+   caused by depth-less YOLO detections ($z=0.0$) seizing the base in empty arenas, and protected
+   sweep rows against stranded off-entry dispatches (§3).
+4. **The repeated "no progress for 30s" stalls are a *planning* problem, not a control
    problem.** The robot travels inside the costmap's inscribed band, and from there DWB's
-   `ObstacleFootprint` critic legitimately vetoes every trajectory. Four separate attempts to
-   fix this at the controller/recovery layer produced one clear regression and one
-   improvement; the change that actually addressed the cause was a cost-aware global planner.
+   `ObstacleFootprint` critic legitimately vetoes every trajectory. Resolved by reordering
+   recoveries (`BackUp` before `Spin`), making the stall watchdog recovery-aware, and introducing
+   `SmacGrid` (`nav2_smac_planner::SmacPlanner2D`) for cost-aware centering (§5–§8).
+5. **Empirical evaluation infrastructure & SLAM loop-closure recovery.** Deployed automated
+   hardware mission runner `run_full_mission.sh`, passive ground-truth recorder
+   `mission_metrics_node.py`, Fast-DDS offboard telemetry (`ros_dds.md`), and corrected RTAB-Map's
+   Visual-ICP loop closure registration (§4).
 
 A recurring theme, and the more useful lesson: **several plausible fixes made things worse,
 and the metric that looked like the goal (stall count) turned out to be a bad proxy.** Those
@@ -28,7 +39,7 @@ not be repeated.
 
 Across every run, the frontier explorer's watchdog fired repeatedly with
 `Goal to (x, y) stalled (no progress for 3Xs)`. Five hypotheses were investigated and
-rejected before the real cause was found (§7).
+rejected before the real cause was found (§9).
 
 ### Cause
 
@@ -97,7 +108,7 @@ motor torque fell as the pack drained. The deadband sweep also refuted it direct
 ### Also added
 
 `/battery` (`sensor_msgs/BatteryState`) and `/wheel_pwm` (`std_msgs/Int16MultiArray`).
-`Batteryvolt` and the PWM bytes were already parsed by `Kobuki.py` and never surfaced, which
+`Batteryvolt` and the PWM bytes were already parsed by `KobukiDriver.py` and never surfaced, which
 left a real failure mode unobservable. PWM matters as much as voltage because together they
 separate the two explanations: high PWM with little motion means the wheels are loaded or
 stuck; low PWM means the driver never asked for enough.
@@ -136,7 +147,128 @@ cell. This is the workspace's first `ament_cmake` (C++) package alongside the fo
 
 ---
 
-## 3. Waypoint Dedup — Two Guards on the Snapped Point
+## 3. Perception-Autonomy Gating & Row-Entry Verification
+
+### 3.1 Phantom Cube Interrupt Filter (`executor_node.py`)
+
+**Problem.** During exploration and coverage sweeps, the robot repeatedly aborted active Nav2
+goals, transitioned into `State.TARGETING`, and paused for ~5 s to chase non-existent targets.
+Measured on a deliberately cleared arena with zero cubes present (run `20260906-161239`):
+**5 separate false detections**, all occurring at the extreme frame edge ($x \approx -0.85\text{ m}$)
+with depth reported as $z = 0.00\text{ m}$. Each cancelled an in-flight sweep goal before timing out.
+
+**Root Cause.** `yolo_node` emits $z = 0.0$ in two distinct situations:
+1. A genuine cube enters the camera's physical blind-spot ($< 0.5\text{ m}$, `KINECT_MIN_RANGE_M`).
+2. Depth lookup fails (e.g. edge-of-frame noise, boundary occlusion, or low surface texture).
+
+At the executor layer, these cases are indistinguishable. Previously, `executor_node.py` checked
+only `msg.z > self._cube_max_range_m` ($1.0\text{ m}$). Because $0.0 \le 1.0$, every depth-less
+false positive bypassed the gate and seized the base.
+
+**Fix.** A state-gated check in `_detection_cb`:
+```python
+if msg.z == 0.0 and self._state == State.EXPLORING:
+    return
+```
+A cube chase can only be initiated when the robot has measured an actual distance
+($0.5\text{ m} \le z \le 1.0\text{ m}$). The capture sequence is untouched: `State.APPROACHING`
+still relies on the $z = 0.0$ sentinel to confirm blind-spot entry before triggering
+`State.CAPTURING`.
+
+**Result:** In subsequent runs, phantom interrupts dropped from **5 → 0**, completely preventing
+spurious goal cancellations during coverage sweeps.
+
+### 3.2 Row-Entry Tolerance & Off-Entry Fallback (`frontier_explorer_node.py`)
+
+**Problem.** A `SweepStraight` row leg assumes the robot is standing at that row's designated
+entry point. But the transit leg preceding it is an ordinary Nav2 obstacle-avoiding goal that
+can be aborted, stalled, or interrupted by cube collection. When that happened, the robot was
+stranded in the middle of the room. Commanding `SweepStraight` from the middle of the room
+forced an angled line cutting directly through furniture, walls, or costmap inflation, causing
+`ComputePathToPose` to fail immediately with error code 208 (`NO_VALID_PATH`).
+
+**Fix.** Track `_pending_row_entry` and enforce `ROW_ENTRY_TOLERANCE_M = 0.5\text{ m}`:
+```python
+off_entry = False
+if leg == SWEEP_LEG_ROW and self._pending_row_entry is not None:
+    entry_dist = distance(robot_x, robot_y, self._pending_row_entry[0], self._pending_row_entry[1])
+    off_entry = entry_dist > ROW_ENTRY_TOLERANCE_M
+    if off_entry:
+        self._rows_off_entry += 1
+```
+* If `entry_dist <= 0.5 m`: Dispatches cleanly with `SweepStraight`.
+* If stranded (`entry_dist > 0.5 m`): Automatically routes the leg as an obstacle-avoiding
+  transit using `DEFAULT_PLANNER_ID` (`GridBased`), allowing the robot to navigate around obstacles
+  to the row endpoint instead of failing.
+* Surfaces `_rows_off_entry` at sweep exhaustion so interruption-induced degradation is observable.
+
+*Commit: `53be328`*
+
+---
+
+## 4. Automated Mission Architecture & Ground-Truth Infrastructure
+
+### 4.1 Ground-Truth Metrics Logging (`mission_metrics_node.py`)
+
+To rigorously evaluate the core thesis (*"LiDAR mapping vs Camera inspection deficit"*), a passive,
+subscribe-only metrics node was implemented:
+* **Metric Outputs:** Recorded to `<logdir>/metrics.jsonl` at 10 Hz.
+* **Fields Tracked:** Cumulative trajectory distance ($\text{m}$), mapped free cells ($5\text{ cm}$
+  resolution), swept inspected cells, instantaneous coverage percentage, FSM state transitions,
+  and per-cube first inspection time vs delivery time.
+* **Design Constraint:** Subscribe-only by construction; publishes zero ROS topics so it cannot
+  perturb mission timing or introduce controller latency. Unit-tested in `test/test_mission_metrics.py`.
+
+*Commit: `247eb89`*
+
+### 4.2 Unified Launch Orchestration (`run_full_mission.sh`)
+
+Replaced ad-hoc multi-terminal bringup with a single hardened shell orchestrator:
+* **Subsystem Phasing:** Sequentially launches and confirms readiness via regex log-scanning (`wait_for_log`):
+  1. Fast-DDS discovery server (`11811`).
+  2. Base hardware drivers (Kobuki serial, RPLiDAR C1, Kinect bridge, EKF).
+  3. RTAB-Map SLAM (`/map` and TF ready).
+  4. Nav2 navigation stack (waits for `Managed nodes are active`).
+  5. YOLO cube detector inside a GPU-accelerated Docker container (`botzilla/yolo:jazzy`).
+  6. Mission metrics logger & unified mission executor.
+* **Signal Trapping:** Traps `SIGINT`/`SIGTERM` to issue clean teardown across all background PIDs,
+  stop motors, and dump execution summaries.
+* **Policy Configuration:** Exposes `--policy fraction|exhaustion` and `--row-planner SweepStraight|GridBased`
+  for repeatable empirical comparisons.
+
+*Commits: `247eb89`, `dc97d37`, `602074b`, `44d8aa7`*
+
+### 4.3 RTAB-Map SLAM Loop Closure Recovery (`rtabmap.launch.py`)
+
+**Problem.** In initial hardware runs, RTAB-Map accumulated unbounded odometry drift over 31.2 m
+of travel: **19 loop closures were rejected and 0 accepted**. As odometry drifted, the map frame
+deformed, causing the coverage tracker to falsely count old floor as newly mapped (free cell count
+jumped 18,632 → 20,396 in 5 minutes while revisiting known space).
+
+**Root Cause & Fix (Commit `44d8aa7`):**
+1. **Strategy Mismatch:** `Reg/Strategy` was set to `'1'` (ICP only), conflicting with the comment
+   asserting Visual+ICP. Changed to `'2'` (`VisIcp`).
+2. **Inlier Rejection:** Place recognition found 72–85 visual feature matches, but geometric
+   verification rejected them against the default threshold of 20 inliers (inliers were scoring
+   14/20 and 16/20). Lowered `Vis/MinInliers` from 20 to 15, immediately converting near-misses
+   into accepted loop closures and anchoring the map coordinate frame.
+
+### 4.4 Headless Offboard Telemetry (`ros_dds.md`)
+
+Remote desktop streaming via NoMachine (`nxnode.bin`, `nxexec`) was discovered running at Linux
+realtime priority (`SCHED_RR`), preempting the Nav2 controller thread and causing the control
+loop rate to collapse from **20 Hz down to 4.7 Hz** (the direct cause of jerky, halting base motion).
+* **Fix:** Stopped NoMachine daemons and transitioned to headless execution on the Jetson Orin Nano.
+* **Fast-DDS Discovery Server:** Configured a Fast-DDS Discovery Server (`hirunahhm.local:11811`,
+  `ROS_SUPER_CLIENT=true`, `rmw_fastrtps_cpp`) allowing developer workstations to run RViz locally
+  over Wi-Fi, visualizing TF, `/map`, `/scan`, and `/swept_coverage_map` with zero rendering or
+  desktop overhead on the Jetson CPU.
+
+*Commit: `99a5e3a`, document `ros_dds.md`*
+
+---
+
+## 5. Waypoint Dedup — Two Guards on the Snapped Point
 
 **Problem.** `_snap_to_reachable` can map two different queue points onto the *same* reachable
 cell. Measured in run 18: the row waypoint `(3.96, 1.92)` and the transit immediately after it
@@ -182,7 +314,7 @@ radius.
 
 ---
 
-## 4. Recovery Ordering: BackUp Before Spin
+## 6. Recovery Ordering: BackUp Before Spin
 
 **This robot cannot pivot in a tight spot, and that cannot be tuned away.** The footprint's
 circumscribed radius is `sqrt(0.36² + 0.215²) = 0.419 m`, so an in-place turn needs **0.84 m
@@ -213,7 +345,7 @@ would have failed to load at runtime with an obscure BT error.
 
 ---
 
-## 5. Recovery-Aware Watchdog — A Negative Result, Then a Correction
+## 7. Recovery-Aware Watchdog — A Negative Result, Then a Correction
 
 This is the most instructive sequence of the week and is recorded in full.
 
@@ -260,9 +392,11 @@ was doing real work — abandoning a hopeless goal quickly and moving to a reach
 mid-manoeuvre. Worst case per goal drops from 120 s to 50 s. Run 21 recovered 30%/40%/50%
 coverage levels that run 20 never reached.
 
+*Commits: `4acea45`, `6be1fc1`*
+
 ---
 
-## 6. The Obstacle-Hugging Deadlock and the Cost-Aware Planner
+## 8. The Obstacle-Hugging Deadlock and the Cost-Aware Planner
 
 ### Diagnosis
 
@@ -311,11 +445,11 @@ Selection is a launch parameter (`default_planner_id`) with the **default unchan
 `GridBased`**, plus `run_full_mission.sh --planner GridBased|SmacGrid`, so a bare run plans
 exactly as before and the A/B needs no rebuild.
 
-*Uncommitted at time of writing.*
+*Commit: `6be1fc1`*
 
 ---
 
-## 7. Rejected Hypotheses
+## 9. Rejected Hypotheses
 
 Every one of these was measured and rejected. They are listed so they are not re-tried.
 
@@ -332,7 +466,7 @@ Every one of these was measured and rejected. They are listed so they are not re
 
 ---
 
-## 8. Results
+## 10. Results
 
 All runs on hardware, same arena, `policy=fraction`. Minutes to reach each coverage level.
 
@@ -346,7 +480,7 @@ All runs on hardware, same arena, `policy=fraction`. Minutes to reach each cover
 
 **Run 21's shape is the result that matters: slower to start, but it does not hit a wall.**
 Run 18's early speed came from easy nearby frontiers; it then bogged down at ~48% in exactly
-the deadlocks described in §6. Run 21 pays an early cost and keeps climbing, reaching 50% and
+the deadlocks described in §8. Run 21 pays an early cost and keeps climbing, reaching 50% and
 60% — levels run 18 never touched.
 
 ### Correction on "best on record"
@@ -375,13 +509,13 @@ precisely so this needs no code change.
 
 ---
 
-## 9. Open Items
+## 11. Open Items
 
 **Blocking the attribution claim**
 * Run the `--planner GridBased` control on the current build.
 
 **Known defects**
-* **Row-level abandonment** (§3) — point dedup cannot catch a whole bad sweep row.
+* **Row-level abandonment** (§5) — point dedup cannot catch a whole bad sweep row.
 * **SmacGrid's early deficit** — 20% at 6.6 min vs 2.3. Planner startup logs
   `Inflation layer ... not set sufficiently for optimized non-circular collision checking`,
   so Smac fell back to its slow collision path, which it warns "will substantially impact
@@ -391,14 +525,13 @@ precisely so this needs no code change.
   and double `rclpy.shutdown()` — are fixed.)
 * **YOLO false positives cluster at frame edges.** The `z == 0.0` gate removed only the
   depth-less subset. Phantom detections went 5 → 0 in run 14, but the edge cluster remains.
-* `rtabmap.launch.py` still needs reverting (`Reg/Strategy` back to `'1'`, drop
-  `Vis/MinInliers: '15'`) — long outstanding.
+* `rtabmap.launch.py` loop-closure parameters tuned (`Reg/Strategy: '2'`, `Vis/MinInliers: '15'`)
+  require ongoing validation across varied lighting environments.
 
 **Not yet attempted**
 * Swept-coverage costmap layer; coverage-aware DWB critic; sweep-specific goal checker.
 * Rebalancing DWB scales — `ObstacleFootprint.scale: 0.8` against `PathAlign/PathDist: 32.0`
   means path-following outweighs stay-clear by ~40×.
 
-**Repo state.** Commits `99a5e3a`, `53be328`, `56fd9de`, `4acea45` are on `research`. The
-SmacGrid work and `RECOVERY_BUDGET_S = 20.0` are uncommitted across
-`nav2_params.yaml`, `frontier_explorer_node.py`, `executor.launch.py`, `run_full_mission.sh`.
+**Repo state.** Commits `dc97d37`, `247eb89`, `602074b`, `44d8aa7`, `99a5e3a`, `53be328`,
+`56fd9de`, `4acea45`, and `6be1fc1` are all committed and clean on the `research` branch.

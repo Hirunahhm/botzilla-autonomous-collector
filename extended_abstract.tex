@@ -1,0 +1,286 @@
+%==============================================================================
+% ERU Symposium --- Extended Abstract
+%
+% Formatting follows "1. ERUS Extended-Abstract_Template.docx":
+%   A4 paper, two-column body, IEEE conference style, TWO PAGES INCLUDING
+%   REFERENCES. The template shows no separate Abstract block (keywords follow
+%   the author block directly), so none is used here.
+%
+% Compile:  pdflatex extended_abstract.tex   (twice, for references)
+%
+% >>> BEFORE SUBMITTING: fill in every field marked TODO. <<<
+%==============================================================================
+\documentclass[conference,a4paper,10pt]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage[a4paper,top=0.75in,bottom=1.0in,left=0.63in,right=0.63in,
+            columnsep=0.25in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{textcomp}
+\usepackage{xcolor}
+
+% Ragged-bottom columns read better in a 2-page extended abstract.
+\raggedbottom
+
+\begin{document}
+
+\title{Interleaved Frontier Exploration and Camera Coverage\\
+for Target Retrieval under Short-Range Perception}
+
+%------------------------------------------------------------------------------
+% AUTHOR BLOCK
+% The template is built for up to six authors, laid out left-to-right and then
+% down. Delete unused \IEEEauthorblockN/A pairs; with fewer than three authors
+% the remaining blocks re-centre automatically.
+% TODO: confirm the spelling of every name, department, institution and city.
+%------------------------------------------------------------------------------
+\author{
+\IEEEauthorblockN{Hiruna Malavipathirana}
+\IEEEauthorblockA{\textit{Computer Science and Engineering Department} \\
+\textit{University of Moratuwa} \\
+Matara, Sri Lanka \\
+hirunamalavipathirana.333@gmail.com}
+}
+
+\maketitle
+
+\begin{IEEEkeywords}
+autonomous exploration, coverage path planning, mobile robotics, ROS~2,
+sensor footprint
+\end{IEEEkeywords}
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+Autonomous retrieval of objects from an unknown indoor space requires a robot to
+do two things that are usually treated as one: build a map of the space, and
+\emph{observe} the space with the sensor that actually detects the target. On a
+low-cost differential-drive platform these two tasks are performed by sensors
+with radically different footprints. A 2D~LiDAR maps a full \(360^{\circ}\)
+sweep out to several metres, whereas an RGB-D camera used for object detection
+covers a narrow forward cone --- on our platform a \(57^{\circ}\) horizontal
+field of view (\(\pm 28.5^{\circ}\)) out to a usable depth of approximately
+\(1.0\,\mathrm{m}\).
+
+Classical frontier exploration~\cite{yamauchi} terminates when no frontier
+between known-free and unknown space remains, i.e.\ when the \emph{mapping}
+sensor has seen everything. This criterion says nothing about whether the
+\emph{detection} sensor has ever pointed at a given patch of floor. A robot can
+therefore declare exploration complete while most of the mapped floor has never
+entered the camera cone, and any target lying there is missed.
+
+This work addresses that mismatch. The \textbf{aim} is to raise the fraction of
+mapped floor actually inspected by the short-range detector, without an
+unacceptable increase in mission time. The \textbf{objectives} are to (i)~track,
+online, which map cells the camera cone has passed over; (ii)~use that quantity
+to decide \emph{when} to interrupt exploration for a systematic coverage sweep;
+and (iii)~evaluate the interleaved policy against an explore-then-sweep baseline
+on real hardware.
+
+%==============================================================================
+\section{Literature Review}
+%==============================================================================
+Frontier-based exploration~\cite{yamauchi} remains the dominant paradigm for
+autonomous mapping and underlies most ROS implementations. Coverage path
+planning is a separate and mature literature, surveyed by
+Choset~\cite{choset} and Galceran and Carreras~\cite{galceran}, in which
+boustrophedon (lawnmower) decompositions guarantee that a known region is
+swept by a tool of known width.
+
+The two are normally solved in sequence: explore to build a map, then plan
+coverage over the completed map. That separation is sound when the mapping and
+working footprints coincide, but fails when the detector is much
+shorter-ranged, because exploration's termination criterion is blind to
+detector coverage. Next-best-view and active-search methods select viewpoints
+for a target sensor but generally assume the map already exists.
+
+The gap addressed here is therefore one of \emph{scheduling}: given that both
+exploration and detector coverage are necessary, and the second is far slower
+per unit area, when should a robot switch between them?
+
+%==============================================================================
+\section{Materials and Methods}
+%==============================================================================
+
+\subsection{Platform and Software Stack}
+Experiments used a Kobuki differential-drive base with an RGB-D camera and a
+360\textdegree{} 2D~LiDAR, computing on an NVIDIA Jetson Orin Nano. The stack is
+ROS~2 Jazzy with RTAB-Map~\cite{rtabmap} for SLAM and
+Nav2~\cite{nav2} for planning and control, using the DWB local
+planner~\cite{dwa}. Target detection uses a YOLO model in a GPU container.
+The robot footprint is a measured asymmetric polygon
+(\(0.36\,\mathrm{m}\) forward, \(0.22\,\mathrm{m}\) rear,
+\(0.215\,\mathrm{m}\) half-width), which matters because every
+inflation-derived test in Nav2 is built on an inscribed circle and cannot see
+the forward overhang.
+
+\subsection{Swept-Coverage Tracking}
+A \emph{swept mask} is maintained in parallel with the occupancy grid. On every
+pose update, the map cells falling inside the camera cone
+(\(57^{\circ}\) horizontal FOV, \(\pm 28.5^{\circ}\), \(1.0\,\mathrm{m}\)) are marked as inspected. The
+coverage deficit is then the ratio of un-swept to total known-free cells.
+
+\subsection{Interleaving Policy}
+Two arms were implemented and compared:
+\begin{itemize}
+  \item \textbf{Exhaustion (baseline).} Explore frontiers until none remain,
+        then perform one coverage sweep --- the conventional sequential order.
+  \item \textbf{Fraction (proposed).} Interrupt frontier exploration for a
+        boustrophedon sweep as soon as the un-swept known-free area exceeds
+        \(15\%\) of known free space, then resume exploring.
+\end{itemize}
+Sweep rows are spaced at \(0.86\,\mathrm{m}\), a \(10\%\) overlap on the
+\(0.95\,\mathrm{m}\) swath implied by the camera cone.
+
+\subsection{Navigation Extensions}
+Two Nav2 plugins were added because stock components degraded the sweep.
+First, a custom straight-line global planner is selected \emph{per goal} for
+sweep rows, since the default gradient planner curves off pre-validated rows
+toward locally cheaper cells. Second, a cost-aware global
+planner (\texttt{SmacPlanner2D}) replaces the gradient planner for transit
+goals, for the reason established in Section~\ref{sec:results}.
+
+%==============================================================================
+\section{Results and Discussion}
+\label{sec:results}
+%==============================================================================
+
+\subsection{Interleaving Improves Detector Coverage}
+Table~\ref{tab:arms} compares the two policy arms over hardware runs of at
+least 14 minutes. The interleaved policy reached a mean final camera coverage
+of \(58.2\%\) against \(42.6\%\) for the sequential baseline, an improvement of
+\(15.6\) percentage points (\(37\%\) relative).
+
+\begin{table}[t]
+\caption{Final camera coverage by policy arm (hardware runs \(\geq\)14\,min)}
+\label{tab:arms}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Policy} & \textbf{Runs} & \textbf{Coverage (\%)} & \textbf{Mean (\%)} \\
+\midrule
+Exhaustion (baseline) & 3 & 37.7--46.9 & 42.6 \\
+Fraction (proposed)   & 7 & 48.6--66.4 & \textbf{58.2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The mechanism is straightforward: the baseline spends its entire exploration
+phase accumulating floor the camera never inspects, and a single terminal sweep
+cannot recover it within a practical mission time. Interrupting early keeps the
+deficit bounded.
+
+\subsection{Actuation Faults Masquerade as Planning Faults}
+A finding with wider applicability emerged during evaluation. Missions stalled
+repeatedly with the navigation stack reporting healthy operation. Bench
+measurement, with commanded and achieved yaw compared against an independent
+gyroscope, showed that the base driver selected its pure-rotation command mode
+only when linear velocity was \emph{exactly} zero; any non-zero component
+routed the command into an arc mode that scales speed about the robot centre
+rather than the wheels. Because the local planner almost never emits exactly
+zero linear velocity while turning, nearly every mission turn was attenuated,
+losing \(84\%\) to \(91\%\) of commanded yaw. At a commanded
+\(0.400\,\mathrm{rad/s}\) with \(0.0105\,\mathrm{m/s}\) of linear
+velocity, the achieved/commanded ratio was \(0.16\); at
+\(0.800\,\mathrm{rad/s}\) it fell to \(0.09\). Testing on a turn-radius
+criterion instead of an equality test restored the ratio to \(1.01\)--\(1.03\),
+while a genuine-arc control case was unchanged at \(0.78\), confirming the
+change is confined to the near-pivot regime.
+
+
+\subsection{Residual Stalls Are a Planning Problem}
+After the actuation fix, stalls persisted. Instrumenting the controller at a
+deadlock showed the robot was not in contact with anything --- the nearest
+LiDAR return was \(0.41\,\mathrm{m}\) --- yet the trajectory critic rejected
+all 440 sampled trajectories in 60 separate control cycles. Sampling the raw
+costmap under the footprint showed it occupied inscribed-inflated cells in 54
+of 64 consecutive samples: the robot habitually travelled inside the inflation
+band, where trajectories toward the obstacle are correctly vetoed while an
+oscillation guard suppresses the reversal that would turn it away. The cause is
+that the gradient global planner weights obstacle cost weakly and produces
+wall-hugging paths, which the local planner then follows faithfully. Replacing
+it with a cost-aware planner that routes through the centre of free space
+addressed the cause rather than the symptom.
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+The aim was met: tracking detector coverage explicitly and interleaving
+boustrophedon sweeps with frontier exploration raised mean camera coverage from
+\(42.6\%\) to \(58.2\%\) on hardware, confirming that map completeness is an
+inadequate stopping criterion when the detection footprint is much smaller than
+the mapping footprint.
+
+Three limitations qualify these results. The comparison rests on a modest
+sample (3 baseline and 7 interleaved runs) in a single arena. The navigation
+extensions were introduced alongside other changes, so the contribution of each
+individual component is not yet isolated. Finally, the sweep trigger threshold
+was fixed at \(15\%\) rather than tuned or adapted.
+
+Future work will isolate the planner contribution through matched control runs,
+adapt the trigger threshold to observed target density, and extend coverage
+bookkeeping from a binary swept mask to a confidence field that accounts for
+viewing distance and angle, since detection reliability is not uniform across
+the camera cone.
+
+%==============================================================================
+\section*{Acknowledgment}
+The author wishes to express sincere gratitude to project supervisor Dr.~Sulochana Sooriyaarachchi, Senior Lecturer in the Department of Computer Science \& Engineering, University of Moratuwa, for her continuous guidance, invaluable insights, and technical review throughout this research. The author also gratefully acknowledges the Intellisense Lab, Department of Computer Science \& Engineering, University of Moratuwa, for providing the experimental facilities, robotic hardware platforms, and funding support essential to this work.
+
+%==============================================================================
+\begin{thebibliography}{00}
+
+\bibitem{yamauchi} B.~Yamauchi, ``A frontier-based approach for autonomous
+exploration,'' in \emph{Proc. IEEE Int. Symp. Computational Intelligence in
+Robotics and Automation}, 1997, pp.~146--151.
+
+\bibitem{choset} H.~Choset, ``Coverage for robotics --- a survey of recent
+results,'' \emph{Annals of Mathematics and Artificial Intelligence}, vol.~31,
+pp.~113--126, 2001.
+
+\bibitem{galceran} E.~Galceran and M.~Carreras, ``A survey on coverage path
+planning for robotics,'' \emph{Robotics and Autonomous Systems}, vol.~61,
+no.~12, pp.~1258--1276, 2013.
+
+\bibitem{rtabmap} M.~Labb\'{e} and F.~Michaud, ``RTAB-Map as an open-source
+lidar and visual simultaneous localization and mapping library for large-scale
+and long-term online operation,'' \emph{Journal of Field Robotics}, vol.~36,
+no.~2, pp.~416--446, 2019.
+
+\bibitem{nav2} S.~Macenski, F.~Mart\'{i}n, R.~White, and J.~Gin\'{e}s Clavero,
+``The Marathon 2: A navigation system,'' in \emph{Proc. IEEE/RSJ Int. Conf.
+Intelligent Robots and Systems (IROS)}, 2020, pp.~2718--2725.
+
+\bibitem{dwa} D.~Fox, W.~Burgard, and S.~Thrun, ``The dynamic window approach
+to collision avoidance,'' \emph{IEEE Robotics and Automation Magazine}, vol.~4,
+no.~1, pp.~23--33, 1997.
+
+\end{thebibliography}
+
+
+%==============================================================================
+% CUT FOR LENGTH --- restore if the compiled PDF has spare room on page 2.
+% This was a subsection of Results and Discussion, placed after
+% "Residual Stalls Are a Planning Problem". It is the most transferable
+% methodological point in the work, so it is the first thing worth restoring.
+%
+% \subsection{A Note on Proxy Metrics}
+% An intermediate result is worth recording. Extending the stall watchdog so that
+% in-progress recovery behaviours were not cancelled reduced the stall rate by a
+% factor of five, from \(1.26\) to \(0.23\) stalls per minute --- while making
+% coverage approximately \(2.5\times\) slower, because the robot remained
+% committed to unreachable goals. The stall count fell largely because that time
+% ceased to be \emph{counted} as a stall. Coverage-versus-time, not stall count,
+% is the metric that reflects the objective.
+%
+% Also cut: a table of achieved/commanded yaw before and after the driver fix.
+% Its numbers now appear inline in "Actuation Faults Masquerade as Planning
+% Faults"; the full five-row table is in week_8.md.
+%==============================================================================
+
+\end{document}
