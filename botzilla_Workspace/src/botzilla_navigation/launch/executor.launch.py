@@ -75,6 +75,22 @@ def generate_launch_description():
         description='true = never chase a detected cube; keep searching.',
     )
     detect_only = LaunchConfiguration('detect_only')
+    # Research arms decided in search_strategies.py — see frontier_explorer_node
+    # "Search strategies". 'sweep' keeps the frontier + sweep behaviour (arms B/C).
+    search_strategy_arg = DeclareLaunchArgument(
+        'search_strategy',
+        default_value='sweep',
+        description="'sweep' (B/C), 'region' (proposed), 'heats' (D), "
+                    "'camera_greedy' (E).",
+    )
+    search_strategy = LaunchConfiguration('search_strategy')
+    inspection_mode_arg = DeclareLaunchArgument(
+        'inspection_mode',
+        default_value='mixed',
+        description="'region' only: 'mixed', 'viewpoints', 'rows', 'one_look', "
+                    "'spin_grid'.",
+    )
+    inspection_mode = LaunchConfiguration('inspection_mode')
 
     # Control arm for the straight-line sweep planner: 'GridBased' makes row legs
     # plan exactly as they did before botzilla_straightline_planner existed, so the
@@ -122,6 +138,8 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'sweep_trigger_mode': sweep_trigger_mode,
             'sweep_new_area_m2': ParameterValue(sweep_new_area_m2, value_type=float),
+            'search_strategy': search_strategy,
+            'inspection_mode': inspection_mode,
             'sweep_row_planner_id': sweep_row_planner_id,
             'default_planner_id': default_planner_id,
             'coverage_cost': ParameterValue(coverage_cost, value_type=int),
@@ -133,6 +151,8 @@ def generate_launch_description():
         sweep_trigger_mode_arg,
         sweep_new_area_arg,
         detect_only_arg,
+        search_strategy_arg,
+        inspection_mode_arg,
         sweep_row_planner_id_arg,
         default_planner_id_arg,
         coverage_cost_arg,

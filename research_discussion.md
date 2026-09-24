@@ -719,6 +719,39 @@ comparison with the HEATS-style baseline as its centrepiece. Decide once the dea
    choice between rows and a viewpoint planner whose viewpoints carry a turn range (one look up
    to a partial or full spin). Optionally run the rows vs viewpoints early warning first (§8.5).
 4. **Build arm E, then arm D** (D shares the region code and the viewpoint planner).
+
+   **Status of steps 3–4 (2026-09-25): built, unit-tested (88 tests), and run end to end
+   against a kinematic fake of Nav2 and SLAM. That harness only tests the decision logic,
+   not the robot. None of this has run on hardware yet.**
+   - `region_segmentation.py`:
+     - rooms are found by clearance ≥ 0.5 m (gaps < 1 m split rooms), then grown back over
+       all free floor; free space no room reaches becomes a corridor, visited last;
+     - regions over 40 m² are cut into 4 m tiles on a grid anchored at the start pose;
+     - a frontier is "inside" when it lies in the active region and is not narrow; anything
+       else is an exit.
+   - `viewpoint_planning.py`:
+     - a viewpoint is a position, a start heading and a turn span (0°, 60°, 120°, 180°,
+       240° or a full spin);
+     - visibility uses the swept mask's own geometry (0.48–1.0 m ring, ±28.5°, line of
+       sight), computed with numpy against precomputed rays;
+     - the score is seen area per second:
+       `gain / (travel + 4 s stop overhead + turn to start + span / turn rate)`.
+   - `search_strategies.py`: `RegionSearch` (proposed + ablations via `inspection_mode`),
+     `HeatsSearch` (arm D, full two-stage), `CameraGreedySearch` (arm E).
+   - Explorer: set `search_strategy` / `inspection_mode`, or pass `--strategy` /
+     `--inspection` to `run_full_mission.sh`.
+     - A look is a Nav2 goal to the viewpoint, then Nav2 Spin goals (new `LOOKING` state).
+     - Marking now runs every 0.5 s so the swept mask keeps up while turning.
+     - `/explorer/events` (JSON) records goal results, stalls, decisions and looks.
+   - `mission_metrics_node`: records `/battery` and `/explorer/events`; `run_end` has the
+     start and end voltage and the stall count.
+   - `tools/analyze_runs.py`: per-run and per-arm tables of the plan's metrics within the 15-min
+     budget, per-layout paired table, Mann–Whitney against `region/mixed`.
+   - Found by the harness and fixed:
+     - The planner rounded the 57° FOV **up** to 60° of bins, so floor at the FOV edges was
+       always predicted and never marked, and the same look repeated forever. Windows now
+       round down, and a look just done isn't repeated for 60 s.
+     - The first tile cap (24 m²) split normal rooms into tiles; it is now 40 m².
 5. **Hardware fixes (required before any counted run):** Kinect tilt and IR intrinsics, then
    check whether stalls drop. Stalls hit short frequent trips hardest, which arm D makes most, so
    this protects D from an unfair disadvantage.
@@ -727,7 +760,8 @@ comparison with the HEATS-style baseline as its centrepiece. Decide once the dea
 
 ### 9.2 Open items
 
-- Pending decisions: arm D fidelity (full vs light); abstract scope (depends on the deadline);
+- Decided 2026-09-24: arm D is the **full** two-stage HEATS-style version (~1 week).
+- Pending decisions: abstract scope (depends on the deadline);
   whether to run the rows vs viewpoints early warning before the full build.
 - Measure the real LiDAR mount height (URDF 0.24 m vs ~12 cm observed).
 - Measure YOLO's frame rate on the Jetson.

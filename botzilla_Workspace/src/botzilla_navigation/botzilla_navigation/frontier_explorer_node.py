@@ -252,6 +252,23 @@ baseline by sweep_new_area_m2. Floor a sweep failed to cover does not re-trigger
 new floor from exploration does. 'fraction' is kept unchanged so earlier runs stay
 reproducible.
 
+Search strategies (search_strategy parameter). 'sweep' (default) is everything above:
+frontier exploration plus coverage sweeps, arms B and C. The research plan's other arms
+— the proposed region-by-region method and its ablations ('region' + inspection_mode),
+arm D ('heats') and arm E ('camera_greedy') — make their decisions in
+search_strategies.py, a pure module. In those modes, whenever this node is IDLE it hands
+the strategy a snapshot (map, costmap, planning mask, frontier clusters with their
+cells) and executes the Action it returns with the machinery above: a frontier action
+goes through the same snap/blacklist/reachability path as a frontier here, a rows action
+through the sweep queue (row abandonment included), and a look action drives to a
+viewpoint facing its start heading and then turns through its span with Nav2 Spin goals
+(State.LOOKING). Only the decisions differ between arms, never the execution.
+
+While looking, the camera must be marked often enough that the swept mask keeps up with
+a turning robot: at 0.4 rad/s the view moves 46 deg in the 2 s evaluation period, so
+marking runs every SWEPT_MARK_PERIOD_S (0.5 s) and the coverage topics are republished
+every EVAL_PERIOD_S as before.
+
 Snap/self-clearance agreement: COSTMAP_SAFE_COST (75) sits well below the inscribed
 cutoff SELF_CLEARANCE_MAX_COST (99), so any cell _snap_to_reachable accepts is by
 construction not a colliding pose. The snap and the arrival check therefore agree, and a
@@ -288,8 +305,10 @@ Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
 
+import json
 import math
 import os
+import time
 
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
@@ -304,6 +323,12 @@ from botzilla_navigation.frontier_detection import (
     in_collision,
     select_target,
     world_to_grid,
+)
+from botzilla_navigation.region_segmentation import Grid
+from botzilla_navigation.search_strategies import (
+    INSPECTION_MODES,
+    make_strategy,
+    Snapshot,
 )
 from botzilla_navigation.swept_mask import (
     build_coverage_cost_data,
@@ -323,12 +348,13 @@ from botzilla_navigation.swept_mask import (
 from geometry_msgs.msg import PointStamped
 from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose, Spin
 from nav_msgs.msg import OccupancyGrid
+import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 import tf2_ros
 from tf2_ros import TransformException
 
@@ -658,6 +684,24 @@ SWEEP_RETRIGGER_COOLDOWN_S = 20.0
 # work rather than being stubbed in now.
 SWEEP_TRIGGER_MODES = ('fraction', 'exhaustion', 'area')
 
+# Accepted values of the search_strategy parameter — see module docstring.
+SEARCH_STRATEGIES = ('sweep', 'region', 'heats', 'camera_greedy')
+
+# Swept-mask marking period — see module docstring ("While looking ...").
+SWEPT_MARK_PERIOD_S = 0.5
+
+# A look's Spin goals: time allowance per radian (Nav2 aborts the Spin past it) and the
+# backstop for a look whose callbacks never land. Nav2's spin runs at up to 0.4 rad/s
+# with a 0.2 rad/s floor, so 1/0.2 s per radian is the slowest honest turn.
+LOOK_SECONDS_PER_RAD = 5.0
+LOOK_ALLOWANCE_MARGIN_S = 10.0
+# Turns smaller than this before a look are skipped: Nav2 already brought the robot
+# within yaw_goal_tolerance (0.25 rad) of the start heading.
+LOOK_MIN_ALIGN_RAD = 0.2
+# A viewpoint whose goal snapped further than this from where it was planned is not the
+# viewpoint any more (it would look at different floor); treat it as failed.
+LOOK_MAX_SNAP_M = 0.3
+
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
 
@@ -667,6 +711,7 @@ class State:
     CHECKING_PATH = 'CHECKING_PATH'
     NAVIGATING = 'NAVIGATING'
     RECOVERING = 'RECOVERING'
+    LOOKING = 'LOOKING'
     COVERAGE_COMPLETE = 'COVERAGE_COMPLETE'
 
 
@@ -721,6 +766,9 @@ class FrontierExplorerNode(Node):
         # COVERAGE_COST. Requires botzilla_coverage_layer in the global costmap, and only
         # a cost-aware planner (SmacGrid) actually trades distance against it.
         self.declare_parameter('coverage_cost', COVERAGE_COST)
+        # Which arm decides where to go — see module docstring "Search strategies".
+        self.declare_parameter('search_strategy', 'sweep')
+        self.declare_parameter('inspection_mode', 'mixed')
         self.declare_parameter('coverage_cost_radius_m', COVERAGE_COST_RADIUS_M)
         # Flat [x0,y0,x1,y1,...] in base_link metres. MUST match nav2_params.yaml's
         # `footprint` — if the two disagree, this node will happily pick goals the
@@ -752,6 +800,20 @@ class FrontierExplorerNode(Node):
         self._default_planner_id = self.get_parameter('default_planner_id').value
         self._coverage_cost = int(self.get_parameter('coverage_cost').value)
         self._coverage_cost_radius_m = self.get_parameter('coverage_cost_radius_m').value
+        self._search_strategy = self.get_parameter('search_strategy').value
+        self._inspection_mode = self.get_parameter('inspection_mode').value
+        if self._search_strategy not in SEARCH_STRATEGIES:
+            self.get_logger().error(
+                f'Unknown search_strategy {self._search_strategy!r} — falling back to '
+                f"'sweep'. Valid: {list(SEARCH_STRATEGIES)}."
+            )
+            self._search_strategy = 'sweep'
+        if self._inspection_mode not in INSPECTION_MODES:
+            self.get_logger().error(
+                f'Unknown inspection_mode {self._inspection_mode!r} — falling back to '
+                f"'mixed'. Valid: {list(INSPECTION_MODES)}."
+            )
+            self._inspection_mode = 'mixed'
         flat_footprint = self.get_parameter('footprint').value
         if len(flat_footprint) < 6 or len(flat_footprint) % 2:
             self.get_logger().error(
@@ -775,6 +837,7 @@ class FrontierExplorerNode(Node):
             f'planner={self._default_planner_id} '
             f'row_planner={self._sweep_row_planner_id} '
             f'coverage_cost={self._coverage_cost} '
+            f'strategy={self._search_strategy} inspection={self._inspection_mode} '
             f'footprint={len(self._footprint_m)}pt '
             f'fwd={max(v[0] for v in self._footprint_m):.2f}m'
         )
@@ -871,6 +934,26 @@ class FrontierExplorerNode(Node):
         # publishes one zero grid rather than one every tick.
         self._coverage_cost_zeroed = True
 
+        # Search strategy (non-'sweep' arms) — see module docstring.
+        self._strategy = None
+        if self._search_strategy != 'sweep':
+            self._strategy = make_strategy(
+                self._search_strategy, inspection_mode=self._inspection_mode,
+                half_fov_rad=self._camera_half_fov_rad,
+                min_range_m=self._camera_min_range_m,
+                max_range_m=self._camera_mark_range_m,
+                row_spacing_m=self._sweep_row_spacing_m,
+            )
+        self._strategy_action = None     # the Action being executed, for report()
+        self._strategy_given_up = False  # stop waiting on blacklisted frontiers
+        self._pending_look = None        # look Action whose viewpoint goal is in flight
+        self._look_steps = []            # relative Spin angles still to run
+        self._look_goal_handle = None
+        self._look_start_time = None
+        self._look_timeout_s = 0.0
+        self._look_epoch = 0
+        self._swept_publish_countdown = 0
+
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -894,6 +977,10 @@ class FrontierExplorerNode(Node):
         self.create_subscription(
             PointStamped, '/cube_abandoned', self._cube_abandoned_cb, 10
         )
+        # One JSON object per decision/outcome (goal results, stalls, looks, regions),
+        # recorded by mission_metrics_node so the analysis can count stalls and turning
+        # per arm without parsing this node's log text.
+        self._events_pub = self.create_publisher(String, '/explorer/events', 50)
 
         # Ground truth for what the planner will actually accept — see
         # COSTMAP_SAFE_COST above for why the raw /map alone isn't enough.
@@ -937,7 +1024,7 @@ class FrontierExplorerNode(Node):
         self.create_timer(EVAL_PERIOD_S, self._evaluate)
         # Separate timer, deliberately not folded into _evaluate() — see
         # _update_swept_coverage's docstring.
-        self.create_timer(EVAL_PERIOD_S, self._update_swept_coverage)
+        self.create_timer(SWEPT_MARK_PERIOD_S, self._update_swept_coverage)
 
         self.get_logger().info('frontier_explorer_node started, waiting for /map ...')
 
@@ -1004,6 +1091,15 @@ class FrontierExplorerNode(Node):
         if self._spin_goal_handle is not None:
             self._spin_goal_handle.cancel_goal_async()
             self._spin_goal_handle = None
+        # A look (or the drive to one) is simply dropped: the strategy replans from
+        # wherever the robot ends up, so nothing is reported as failed.
+        self._look_epoch += 1
+        if self._look_goal_handle is not None:
+            self._look_goal_handle.cancel_goal_async()
+            self._look_goal_handle = None
+        self._pending_look = None
+        self._look_steps = []
+        self._look_start_time = None
         # Invalidate any in-flight attempt so its late callback can't resurrect state
         # after we've handed control over.
         self._goal_epoch += 1
@@ -1033,6 +1129,9 @@ class FrontierExplorerNode(Node):
     def _update_swept_coverage(self):
         """Mark swept cells and republish /swept_coverage_map, independent of state.
 
+        Marks every SWEPT_MARK_PERIOD_S and republishes every EVAL_PERIOD_S — see the
+        module docstring on looks.
+
         _evaluate() returns early for NAVIGATING/CHECKING_PATH/RECOVERING (see its
         module-docstring "Replanning policy") — a NavigateToPose goal typically runs for
         tens of seconds, during which _evaluate() never reaches the swept-mask code at
@@ -1060,6 +1159,14 @@ class FrontierExplorerNode(Node):
             min_range_m=self._camera_min_range_m,
             occupancy=msg.data if self._coverage_occlusion else None,
         )
+        self._resolve_revisit_points(robot_x, robot_y, robot_yaw)
+
+        # Marking runs every SWEPT_MARK_PERIOD_S; the (much more expensive) grid
+        # publishing only every EVAL_PERIOD_S — see module docstring.
+        self._swept_publish_countdown -= 1
+        if self._swept_publish_countdown > 0:
+            return
+        self._swept_publish_countdown = max(1, round(EVAL_PERIOD_S / SWEPT_MARK_PERIOD_S))
 
         coverage_msg = OccupancyGrid()
         coverage_msg.header.frame_id = MAP_FRAME
@@ -1069,8 +1176,6 @@ class FrontierExplorerNode(Node):
             msg.data, self._swept_mask, msg.info.width, msg.info.height
         )
         self._swept_map_pub.publish(coverage_msg)
-
-        self._resolve_revisit_points(robot_x, robot_y, robot_yaw)
         self._publish_coverage_cost()
 
     # ------------------------------------------------------------------ #
@@ -1219,6 +1324,9 @@ class FrontierExplorerNode(Node):
             # than picking a target concurrently — see _check_recovery_stall.
             self._check_recovery_stall()
             return
+        if self._state == State.LOOKING:
+            self._check_look_stall()
+            return
         if self._state == State.COVERAGE_COMPLETE:
             return
         if self._latest_map is None:
@@ -1256,7 +1364,8 @@ class FrontierExplorerNode(Node):
         # into view, so new frontiers can appear mid-sweep. Checking only while in
         # FRONTIER mode would strand them unexplored forever.
         clusters = find_frontiers(
-            msg.data, msg.info.width, msg.info.height, MIN_FRONTIER_CLUSTER_SIZE
+            msg.data, msg.info.width, msg.info.height, MIN_FRONTIER_CLUSTER_SIZE,
+            with_cells=self._strategy is not None,
         )
         self.get_logger().info(
             f'/map is {msg.info.width}x{msg.info.height} @ {msg.info.resolution:.3f}m/cell, '
@@ -1266,7 +1375,7 @@ class FrontierExplorerNode(Node):
         frontiers_world = [
             grid_to_world(r, c, msg.info.resolution,
                           msg.info.origin.position.x, msg.info.origin.position.y)
-            for (r, c, _size) in clusters
+            for (r, c, *_rest) in clusters
         ]
 
         # Swept-mask marking and /swept_coverage_map publishing happen on their own
@@ -1280,6 +1389,10 @@ class FrontierExplorerNode(Node):
             f'({100.0 * (1.0 - unswept_free / max(1, total_free)):.1f}%)',
             throttle_duration_sec=10.0,
         )
+
+        if self._strategy is not None and self._mode != 'SWEEPING':
+            self._evaluate_strategy(msg, clusters, frontiers_world, robot_pose)
+            return
 
         if self._mode == 'SWEEPING':
             # Run the current sweep to completion regardless of what frontier detection
@@ -1345,10 +1458,13 @@ class FrontierExplorerNode(Node):
                 return
 
         target = select_target(candidates, robot_x, robot_y)
+        self._dispatch_frontier(target, robot_x, robot_y, len(clusters))
 
+    def _dispatch_frontier(self, target, robot_x, robot_y, n_clusters):
+        """Snap a frontier target, guard it, and start its reachability check."""
         if distance(robot_x, robot_y, target[0], target[1]) < MIN_TARGET_DISTANCE_M:
             self.get_logger().debug('Nearest frontier is too close, waiting for next map update.')
-            return
+            return False
 
         nav_point = self._snap_to_reachable(target, robot_x, robot_y)
         if nav_point is None:
@@ -1358,7 +1474,7 @@ class FrontierExplorerNode(Node):
                 f'inflation); blacklisting without spending a path-check on it.'
             )
             self._blacklist_target(target[0], target[1])
-            return
+            return False
 
         nav_x, nav_y = nav_point
         # The MIN_TARGET_DISTANCE_M check above guards the RAW frontier, but snapping can
@@ -1380,10 +1496,10 @@ class FrontierExplorerNode(Node):
                 f'Blacklisting so other frontiers get a turn.'
             )
             self._blacklist_target(target[0], target[1])
-            return
+            return False
 
         self.get_logger().info(
-            f'{len(clusters)} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f}) '
+            f'{n_clusters} frontier(s) found, targeting ({target[0]:.2f}, {target[1]:.2f}) '
             f'-> snapped to reachable point ({nav_x:.2f}, {nav_y:.2f})'
         )
         yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
@@ -1393,6 +1509,249 @@ class FrontierExplorerNode(Node):
         self._active_planner_id = self._default_planner_id
         self._sweep_row_retry = None
         self._check_reachability(nav_x, nav_y, yaw)
+        return True
+
+    # ------------------------------------------------------------------ #
+    # Search strategies (search_strategy != 'sweep') — see module docstring
+    # ------------------------------------------------------------------ #
+
+    def _emit_event(self, event, **fields):
+        """Publish one /explorer/events record (JSON) for mission_metrics_node."""
+        fields['event'] = event
+        fields['strategy'] = self._search_strategy
+        self._events_pub.publish(String(data=json.dumps(fields)))
+
+    def _goal_kind(self):
+        """Return what the in-flight NavigateToPose goal is for (/explorer/events)."""
+        if self._current_target is None:
+            return 'handover'   # cancelled because executor_node took the base
+        if self._frontier_origin is not None:
+            return 'frontier'
+        if self._pending_look is not None:
+            return 'viewpoint'
+        return 'sweep'
+
+    def _is_blacklisted(self, x, y):
+        now = self.get_clock().now()
+        return any(
+            distance(x, y, bx, by) < BLACKLIST_RADIUS_M
+            for (bx, by, exp) in self._blacklist if exp > now
+        )
+
+    def _evaluate_strategy(self, msg, clusters, frontiers_world, robot_pose):
+        """Ask the strategy what to do next and start doing it."""
+        # Deciding means the node is IDLE, so any look still marked pending was never
+        # started (e.g. the planner server was unavailable) and must not be blamed for
+        # the next goal's failure — see _mark_sweep_waypoint_unreachable.
+        self._pending_look = None
+        robot_x, robot_y, _ = robot_pose
+        info = msg.info
+        grid = Grid(msg.data, info.width, info.height, info.resolution,
+                    info.origin.position.x, info.origin.position.y)
+        cm = self._latest_costmap
+        costmap = Grid(cm.data, cm.info.width, cm.info.height, cm.info.resolution,
+                       cm.info.origin.position.x, cm.info.origin.position.y)
+        seen = np.asarray(self._planning_mask(), dtype=bool).reshape(
+            info.height, info.width)
+        frontiers = [
+            {'x': fx, 'y': fy, 'cells': cluster[3], 'blacklisted': self._is_blacklisted(fx, fy)}
+            for (fx, fy), cluster in zip(frontiers_world, clusters)
+        ]
+        snap = Snapshot(grid, costmap, seen, robot_pose, frontiers, time.monotonic(),
+                        frontiers_given_up=self._strategy_given_up)
+        started = time.monotonic()
+        action = self._strategy.next_action(snap)
+        took = time.monotonic() - started
+        for note in self._strategy.events:
+            self.get_logger().info(f'[strategy] {note}')
+            self._emit_event('strategy_note', note=note)
+        self._strategy.events.clear()
+        self.get_logger().info(
+            f'[strategy] {action.kind}: {action.reason} ({took * 1000:.0f} ms)'
+        )
+        self._emit_event('strategy_action', kind=action.kind, reason=action.reason,
+                         decide_ms=round(took * 1000))
+        self._strategy_action = action
+        if action.kind != 'wait':
+            self._stuck_since = None
+            self._consecutive_recoveries = 0
+
+        if action.kind == 'frontier':
+            tx, ty = action.target
+            if not self._dispatch_frontier(action.target, robot_x, robot_y, len(clusters)):
+                if distance(robot_x, robot_y, tx, ty) < MIN_TARGET_DISTANCE_M:
+                    # The strategy would pick this same frontier again next tick.
+                    self._blacklist_target(tx, ty)
+        elif action.kind == 'rows':
+            self._mode = 'SWEEPING'
+            self._sweep_queue = [
+                (wx, wy, SWEEP_LEG_ROW if i % 2 else SWEEP_LEG_TRANSIT)
+                for i, (wx, wy) in enumerate(action.waypoints)
+            ]
+            self._pending_row_entry = None
+            self._row_failures = {}
+            self._dispatch_next_sweep_waypoint(robot_x, robot_y, frontiers_world)
+        elif action.kind == 'look':
+            self._dispatch_look(action, robot_pose)
+        elif action.kind == 'wait':
+            self._handle_strategy_wait()
+        elif action.kind == 'done':
+            self._publish_coverage_complete(action.reason)
+
+    def _handle_strategy_wait(self):
+        """Only blacklisted frontiers left: back up a few times, then stop waiting."""
+        now = self.get_clock().now()
+        if self._stuck_since is None:
+            self._stuck_since = now
+        if (now - self._stuck_since).nanoseconds / 1e9 < STUCK_RECOVERY_TIMEOUT_S:
+            return
+        if self._consecutive_recoveries >= STUCK_RECOVERIES_BEFORE_SWEEP:
+            self.get_logger().warn(
+                f'Remaining frontiers stayed unreachable across '
+                f'{self._consecutive_recoveries} recoveries — no longer waiting on them.'
+            )
+            self._strategy_given_up = True
+            self._stuck_since = None
+            return
+        self._consecutive_recoveries += 1
+        self._start_recovery_backup()
+
+    def _dispatch_look(self, action, robot_pose):
+        """Drive to a viewpoint facing its start heading; the look starts on arrival."""
+        vp = action.viewpoint
+        robot_x, robot_y, _ = robot_pose
+        if distance(robot_x, robot_y, vp.x, vp.y) < MIN_TARGET_DISTANCE_M:
+            self._start_look(action)
+            return
+        nav_point = self._snap_to_reachable((vp.x, vp.y), robot_x, robot_y)
+        if nav_point is None or distance(nav_point[0], nav_point[1], vp.x, vp.y) > LOOK_MAX_SNAP_M:
+            self.get_logger().info(
+                f'Viewpoint ({vp.x:.2f}, {vp.y:.2f}) has no reachable cell within '
+                f'{LOOK_MAX_SNAP_M}m in the costmap; skipping it.'
+            )
+            self._look_failed(action, 'unsnappable')
+            return
+        self._pending_look = action
+        self._frontier_origin = None
+        self._active_sweep_row = None
+        self._active_planner_id = self._default_planner_id
+        self._sweep_row_retry = None
+        self._check_reachability(nav_point[0], nav_point[1], vp.heading)
+
+    def _look_failed(self, action, why):
+        self._pending_look = None
+        self._emit_event('look_result', ok=False, why=why,
+                         x=round(action.viewpoint.x, 3), y=round(action.viewpoint.y, 3))
+        self._strategy.report(action, False, time.monotonic())
+
+    def _start_look(self, action):
+        """Turn through the viewpoint's span, starting from whichever end is nearer."""
+        vp = action.viewpoint
+        pose = self._get_robot_pose()
+        yaw = pose[2] if pose is not None else vp.heading
+        steps = []
+        if vp.span > 0.0:
+            end = vp.heading + vp.span
+            to_start = math.atan2(math.sin(vp.heading - yaw), math.cos(vp.heading - yaw))
+            to_end = math.atan2(math.sin(end - yaw), math.cos(end - yaw))
+            if abs(to_end) < abs(to_start):
+                align, sweep = to_end, -vp.span
+            else:
+                align, sweep = to_start, vp.span
+            if abs(align) >= LOOK_MIN_ALIGN_RAD:
+                steps.append(align)
+            steps.append(sweep)
+        else:
+            align = math.atan2(math.sin(vp.heading - yaw), math.cos(vp.heading - yaw))
+            if abs(align) >= LOOK_MIN_ALIGN_RAD:
+                steps.append(align)
+        self._pending_look = action
+        if not steps:
+            self._finish_look(True, 'already facing it')
+            return
+        self._look_steps = steps
+        self._look_start_time = self.get_clock().now()
+        self._look_timeout_s = (
+            sum(abs(a) for a in steps) * LOOK_SECONDS_PER_RAD
+            + LOOK_ALLOWANCE_MARGIN_S * len(steps)
+        )
+        self._state = State.LOOKING
+        self.get_logger().info(
+            f'Looking at ({vp.x:.2f}, {vp.y:.2f}): turns '
+            f'{[round(math.degrees(a)) for a in steps]} deg.'
+        )
+        self._send_next_look_step()
+
+    def _send_next_look_step(self):
+        if not self._spin_client.wait_for_server(timeout_sec=2.0):
+            self._finish_look(False, 'spin server unavailable')
+            return
+        angle = self._look_steps.pop(0)
+        goal = Spin.Goal()
+        goal.target_yaw = angle
+        goal.time_allowance = Duration(
+            seconds=abs(angle) * LOOK_SECONDS_PER_RAD + LOOK_ALLOWANCE_MARGIN_S
+        ).to_msg()
+        self._look_epoch += 1
+        epoch = self._look_epoch
+        future = self._spin_client.send_goal_async(goal)
+        future.add_done_callback(lambda f, epoch=epoch: self._look_response_cb(f, epoch))
+
+    def _look_response_cb(self, future, epoch):
+        if epoch != self._look_epoch:
+            return
+        handle = future.result()
+        if not handle.accepted:
+            self._finish_look(False, 'spin rejected')
+            return
+        self._look_goal_handle = handle
+        handle.get_result_async().add_done_callback(
+            lambda f, epoch=epoch: self._look_result_cb(f, epoch)
+        )
+
+    def _look_result_cb(self, future, epoch):
+        if epoch != self._look_epoch:
+            return
+        self._look_goal_handle = None
+        status = future.result().status
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            self._finish_look(False, f'spin status {status}')
+            return
+        if self._look_steps:
+            self._send_next_look_step()
+            return
+        self._finish_look(True, 'turn complete')
+
+    def _finish_look(self, ok, why):
+        action = self._pending_look
+        self._pending_look = None
+        self._look_steps = []
+        self._look_start_time = None
+        if self._state == State.LOOKING:
+            self._state = State.IDLE
+        if action is None:
+            return
+        vp = action.viewpoint
+        self.get_logger().info(
+            f'Look at ({vp.x:.2f}, {vp.y:.2f}) {"done" if ok else "failed"}: {why}.'
+        )
+        self._emit_event('look_result', ok=ok, why=why, x=round(vp.x, 3), y=round(vp.y, 3),
+                         span_deg=round(math.degrees(vp.span)),
+                         planned_gain_m2=round(vp.gain_m2, 3))
+        self._strategy.report(action, ok, time.monotonic())
+
+    def _check_look_stall(self):
+        if self._look_start_time is None:
+            return
+        elapsed = (self.get_clock().now() - self._look_start_time).nanoseconds / 1e9
+        if elapsed < self._look_timeout_s:
+            return
+        self.get_logger().warn(f'Look did not finish within {self._look_timeout_s:.0f}s.')
+        self._look_epoch += 1
+        if self._look_goal_handle is not None:
+            self._look_goal_handle.cancel_goal_async()
+            self._look_goal_handle = None
+        self._finish_look(False, 'timed out')
 
     def _snap_to_reachable(self, target_world, robot_x=None, robot_y=None):
         """Move a raw frontier point to the nearest costmap cell Nav2 can plan into.
@@ -1490,6 +1849,12 @@ class FrontierExplorerNode(Node):
         than entered into the cooldown bookkeeping meant for frontier clusters that get
         re-evaluated every tick.
         """
+        if not self._sweep_queue and self._strategy is not None:
+            # A strategy's row pass is over; hand control back to the strategy.
+            self._mode = 'FRONTIER'
+            self.get_logger().info('[strategy] row pass finished.')
+            self._emit_event('rows_done', rows_off_entry=self._rows_off_entry)
+            return
         if not self._sweep_queue:
             candidates = self._filter_blacklisted(frontiers_world)
             total_free, unswept_free = count_unswept_free(
@@ -1901,6 +2266,9 @@ class FrontierExplorerNode(Node):
             f'Goal to {self._current_target} stalled ({reason}); canceling instead of '
             f'waiting on Nav2 to give up.'
         )
+        self._emit_event('stall', kind=self._goal_kind(), reason=reason,
+                         x=round(self._current_target[0], 3),
+                         y=round(self._current_target[1], 3))
         self._goal_handle.cancel_goal_async()
         self._cancel_requested = True
 
@@ -1948,7 +2316,14 @@ class FrontierExplorerNode(Node):
 
         attempted=False marks a cheap skip that cost no driving time; only attempted
         failures count toward abandoning the row (see SWEEP_ROW_MAX_FAILURES).
+
+        A failed drive to a strategy viewpoint arrives here too (it is also a goal with
+        no frontier origin); it is reported to the strategy instead, and nothing is
+        marked swept — the camera never looked.
         """
+        if self._pending_look is not None:
+            self._look_failed(self._pending_look, 'could not reach the viewpoint')
+            return
         self._record_sweep_failure(x, y)
         if attempted:
             self._note_sweep_row_result(succeeded=False)
@@ -2293,6 +2668,9 @@ class FrontierExplorerNode(Node):
             GoalStatus.STATUS_CANCELED: 'CANCELED',
         }.get(result.status, f'status={result.status}')
         self.get_logger().info(f'Nav2 goal finished: {status_name}')
+        self._emit_event('goal_result', status=status_name, kind=self._goal_kind())
+        look = (self._pending_look
+                if result.status == GoalStatus.STATUS_SUCCEEDED else None)
 
         if result.status != GoalStatus.STATUS_SUCCEEDED:
             if self._frontier_origin is not None:
@@ -2300,7 +2678,8 @@ class FrontierExplorerNode(Node):
                 self._blacklist_target(x, y)
             elif self._current_target is not None:
                 self._mark_sweep_waypoint_unreachable(*self._current_target)
-        elif self._frontier_origin is None and self._current_target is not None:
+        elif (self._frontier_origin is None and self._current_target is not None
+              and self._pending_look is None):
             self._note_sweep_row_result(succeeded=True)
 
         self._current_target = None
@@ -2313,6 +2692,8 @@ class FrontierExplorerNode(Node):
         self._first_recovery_time = None
         self._last_progress_time = None
         self._state = State.IDLE
+        if look is not None:
+            self._start_look(look)
 
 
 def main(args=None):

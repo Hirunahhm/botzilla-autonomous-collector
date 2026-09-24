@@ -27,6 +27,15 @@
 #                                  C); 'exhaustion' is explore-then-sweep (arm B).
 #   --sweep-area M2                'area' policy only: sweep once this much un-swept
 #                                  floor has been added since the last sweep (3.0).
+#   --strategy sweep|region|heats|camera_greedy
+#                                  which arm decides where to go. 'sweep' (default)
+#                                  is frontier exploration + sweeps (--policy picks B
+#                                  or C); 'region' is the proposed method; 'heats' is
+#                                  arm D; 'camera_greedy' is arm E.
+#   --inspection mixed|viewpoints|rows|one_look|spin_grid
+#                                  'region' only: the inspection primitive. 'mixed'
+#                                  (default) is the proposed method; the others are
+#                                  ablations 1-3 and the optional spin grid.
 #   --detect-only                  never chase a detected cube; keep searching. Every
 #                                  counted research run uses this.
 #   --floor-area M2                measured arena floor area, the fixed coverage
@@ -104,6 +113,8 @@ COLLISION_MONITOR=0
 LAYOUT=""
 SWEEP_AREA=""      # empty => launch default (3.0)
 DETECT_ONLY=0
+STRATEGY=""        # empty => launch default (sweep)
+INSPECTION=""      # empty => launch default (mixed)
 FLOOR_AREA=""      # empty => take floor_area_m2 from the layout, if any
 
 # Printed by --help: the contiguous comment block at the top of this file. Derived
@@ -131,6 +142,10 @@ while [ $# -gt 0 ]; do
         --sweep-area)  SWEEP_AREA="${2:-}"; shift ;;
         --sweep-area=*) SWEEP_AREA="${1#*=}" ;;
         --detect-only) DETECT_ONLY=1 ;;
+        --strategy)    STRATEGY="${2:-}"; shift ;;
+        --strategy=*)  STRATEGY="${1#*=}" ;;
+        --inspection)  INSPECTION="${2:-}"; shift ;;
+        --inspection=*) INSPECTION="${1#*=}" ;;
         --floor-area)  FLOOR_AREA="${2:-}"; shift ;;
         --floor-area=*) FLOOR_AREA="${1#*=}" ;;
         --layout)      LAYOUT="${2:-}"; shift ;;
@@ -149,6 +164,23 @@ if [ -n "$POLICY" ] && [ "$POLICY" != "exhaustion" ] && [ "$POLICY" != "fraction
    && [ "$POLICY" != "area" ]; then
     echo "ERROR: --policy must be 'exhaustion', 'fraction' or 'area' (got: '$POLICY')" >&2
     exit 2
+fi
+case "${STRATEGY:-sweep}" in
+    sweep|region|heats|camera_greedy) ;;
+    *) echo "ERROR: --strategy must be sweep, region, heats or camera_greedy (got: '$STRATEGY')" >&2
+       exit 2 ;;
+esac
+case "${INSPECTION:-mixed}" in
+    mixed|viewpoints|rows|one_look|spin_grid) ;;
+    *) echo "ERROR: --inspection must be mixed, viewpoints, rows, one_look or spin_grid" \
+            "(got: '$INSPECTION')" >&2
+       exit 2 ;;
+esac
+if [ -n "$INSPECTION" ] && [ "$STRATEGY" != "region" ]; then
+    echo "WARNING: --inspection only affects --strategy region; it is ignored here." >&2
+fi
+if [ -n "$POLICY" ] && [ -n "$STRATEGY" ] && [ "$STRATEGY" != "sweep" ]; then
+    echo "WARNING: --policy only affects --strategy sweep; it is ignored here." >&2
 fi
 # Positive decimals only: rclpy would reject a non-number at launch, but only after
 # the whole stack is up.
@@ -420,6 +452,8 @@ fi
     echo "  \"coverage_cost\": ${COVERAGE_COST:-0},"
     echo "  \"sweep_new_area_m2\": ${SWEEP_AREA:-3.0},"
     echo "  \"detect_only\": $([ "$DETECT_ONLY" = 1 ] && echo true || echo false),"
+    echo "  \"strategy\": \"${STRATEGY:-sweep}\","
+    echo "  \"inspection\": \"${INSPECTION:-mixed}\","
     echo "  \"floor_area_m2\": ${FLOOR_AREA:-null},"
     echo "  \"mission\": $([ "$RUN_MISSION" = 1 ] && echo true || echo false),"
     echo "  \"git_commit\": \"$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)\","
@@ -430,6 +464,7 @@ fi
 
 if [ -n "$POLICY" ] || [ "$RUN_METRICS" = 1 ]; then
     step "research run"
+    ok "strategy : ${STRATEGY:-sweep}${INSPECTION:+ ($INSPECTION)}"
     ok "policy   : ${POLICY:-fraction (launch default)}"
     ok "detect   : $([ "$DETECT_ONLY" = 1 ] && echo 'detect-only (no chasing)' || echo 'chase + collect')"
     if [ "$RUN_METRICS" = 1 ]; then
@@ -537,6 +572,8 @@ if [ "$RUN_MISSION" = 1 ]; then
     [ -n "$COVERAGE_COST" ] && EXEC_ARGS+=("coverage_cost:=$COVERAGE_COST")
     [ -n "$SWEEP_AREA" ] && EXEC_ARGS+=("sweep_new_area_m2:=$SWEEP_AREA")
     [ "$DETECT_ONLY" = 1 ] && EXEC_ARGS+=("detect_only:=true")
+    [ -n "$STRATEGY" ] && EXEC_ARGS+=("search_strategy:=$STRATEGY")
+    [ -n "$INSPECTION" ] && EXEC_ARGS+=("inspection_mode:=$INSPECTION")
     start_bg "$LOG_DIR/executor.log" \
         ros2 launch botzilla_navigation executor.launch.py "${EXEC_ARGS[@]}"
     wait_for_log "$LOG_DIR/executor.log" "HOME latched" 90 "HOME latched — mission running"

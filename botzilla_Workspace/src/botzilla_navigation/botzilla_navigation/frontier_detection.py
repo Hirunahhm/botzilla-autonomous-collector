@@ -38,7 +38,7 @@ def _is_unknown(value):
     return value < 0
 
 
-def find_frontiers(data, width, height, min_cluster_size=4):
+def find_frontiers(data, width, height, min_cluster_size=4, with_cells=False):
     """Find frontier clusters: connected groups of free cells that border unknown space.
 
     Returns a list of (row, col, cell_count) tuples, one per cluster, in grid-cell
@@ -52,6 +52,10 @@ def find_frontiers(data, width, height, min_cluster_size=4):
     cluster shape recurs, and exploration stalls on that spot until it blacklists.
     Snapping to the nearest real member cell guarantees the target is always an
     actual free, in-cluster cell.
+
+    with_cells=True appends the cluster's member cells [(row, col), ...] as a fourth
+    element — search_strategies needs them to tell a room's own frontiers from the
+    ones seen through a doorway.
     """
     def idx(r, c):
         return r * width + c
@@ -95,7 +99,10 @@ def find_frontiers(data, width, height, min_cluster_size=4):
                 target_r, target_c = min(
                     cells, key=lambda p: (p[0] - mean_r) ** 2 + (p[1] - mean_c) ** 2
                 )
-                clusters.append((target_r, target_c, len(cells)))
+                if with_cells:
+                    clusters.append((target_r, target_c, len(cells), cells))
+                else:
+                    clusters.append((target_r, target_c, len(cells)))
 
     return clusters
 

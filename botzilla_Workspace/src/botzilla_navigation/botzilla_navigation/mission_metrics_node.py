@@ -59,6 +59,10 @@ node started, and `type`):
                    with its map position and matched cube_id (None = false positive)
   cube_first_detected  the FIRST detection matched to each ground-truth cube
   cube_inspected   the FIRST time a ground-truth cube entered the camera frustum
+  battery          /battery voltage, at the first message and every battery_period_s
+                   (the protocol starts every counted run above a fixed voltage)
+  explorer_event   one /explorer/events record from frontier_explorer_node (goal
+                   results, stalls, strategy decisions, looks), passed through as-is
   run_end          summary, on clean shutdown
 
 Usage:
@@ -88,6 +92,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from sensor_msgs.msg import BatteryState
 from std_msgs.msg import String
 import tf2_ros
 from tf2_ros import TransformException
@@ -130,6 +135,13 @@ class MissionMetricsNode(Node):
         self.declare_parameter('match_radius_m', MATCH_RADIUS_M)
         # 0 = take floor_area_m2 from the layout file, if it has one.
         self.declare_parameter('arena_floor_m2', 0.0)
+        self.declare_parameter('battery_period_s', 30.0)
+        self._battery_period_s = self.get_parameter('battery_period_s').value
+        self._battery_first = None
+        self._battery_last = None
+        self._battery_logged_at = None
+        self._stalls = 0
+        self._events = 0
 
         self._half_fov_rad = self.get_parameter('camera_half_fov_rad').value
         self._mark_range_m = self.get_parameter('camera_mark_range_m').value
@@ -173,6 +185,8 @@ class MissionMetricsNode(Node):
         )
         # Only for the inspection line-of-sight test — see the module docstring.
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
+        self.create_subscription(BatteryState, '/battery', self._battery_cb, 10)
+        self.create_subscription(String, '/explorer/events', self._explorer_event_cb, 50)
         self.create_subscription(String, '/mission/status', self._status_cb, 10)
         self.create_subscription(
             Point, '/detected_cube', self._cube_cb, qos_profile_sensor_data
@@ -369,6 +383,26 @@ class MissionMetricsNode(Node):
     def _map_cb(self, msg: OccupancyGrid):
         self._latest_map = msg
 
+    def _battery_cb(self, msg: BatteryState):
+        now = time.monotonic()
+        self._battery_last = round(msg.voltage, 2)
+        if self._battery_first is None:
+            self._battery_first = self._battery_last
+        if (self._battery_logged_at is None
+                or now - self._battery_logged_at >= self._battery_period_s):
+            self._battery_logged_at = now
+            self._write('battery', {'voltage': self._battery_last})
+
+    def _explorer_event_cb(self, msg: String):
+        try:
+            event = json.loads(msg.data)
+        except ValueError:
+            event = {'raw': msg.data}
+        self._events += 1
+        if event.get('event') == 'stall':
+            self._stalls += 1
+        self._write('explorer_event', {'event': event})
+
     def _coverage_cb(self, msg: OccupancyGrid):
         """Cache swept/total counts from /swept_coverage_map — see SWEPT_FREE."""
         swept = 0
@@ -513,6 +547,10 @@ class MissionMetricsNode(Node):
             'detections_false': self._detections_false,
             'detections_unranged': self._detections_unranged,
             'false_positive_spots': self._false_spots,
+            'battery_start_v': self._battery_first,
+            'battery_end_v': self._battery_last,
+            'stalls': self._stalls,
+            'explorer_events': self._events,
         })
         self._fh.close()
 
