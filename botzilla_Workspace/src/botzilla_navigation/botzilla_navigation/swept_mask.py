@@ -182,3 +182,98 @@ def build_coverage_grid_data(data, mask, width, height):
         if 0 <= data[i] < OCCUPIED_THRESHOLD:
             out[i] = 0 if mask[i] else 100
     return out
+
+
+def _summed_area(values, width, height):
+    """Summed-area table with a zero border: S[(r+1)*(w+1)+(c+1)] = sum of rows<=r, cols<=c."""
+    stride = width + 1
+    table = [0] * (stride * (height + 1))
+    for row in range(height):
+        running = 0
+        src = row * width
+        dst = (row + 1) * stride
+        above = row * stride
+        for col in range(width):
+            running += values[src + col]
+            table[dst + col + 1] = table[above + col + 1] + running
+    return table
+
+
+def build_coverage_cost_data(data, mask, width, height, resolution, radius_m, max_cost):
+    """Build OccupancyGrid.data for the coverage cost layer (botzilla_coverage_layer).
+
+    Each known-free cell gets round(max_cost * f), where f is the fraction of known-free
+    cells within a (2r+1)-cell square window around it that the camera has already
+    swept. Everything else (walls, unknown) is 0 — never -1, because the layer reads
+    this as a cost and "unknown" must not become a penalty or a blocker there.
+
+    Smoothed rather than per-cell on purpose. Driving along a line sweeps a band
+    ~2*radius wide, so a single un-swept cell next to swept ones is not worth routing
+    through: the planner would thread thin un-swept slivers that add almost nothing.
+    Averaging over the swath half-width makes the cost track "how much new floor would
+    the camera see from here", which is what the planner should trade distance for.
+    Walls are excluded from the denominator so the cost next to a wall is not diluted
+    toward zero just because half the window is wall.
+
+    max_cost <= 0 returns all zeros without doing the work — the layer then has no
+    effect, which is the control arm of the experiment.
+    """
+    size = width * height
+    if max_cost <= 0:
+        return [0] * size
+    free = [1 if 0 <= data[i] < OCCUPIED_THRESHOLD else 0 for i in range(size)]
+    swept = [1 if free[i] and mask[i] else 0 for i in range(size)]
+    free_sat = _summed_area(free, width, height)
+    swept_sat = _summed_area(swept, width, height)
+    stride = width + 1
+    r = max(0, int(round(radius_m / resolution)))
+
+    out = [0] * size
+    for row in range(height):
+        r0 = max(0, row - r)
+        r1 = min(height, row + r + 1)
+        top = r0 * stride
+        bottom = r1 * stride
+        base = row * width
+        for col in range(width):
+            i = base + col
+            if not free[i]:
+                continue
+            c0 = max(0, col - r)
+            c1 = min(width, col + r + 1)
+            n_free = (free_sat[bottom + c1] - free_sat[top + c1]
+                      - free_sat[bottom + c0] + free_sat[top + c0])
+            if n_free <= 0:
+                continue
+            n_swept = (swept_sat[bottom + c1] - swept_sat[top + c1]
+                       - swept_sat[bottom + c0] + swept_sat[top + c0])
+            out[i] = int(round(max_cost * n_swept / n_free))
+    return out
+
+
+def unmark_discs(mask, width, height, resolution, origin_x, origin_y, centers, radius_m):
+    """Return a COPY of mask with every cell within radius_m of any center set to False.
+
+    Used to build the PLANNING view of the swept mask: floor where a cube was seen but
+    not collected is treated as un-inspected so the sweep and the coverage cost both
+    steer the robot back to it. The original mask is left untouched because it is also
+    the coverage METRIC — the camera really did cover that floor, and un-marking it
+    would under-report inspection for whichever run happened to abort more chases.
+    """
+    out = list(mask)
+    if not centers:
+        return out
+    r_cells = max(0, math.ceil(radius_m / resolution))
+    r_sq = radius_m * radius_m
+    for cx, cy in centers:
+        center_row, center_col = world_to_grid(cx, cy, resolution, origin_x, origin_y)
+        for row in range(center_row - r_cells, center_row + r_cells + 1):
+            if not (0 <= row < height):
+                continue
+            for col in range(center_col - r_cells, center_col + r_cells + 1):
+                if not (0 <= col < width):
+                    continue
+                x, y = grid_to_world(row, col, resolution, origin_x, origin_y)
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r_sq:
+                    out[row * width + col] = False
+    return out

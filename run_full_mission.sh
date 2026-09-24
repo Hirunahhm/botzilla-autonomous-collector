@@ -38,6 +38,13 @@
 #                                  space instead of hugging walls — the measured
 #                                  cause of the obstacle-hugging deadlock. See
 #                                  config/nav2_params.yaml's SmacGrid block.
+#   --coverage-cost N              penalty (0-100, published costmap scale) on floor
+#                                  the camera has already inspected, so the planner
+#                                  prefers routes through un-inspected floor. 0
+#                                  (default) is off. Only SmacGrid trades distance
+#                                  for it, so pair with --planner SmacGrid; 15 is the
+#                                  suggested start (~45% max detour). Zeroed
+#                                  automatically while chasing/delivering a cube.
 #   --collision-monitor            splice nav2_collision_monitor into the cmd_vel
 #                                  chain: an independent, scan-based stop-before-
 #                                  contact using the robot's real (asymmetric)
@@ -84,6 +91,7 @@ RUN_METRICS=0
 POLICY=""          # empty => don't pass it; executor.launch.py keeps its own default
 ROW_PLANNER=""     # empty => launch default (SweepStraight)
 PLANNER=""         # empty => launch default (GridBased)
+COVERAGE_COST=""   # empty => launch default (0, off)
 COLLISION_MONITOR=0
 LAYOUT=""
 
@@ -106,6 +114,8 @@ while [ $# -gt 0 ]; do
         --row-planner=*) ROW_PLANNER="${1#*=}" ;;
         --planner)     PLANNER="${2:-}"; shift ;;
         --planner=*)   PLANNER="${1#*=}" ;;
+        --coverage-cost) COVERAGE_COST="${2:-}"; shift ;;
+        --coverage-cost=*) COVERAGE_COST="${1#*=}" ;;
         --collision-monitor) COLLISION_MONITOR=1 ;;
         --layout)      LAYOUT="${2:-}"; shift ;;
         --layout=*)    LAYOUT="${1#*=}" ;;
@@ -136,6 +146,19 @@ fi
 if [ -n "$PLANNER" ] && [ "$PLANNER" != "GridBased" ] && [ "$PLANNER" != "SmacGrid" ]; then
     echo "ERROR: --planner must be 'GridBased' or 'SmacGrid' (got: '$PLANNER')" >&2
     exit 2
+fi
+
+# Integer 0-74: the layer is max-combined, and anything at or above frontier_explorer's
+# COSTMAP_SAFE_COST (75) would start changing which goal cells the snap accepts.
+if [ -n "$COVERAGE_COST" ]; then
+    if ! [[ "$COVERAGE_COST" =~ ^[0-9]+$ ]] || [ "$COVERAGE_COST" -gt 74 ]; then
+        echo "ERROR: --coverage-cost must be an integer 0-74 (got: '$COVERAGE_COST')" >&2
+        exit 2
+    fi
+    if [ "$COVERAGE_COST" -gt 0 ] && [ "$PLANNER" != "SmacGrid" ]; then
+        echo "WARNING: --coverage-cost without --planner SmacGrid: NavFn barely weighs" \
+             "cost, so this run will look almost identical to coverage-cost 0." >&2
+    fi
 fi
 
 # A layout is only meaningful if something is recording, so it implies --metrics.
@@ -360,6 +383,9 @@ fi
     echo "  \"policy\": \"${POLICY:-fraction (launch default)}\","
     echo "  \"metrics\": $([ "$RUN_METRICS" = 1 ] && echo true || echo false),"
     echo "  \"layout\": \"${LAYOUT:-}\","
+    echo "  \"planner\": \"${PLANNER:-GridBased (launch default)}\","
+    echo "  \"row_planner\": \"${ROW_PLANNER:-SweepStraight (launch default)}\","
+    echo "  \"coverage_cost\": ${COVERAGE_COST:-0},"
     echo "  \"mission\": $([ "$RUN_MISSION" = 1 ] && echo true || echo false),"
     echo "  \"git_commit\": \"$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)\","
     echo "  \"git_dirty\": $(git -C "$REPO_ROOT" diff --quiet 2>/dev/null && echo false || echo true),"
@@ -471,6 +497,7 @@ if [ "$RUN_MISSION" = 1 ]; then
     [ -n "$POLICY" ] && EXEC_ARGS+=("sweep_trigger_mode:=$POLICY")
     [ -n "$ROW_PLANNER" ] && EXEC_ARGS+=("sweep_row_planner_id:=$ROW_PLANNER")
     [ -n "$PLANNER" ] && EXEC_ARGS+=("default_planner_id:=$PLANNER")
+    [ -n "$COVERAGE_COST" ] && EXEC_ARGS+=("coverage_cost:=$COVERAGE_COST")
     start_bg "$LOG_DIR/executor.log" \
         ros2 launch botzilla_navigation executor.launch.py "${EXEC_ARGS[@]}"
     wait_for_log "$LOG_DIR/executor.log" "HOME latched" 90 "HOME latched — mission running"

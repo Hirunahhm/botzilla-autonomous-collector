@@ -636,7 +636,13 @@ global_costmap:
       footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # coverage_layer = soft penalty on floor the camera has already inspected, so
+      # SmacGrid routes through un-inspected floor (botzilla_coverage_layer; the cost
+      # grid comes from frontier_explorer_node's /coverage_cost_map). GLOBAL costmap
+      # only — in the local costmap DWB would start steering around inspected floor.
+      # A no-op unless the explorer runs with coverage_cost > 0 (--coverage-cost), and
+      # max-combined below inscribed cost, so no threshold anywhere else moves.
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "coverage_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
@@ -661,4 +667,8 @@ global_costmap:
         # planner and controller costmaps consistent so DWB doesn't reject the
         # global planner's route as infeasible.
         inflation_radius: 0.45
+      coverage_layer:
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /coverage_cost_map
       always_send_full_costmap: True

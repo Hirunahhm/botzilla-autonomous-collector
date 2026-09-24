@@ -235,6 +235,33 @@ cutoff SELF_CLEARANCE_MAX_COST (99), so any cell _snap_to_reachable accepts is b
 construction not a colliding pose. The snap and the arrival check therefore agree, and a
 goal this node picks cannot be one the robot declares itself stuck at on arrival.
 
+Coverage cost: when coverage_cost > 0, this node also publishes /coverage_cost_map, which
+botzilla_coverage_layer copies into the GLOBAL costmap. Floor the camera has already
+inspected costs a little more to drive over, so a cost-aware planner (SmacGrid) routes
+frontier legs and sweep transits through un-inspected floor, and ordinary travel
+becomes a partial coverage pass instead of a pure transit. The value is smoothed over
+the swath half-width (swept_mask.build_coverage_cost_data) so the planner trades
+distance for how much NEW floor a route would put in front of the camera, not for
+single stray cells. coverage_cost = 0 publishes nothing and the layer is a no-op: that
+is the control arm, and the default, so a bare run plans exactly as before.
+
+Two cube-collection interactions are handled here rather than left to chance:
+
+  * While executor_node owns the base (/exploration_enabled false — chasing a cube or
+    DELIVERING it), the cost grid is published as all zeros. The HOME goal is a normal
+    NavigateToPose on the same global costmap, and a robot carrying a cube must take
+    the direct route, not detour through un-inspected floor it might also bump an
+    unseen cube on.
+
+  * A chase that ends with the cube LOST (executor_node publishes /cube_abandoned) means
+    the floor around that cube was swept but the cube is still there. Left alone, the
+    coverage cost would actively push the robot AWAY from the one place a cube is known
+    to be. Each abandoned position becomes a revisit point: the PLANNING view of the
+    mask (sweep generation and the cost grid) treats a disc around it as un-swept until
+    the camera covers it again from a different viewpoint. The swept mask itself — the
+    coverage METRIC — is never un-marked; the camera really did cover that floor. See
+    CUBE_REVISIT_* below.
+
 Usage:
   ros2 launch botzilla_navigation frontier_explorer.launch.py
 """
@@ -257,16 +284,20 @@ from botzilla_navigation.frontier_detection import (
     world_to_grid,
 )
 from botzilla_navigation.swept_mask import (
+    build_coverage_cost_data,
     build_coverage_grid_data,
     CAMERA_HALF_FOV_RAD,
     CAMERA_MARK_RANGE_M,
     count_unswept_free,
     create_swept_mask,
+    is_in_frustum,
     mark_swept_cells,
     mark_world_point_swept,
     resize_swept_mask,
     should_trigger_sweep,
+    unmark_discs,
 )
+from geometry_msgs.msg import PointStamped
 from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose, Spin
 from nav_msgs.msg import OccupancyGrid
 import rclpy
@@ -506,6 +537,36 @@ SWEEP_ROW_OVERLAP = 0.10
 SWEEP_ROW_SPACING_M = round(SWEEP_SWATH_WIDTH_M * (1.0 - SWEEP_ROW_OVERLAP), 2)  # 0.86 m
 SWEEP_MIN_RUN_M = 0.3
 
+# Coverage cost — see module docstring's "Coverage cost" section. Published scale
+# (0-100, the same scale as /global_costmap/costmap); the layer maps 100 -> internal 252.
+# 0 disables it entirely (control arm).
+#
+# Suggested starting value 15 (~38 internal). SmacPlanner2D charges a cell roughly
+# 1 + cost_travel_multiplier * cost / 252 per step, so with this project's multiplier of
+# 3.0 fully-inspected floor costs ~1.45x per metre: the planner will accept a route up
+# to ~45% longer if it runs through un-inspected floor. Kept well under
+# COSTMAP_SAFE_COST (75) so, combined by max, it can never change which cells the goal
+# snap accepts or what self-clearance calls a collision.
+COVERAGE_COST = 0
+# Smoothing radius for the cost: the half-width of the swath the camera sweeps while
+# driving straight, so the cost at a cell reflects what driving through it would reveal.
+COVERAGE_COST_RADIUS_M = SWEEP_SWATH_WIDTH_M / 2.0
+
+# Revisit points for cubes a chase lost — see module docstring's "Coverage cost" section.
+# Radius of floor treated as un-swept for planning around an abandoned cube's estimated
+# position. Larger than COVERAGE_COST_RADIUS_M so the smoothed cost actually reaches ~0
+# at the centre rather than being averaged back up by the swept ring around it, and
+# comfortably above the position error of a <=1 m ranged detection.
+CUBE_REVISIT_RADIUS_M = 0.75
+# A revisit point is resolved once the camera frustum covers it again FROM A NEW
+# VIEWPOINT — the robot at least this far from where it stood when the chase was
+# abandoned. Without that condition the point resolves on the very next tick: a chase
+# is usually lost while the cube is still (nominally) in the frustum, just not detected.
+CUBE_REVISIT_MIN_SHIFT_M = 0.5
+# At most this many revisits per spot. A persistent false positive (glare, a red object
+# that is not a cube) would otherwise pull the robot back to the same place forever.
+CUBE_REVISIT_MAX_PER_SPOT = 2
+
 # planner_server plugin ids (nav2_params.yaml -> planner_server.planner_plugins).
 # DEFAULT_PLANNER_ID must be sent explicitly on every ComputePathToPose goal: nav2 only
 # infers "the one plugin" when exactly one is registered, and SweepStraight makes two.
@@ -611,6 +672,11 @@ class FrontierExplorerNode(Node):
         # planner is the actual fix for obstacle hugging. Default is unchanged, so a
         # bare run plans exactly as every run before this one.
         self.declare_parameter('default_planner_id', DEFAULT_PLANNER_ID)
+        # Coverage cost weight on the published 0-100 scale; 0 = off (control arm). See
+        # COVERAGE_COST. Requires botzilla_coverage_layer in the global costmap, and only
+        # a cost-aware planner (SmacGrid) actually trades distance against it.
+        self.declare_parameter('coverage_cost', COVERAGE_COST)
+        self.declare_parameter('coverage_cost_radius_m', COVERAGE_COST_RADIUS_M)
         # Flat [x0,y0,x1,y1,...] in base_link metres. MUST match nav2_params.yaml's
         # `footprint` — if the two disagree, this node will happily pick goals the
         # controller's ObstacleFootprint critic then refuses to drive to.
@@ -636,6 +702,8 @@ class FrontierExplorerNode(Node):
         self._sweep_row_spacing_m = self.get_parameter('sweep_row_spacing_m').value
         self._sweep_row_planner_id = self.get_parameter('sweep_row_planner_id').value
         self._default_planner_id = self.get_parameter('default_planner_id').value
+        self._coverage_cost = int(self.get_parameter('coverage_cost').value)
+        self._coverage_cost_radius_m = self.get_parameter('coverage_cost_radius_m').value
         flat_footprint = self.get_parameter('footprint').value
         if len(flat_footprint) < 6 or len(flat_footprint) % 2:
             self.get_logger().error(
@@ -656,6 +724,7 @@ class FrontierExplorerNode(Node):
             f'@{self._camera_mark_range_m}m '
             f'planner={self._default_planner_id} '
             f'row_planner={self._sweep_row_planner_id} '
+            f'coverage_cost={self._coverage_cost} '
             f'footprint={len(self._footprint_m)}pt '
             f'fwd={max(v[0] for v in self._footprint_m):.2f}m'
         )
@@ -735,6 +804,16 @@ class FrontierExplorerNode(Node):
         # re-checked — see SWEEP_RETRIGGER_COOLDOWN_S.
         self._sweep_cooldown_until = None
 
+        # Revisit points for abandoned cube chases: dicts with the cube estimate (x, y)
+        # and where the robot stood when the chase was lost (rx, ry). See
+        # CUBE_REVISIT_RADIUS_M. _abandon_history counts abandons per spot across the
+        # whole run, so CUBE_REVISIT_MAX_PER_SPOT survives a revisit being resolved.
+        self._revisit_points = []
+        self._abandon_history = []  # list of [x, y, count]
+        # Whether the last /coverage_cost_map published was all zeros, so pausing
+        # publishes one zero grid rather than one every tick.
+        self._coverage_cost_zeroed = True
+
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -750,6 +829,14 @@ class FrontierExplorerNode(Node):
         # late-joining RViz should get the latest snapshot immediately, not wait for the
         # next eval tick.
         self._swept_map_pub = self.create_publisher(OccupancyGrid, '/swept_coverage_map', map_qos)
+        # Read by botzilla_coverage_layer (transient-local on that side too). Only ever
+        # published when coverage_cost > 0 — see COVERAGE_COST.
+        self._coverage_cost_pub = self.create_publisher(
+            OccupancyGrid, '/coverage_cost_map', map_qos
+        )
+        self.create_subscription(
+            PointStamped, '/cube_abandoned', self._cube_abandoned_cb, 10
+        )
 
         # Ground truth for what the planner will actually accept — see
         # COSTMAP_SAFE_COST above for why the raw /map alone isn't enough.
@@ -845,6 +932,9 @@ class FrontierExplorerNode(Node):
             return
 
         self.get_logger().info('Exploration DISABLED — yielding the base to executor_node.')
+        # Drop the coverage penalty now, not on the next timer tick: the executor's
+        # chase and HOME delivery must plan on the plain costmap. See module docstring.
+        self._publish_zero_coverage_cost()
         # Actively cancel rather than just going idle: an in-flight NavigateToPose,
         # BackUp, or Spin goal keeps Nav2 publishing cmd_vel, which would fight the
         # executor's own commands all the way through cube approach and capture.
@@ -917,6 +1007,118 @@ class FrontierExplorerNode(Node):
             msg.data, self._swept_mask, msg.info.width, msg.info.height
         )
         self._swept_map_pub.publish(coverage_msg)
+
+        self._resolve_revisit_points(robot_x, robot_y, robot_yaw)
+        self._publish_coverage_cost()
+
+    # ------------------------------------------------------------------ #
+    # Coverage cost and abandoned-cube revisits — see module docstring's
+    # "Coverage cost" section
+    # ------------------------------------------------------------------ #
+
+    def _planning_mask(self):
+        """Return the swept mask as the PLANNER should see it: revisit discs un-swept.
+
+        Never write this back to self._swept_mask — that one is the coverage metric.
+        """
+        msg = self._latest_map
+        return unmark_discs(
+            self._swept_mask, msg.info.width, msg.info.height, msg.info.resolution,
+            msg.info.origin.position.x, msg.info.origin.position.y,
+            [(p['x'], p['y']) for p in self._revisit_points], CUBE_REVISIT_RADIUS_M,
+        )
+
+    def _publish_coverage_cost(self):
+        if self._coverage_cost <= 0:
+            return
+        if not self._enabled:
+            self._publish_zero_coverage_cost()
+            return
+        msg = self._latest_map
+        cost_msg = OccupancyGrid()
+        cost_msg.header.frame_id = MAP_FRAME
+        cost_msg.header.stamp = self.get_clock().now().to_msg()
+        cost_msg.info = msg.info
+        cost_msg.data = build_coverage_cost_data(
+            msg.data, self._planning_mask(), msg.info.width, msg.info.height,
+            msg.info.resolution, self._coverage_cost_radius_m, self._coverage_cost,
+        )
+        self._coverage_cost_pub.publish(cost_msg)
+        self._coverage_cost_zeroed = False
+
+    def _publish_zero_coverage_cost(self):
+        """Publish an all-zero cost grid once, so the layer stops penalising anything."""
+        if self._coverage_cost <= 0 or self._coverage_cost_zeroed:
+            return
+        if self._latest_map is None:
+            return
+        cost_msg = OccupancyGrid()
+        cost_msg.header.frame_id = MAP_FRAME
+        cost_msg.header.stamp = self.get_clock().now().to_msg()
+        cost_msg.info = self._latest_map.info
+        cost_msg.data = [0] * (cost_msg.info.width * cost_msg.info.height)
+        self._coverage_cost_pub.publish(cost_msg)
+        self._coverage_cost_zeroed = True
+
+    def _cube_abandoned_cb(self, msg: PointStamped):
+        if msg.header.frame_id and msg.header.frame_id != MAP_FRAME:
+            self.get_logger().warn(
+                f'/cube_abandoned in frame {msg.header.frame_id!r}, expected '
+                f'{MAP_FRAME!r}; ignoring it.'
+            )
+            return
+        x, y = msg.point.x, msg.point.y
+        entry = next(
+            (h for h in self._abandon_history
+             if distance(h[0], h[1], x, y) < CUBE_REVISIT_RADIUS_M),
+            None,
+        )
+        if entry is None:
+            entry = [x, y, 0]
+            self._abandon_history.append(entry)
+        entry[2] += 1
+        if entry[2] > CUBE_REVISIT_MAX_PER_SPOT:
+            self.get_logger().info(
+                f'Cube chase abandoned at ({x:.2f}, {y:.2f}) again — {entry[2]} times at '
+                f'this spot, over the limit of {CUBE_REVISIT_MAX_PER_SPOT}; not '
+                f'scheduling another revisit (likely a persistent false positive).'
+            )
+            return
+        pose = self._get_robot_pose()
+        rx, ry = (pose[0], pose[1]) if pose is not None else (x, y)
+        # One pending revisit per spot: a second abandon there replaces the first's
+        # viewpoint rather than stacking a duplicate disc.
+        self._revisit_points = [
+            p for p in self._revisit_points
+            if distance(p['x'], p['y'], x, y) >= CUBE_REVISIT_RADIUS_M
+        ]
+        self._revisit_points.append({'x': x, 'y': y, 'rx': rx, 'ry': ry})
+        self.get_logger().info(
+            f'Cube chase abandoned at ({x:.2f}, {y:.2f}) — treating a '
+            f'{CUBE_REVISIT_RADIUS_M}m disc there as un-swept for planning until the '
+            f'camera sees it again from a new viewpoint '
+            f'({len(self._revisit_points)} revisit point(s) pending).'
+        )
+
+    def _resolve_revisit_points(self, robot_x, robot_y, robot_yaw):
+        """Drop revisit points the camera has now re-covered from a different pose."""
+        if not self._revisit_points:
+            return
+        remaining = []
+        for p in self._revisit_points:
+            moved = distance(robot_x, robot_y, p['rx'], p['ry']) >= CUBE_REVISIT_MIN_SHIFT_M
+            seen = is_in_frustum(
+                robot_x, robot_y, robot_yaw, p['x'], p['y'],
+                self._camera_half_fov_rad, self._camera_mark_range_m,
+            )
+            if moved and seen:
+                self.get_logger().info(
+                    f'Revisit point ({p["x"]:.2f}, {p["y"]:.2f}) re-inspected from a new '
+                    f'viewpoint — resolved.'
+                )
+                continue
+            remaining.append(p)
+        self._revisit_points = remaining
 
     # ------------------------------------------------------------------ #
     # Periodic evaluation — drives the whole state machine
@@ -1412,7 +1614,7 @@ class FrontierExplorerNode(Node):
                 msg.data, msg.info.width, msg.info.height, msg.info.resolution,
                 msg.info.origin.position.x, msg.info.origin.position.y,
                 row_spacing_m=self._sweep_row_spacing_m, min_run_m=SWEEP_MIN_RUN_M,
-                swept_mask=self._swept_mask,
+                swept_mask=self._planning_mask(),
             )
             # Tag entry/exit role now — see SWEEP_LEG_TRANSIT. Keeping the planning
             # module's output a plain point list leaves its unit tests untouched.

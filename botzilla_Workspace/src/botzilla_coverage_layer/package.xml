@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>botzilla_coverage_layer</name>
+  <version>0.0.1</version>
+  <description>
+    Nav2 costmap layer that adds a small cost to floor the camera has already
+    inspected, so a cost-aware global planner prefers routes through un-inspected
+    floor. The cost grid is published by botzilla_navigation's frontier_explorer_node.
+  </description>
+  <maintainer email="hirunamalavipathirana.333@gmail.com">hirunahhm</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav2_costmap_2d</depend>
+  <depend>nav_msgs</depend>
+  <depend>pluginlib</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <nav2_costmap_2d plugin="${prefix}/plugin.xml" />
+  </export>
+</package>

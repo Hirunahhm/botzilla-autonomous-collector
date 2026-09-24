@@ -58,7 +58,8 @@ nav2.launch.py and a source of /detected_cube (yolo_node) already running.
 import math
 
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Point, Twist
+from botzilla_navigation.swept_mask import CAMERA_HALF_FOV_RAD
+from geometry_msgs.msg import Point, PointStamped, Twist
 from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient
@@ -123,6 +124,13 @@ CAPTURE_GRACE_S = 2.0
 EXTRA_PUSH_S = 0.1
 # Consecutive z == 0.0 readings before believing the blind-spot signal.
 BLIND_SPOT_FRAMES = 2
+# yolo_node's /detected_cube.x is the cube centre's offset from the image centre,
+# normalised to +/-1 at the image edges (positive = right). Under a pinhole model the
+# edge of the image is the edge of the horizontal FOV, so a cube at depth z sits
+# -x * tan(half_fov) * z to the robot's left. Only used to estimate where a LOST cube
+# is for /cube_abandoned; the camera's few-cm offset from base_link is ignored, which
+# is well inside frontier_explorer_node's CUBE_REVISIT_RADIUS_M.
+CAMERA_HALF_FOV_TAN = math.tan(CAMERA_HALF_FOV_RAD)
 
 # ── Detach ───────────────────────────────────────────────────────────────────
 DETACH_SPEED = -0.10        # m/s, reverse
@@ -211,6 +219,11 @@ class ExecutorNode(Node):
         self._target_cube = None     # geometry_msgs/Point: x=norm offset, z=metres
         self._cube_last_seen = None  # rclpy.time.Time
         self._cube_lost_time = None  # when the cube left frame during CAPTURING
+        # Map-frame (x, y) of the target cube, from the most recent RANGED detection
+        # (z > 0) of the current chase. Published on /cube_abandoned if the chase is
+        # lost, so frontier_explorer_node can steer the robot back — see its
+        # "Coverage cost" docstring section.
+        self._cube_world_estimate = None
         self._blind_spot_frames = 0
         self._phase_start = self.get_clock().now()
         self._startup_start = self.get_clock().now()
@@ -240,6 +253,7 @@ class ExecutorNode(Node):
             Bool, 'velocity_smoother_enabled', enable_qos
         )
         self._status_pub = self.create_publisher(String, '/mission/status', 10)
+        self._abandoned_pub = self.create_publisher(PointStamped, '/cube_abandoned', 10)
 
         self.create_subscription(Point, 'detected_cube', self._cube_cb, 10)
 
@@ -295,6 +309,8 @@ class ExecutorNode(Node):
 
         self._target_cube = msg
         self._cube_last_seen = self.get_clock().now()
+        if msg.z > 0.0:
+            self._update_cube_world_estimate(msg)
 
         if self._state == State.EXPLORING:
             self.get_logger().info(
@@ -397,6 +413,7 @@ class ExecutorNode(Node):
     def _do_targeting(self, cmd, now):
         """Rotate in place until the cube is centred."""
         if self._cube_timed_out(now):
+            self._publish_cube_abandoned()
             self._resume_exploring('Cube lost while targeting.')
             return
         if self._target_cube is None:
@@ -413,6 +430,7 @@ class ExecutorNode(Node):
     def _do_approaching(self, cmd, now):
         """Drive toward the cube, holding it centred. Exit is via _cube_cb."""
         if self._cube_timed_out(now):
+            self._publish_cube_abandoned()
             self._resume_exploring('Cube lost while approaching.')
             return
         if self._target_cube is None:
@@ -590,11 +608,39 @@ class ExecutorNode(Node):
         dy = pose[1] - self._home[1]
         return (dx * dx + dy * dy) < self._home_cube_suppress_radius_m ** 2
 
+    def _update_cube_world_estimate(self, msg: Point):
+        """Project a ranged detection into the map frame — see CAMERA_HALF_FOV_TAN."""
+        pose = self._get_robot_pose()
+        if pose is None:
+            return
+        x, y, yaw = pose
+        forward = msg.z
+        left = -msg.x * CAMERA_HALF_FOV_TAN * msg.z
+        self._cube_world_estimate = (
+            x + forward * math.cos(yaw) - left * math.sin(yaw),
+            y + forward * math.sin(yaw) + left * math.cos(yaw),
+        )
+
+    def _publish_cube_abandoned(self):
+        """Tell frontier_explorer_node where a cube we failed to collect still is."""
+        if self._cube_world_estimate is None:
+            return
+        out = PointStamped()
+        out.header.frame_id = MAP_FRAME
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.point.x, out.point.y = self._cube_world_estimate
+        self._abandoned_pub.publish(out)
+        self.get_logger().info(
+            f'Chase abandoned; cube estimated at ({out.point.x:.2f}, {out.point.y:.2f}) '
+            f'— published to /cube_abandoned for a later revisit.'
+        )
+
     def _publish_exploration_enabled(self, enabled: bool):
         self._explore_pub.publish(Bool(data=enabled))
 
     def _resume_exploring(self, reason=''):
         self._target_cube = None
+        self._cube_world_estimate = None
         self._cube_lost_time = None
         self._blind_spot_frames = 0
         self._publish_exploration_enabled(True)

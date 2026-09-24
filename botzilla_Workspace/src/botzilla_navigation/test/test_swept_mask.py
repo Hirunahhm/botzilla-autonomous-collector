@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from botzilla_navigation.swept_mask import (  # noqa: E402,I100
+    build_coverage_cost_data,
     build_coverage_grid_data,
     count_unswept_free,
     create_swept_mask,
@@ -19,6 +20,7 @@ from botzilla_navigation.swept_mask import (  # noqa: E402,I100
     mark_world_point_swept,
     resize_swept_mask,
     should_trigger_sweep,
+    unmark_discs,
 )
 
 
@@ -153,3 +155,58 @@ def test_build_coverage_grid_data():
         0, -1, -1,    # swept-free -> 0, occupied -> -1, unknown -> -1
         100, 0, -1,   # un-swept-free -> 100, swept-free -> 0, occupied -> -1
     ]
+
+
+def test_coverage_cost_zero_max_cost_is_all_zero():
+    data = [0] * 25
+    mask = [True] * 25
+    assert build_coverage_cost_data(data, mask, 5, 5, 1.0, 1.0, 0) == [0] * 25
+
+
+def test_coverage_cost_fully_swept_free_is_max_and_non_free_is_zero():
+    width, height = 5, 5
+    data = [0] * 25
+    data[12] = 100   # wall
+    data[0] = -1     # unknown
+    mask = [True] * 25
+    out = build_coverage_cost_data(data, mask, width, height, 1.0, 1.0, 15)
+    assert out[12] == 0
+    assert out[0] == 0
+    assert out[6] == 15
+    assert all(v in (0, 15) for v in out)
+
+
+def test_coverage_cost_unswept_is_zero_and_boundary_is_graded():
+    width, height = 10, 1
+    data = [0] * 10
+    mask = [col < 5 for col in range(10)]
+    out = build_coverage_cost_data(data, mask, width, height, 1.0, 1.0, 30)
+    assert out[0] == 30          # deep in swept region
+    assert out[9] == 0           # deep in un-swept region
+    assert out[4] == 20          # window cols 3..5: 2 of 3 swept
+    assert out[5] == 10          # window cols 4..6: 1 of 3 swept
+
+
+def test_coverage_cost_walls_do_not_dilute_denominator():
+    width, height = 3, 1
+    data = [100, 0, 100]
+    mask = [False, True, False]
+    out = build_coverage_cost_data(data, mask, width, height, 1.0, 1.0, 20)
+    assert out[1] == 20
+
+
+def test_unmark_discs_clears_only_within_radius_and_copies():
+    width, height = 11, 11
+    mask = [True] * (width * height)
+    out = unmark_discs(mask, width, height, 1.0, 0.0, 0.0, [(5.5, 5.5)], 1.0)
+    assert all(mask)                          # original untouched
+    assert out[5 * width + 5] is False        # centre
+    assert out[5 * width + 6] is False        # 1.0 m away, on the radius
+    assert out[6 * width + 6] is True         # 1.41 m diagonal, outside
+    assert out[5 * width + 7] is True         # 2.0 m away
+
+
+def test_unmark_discs_no_centers_returns_equal_copy():
+    mask = [True, False, True]
+    out = unmark_discs(mask, 3, 1, 1.0, 0.0, 0.0, [], 0.5)
+    assert out == mask and out is not mask

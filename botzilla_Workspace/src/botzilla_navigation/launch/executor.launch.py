@@ -35,6 +35,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -78,6 +79,13 @@ def generate_launch_description():
         description="Planner for frontier/transit goals: 'GridBased' or 'SmacGrid'.",
     )
     default_planner_id = LaunchConfiguration('default_planner_id')
+    coverage_cost_arg = DeclareLaunchArgument(
+        'coverage_cost',
+        default_value='0',
+        description='Coverage cost on inspected floor, 0-100 published scale '
+                    '(0 = off). Only SmacGrid trades distance against it.',
+    )
+    coverage_cost = LaunchConfiguration('coverage_cost')
 
     executor = Node(
         package='botzilla_navigation',
@@ -97,6 +105,7 @@ def generate_launch_description():
             'sweep_trigger_mode': sweep_trigger_mode,
             'sweep_row_planner_id': sweep_row_planner_id,
             'default_planner_id': default_planner_id,
+            'coverage_cost': ParameterValue(coverage_cost, value_type=int),
         }],
     )
 
@@ -105,6 +114,7 @@ def generate_launch_description():
         sweep_trigger_mode_arg,
         sweep_row_planner_id_arg,
         default_planner_id_arg,
+        coverage_cost_arg,
         LogInfo(msg='[executor] Mission: explore -> collect cube -> deliver to HOME'),
         LogInfo(msg='[executor] HOME is latched at startup from map->base_link.'),
         LogInfo(msg='[executor] Place the robot at the drop-off point before starting.'),
