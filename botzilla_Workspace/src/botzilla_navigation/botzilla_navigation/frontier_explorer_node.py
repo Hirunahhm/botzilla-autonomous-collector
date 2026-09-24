@@ -230,6 +230,28 @@ modes (so it's already known by the time the sweep queue drains), and
 _dispatch_next_sweep_waypoint's empty-queue check re-evaluates against the live map,
 so a fresh sweep covering the new area can begin immediately once this one finishes.
 
+Row abandonment: a sweep row that keeps failing is given up on as a whole. Measured in
+run 22 (run_logs/20260924-001401): three consecutive waypoints on the row at y=-2.55
+each stalled for the full watchdog (~70 s apiece with recoveries) — DWB rejected every
+trajectory along furniture that the row ran beside. SWEEP_FAILURE_RADIUS_M only catches
+a waypoint that snaps onto the SAME failed point; waypoints further along the same row
+are new points and each got a full attempt. After SWEEP_ROW_MAX_FAILURES consecutive
+attempted failures on one map row, every remaining queue entry on that row is dropped,
+and the row is remembered for ABANDONED_ROW_MEMORY_S so the next sweep does not queue it
+straight back. Cheap skips (snap failure, standing on the point, a recently-failed
+point) are not counted — they cost no time. The floor on an abandoned row stays
+un-swept, which is the truth.
+
+Area trigger (sweep_trigger_mode 'area'): the 'fraction' trigger never actually
+switched (research_discussion.md §1.2) — the first sweep starts at 100% un-swept, ends
+with ~45% still un-swept because rows fail and the map grows, so "un-swept > 15%" stays
+true for the whole run and the robot sweeps nearly continuously. 'area' instead
+measures un-swept floor ADDED since the last sweep ended: it records the un-swept count
+when a sweep's queue drains and triggers again only once un-swept floor exceeds that
+baseline by sweep_new_area_m2. Floor a sweep failed to cover does not re-trigger it;
+new floor from exploration does. 'fraction' is kept unchanged so earlier runs stay
+reproducible.
+
 Snap/self-clearance agreement: COSTMAP_SAFE_COST (75) sits well below the inscribed
 cutoff SELF_CLEARANCE_MAX_COST (99), so any cell _snap_to_reachable accepts is by
 construction not a colliding pose. The snap and the arrival check therefore agree, and a
@@ -288,6 +310,7 @@ from botzilla_navigation.swept_mask import (
     build_coverage_grid_data,
     CAMERA_HALF_FOV_RAD,
     CAMERA_MARK_RANGE_M,
+    CAMERA_MIN_RANGE_M,
     count_unswept_free,
     create_swept_mask,
     is_in_frustum,
@@ -443,6 +466,17 @@ SWEEP_FAILURE_RADIUS_M = 0.30
 # Long enough to cover the rest of a row (waypoints arrive seconds to a couple of
 # minutes apart), short enough that a genuine later revisit is not poisoned.
 SWEEP_FAILURE_MEMORY_S = 120.0
+
+# Row abandonment — see module docstring. Two consecutive attempted failures on one map
+# row drop the rest of it: in run 22 this would have skipped the third ~70 s stall on
+# y=-2.55. One failure is not enough — a single transit is often cancelled for reasons
+# local to that point (a snapped goal in a nook) while the rest of the row is fine.
+SWEEP_ROW_MAX_FAILURES = 2
+# How long an abandoned row stays out of newly built sweep queues. A new sweep can start
+# 20 s after the last one ends (SWEEP_RETRIGGER_COOLDOWN_S), and without this it would
+# queue the same row straight back. Long enough to outlast a couple of sweep cycles,
+# short enough that a row blocked by a transient obstacle is tried again later.
+ABANDONED_ROW_MEMORY_S = 300.0
 
 # Exponential backoff: cooldown = min(BASE * 2^(failure_count - 1), MAX). BASE is set well
 # above the ~300s single-attempt failure latency observed live (see module docstring).
@@ -605,6 +639,12 @@ ROW_ENTRY_TOLERANCE_M = 0.5
 # See module docstring's "Interleaved, not sequential" section.
 SWEEP_FRACTION = 0.15
 
+# 'area' trigger — see module docstring. Sweep once un-swept floor exceeds the baseline
+# left by the last sweep by this much. 3 m^2 is roughly a small room, or six camera
+# looks' worth of floor, so a sweep is worth its transit overhead; it is a parameter so
+# the interleaved arm can be tuned without a rebuild.
+SWEEP_NEW_AREA_M2 = 3.0
+
 # After returning from SWEEPING to FRONTIER, don't re-check the dynamic trigger for this
 # long — otherwise the same un-swept ratio that just caused the return would very likely
 # still be true on the next tick, re-triggering SWEEPING before a single frontier goal
@@ -616,7 +656,7 @@ SWEEP_RETRIGGER_COOLDOWN_S = 20.0
 # 'interval' (sweep every N seconds) is deliberately not here yet: it is a third policy
 # arm with its own timer, not a re-labelling of existing behaviour, so it lands with that
 # work rather than being stubbed in now.
-SWEEP_TRIGGER_MODES = ('fraction', 'exhaustion')
+SWEEP_TRIGGER_MODES = ('fraction', 'exhaustion', 'area')
 
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
@@ -655,9 +695,14 @@ class FrontierExplorerNode(Node):
         # interrupt.
         self.declare_parameter('sweep_trigger_mode', 'fraction')
         self.declare_parameter('sweep_fraction', SWEEP_FRACTION)
+        self.declare_parameter('sweep_new_area_m2', SWEEP_NEW_AREA_M2)
         self.declare_parameter('sweep_retrigger_cooldown_s', SWEEP_RETRIGGER_COOLDOWN_S)
         self.declare_parameter('camera_half_fov_rad', CAMERA_HALF_FOV_RAD)
         self.declare_parameter('camera_mark_range_m', CAMERA_MARK_RANGE_M)
+        # Near-field blind ring and occlusion — see swept_mask's module docstring.
+        # Occlusion off reproduces the mask of every run before it existed.
+        self.declare_parameter('camera_min_range_m', CAMERA_MIN_RANGE_M)
+        self.declare_parameter('coverage_occlusion', True)
         self.declare_parameter('costmap_safe_cost', COSTMAP_SAFE_COST)
         self.declare_parameter('sweep_row_spacing_m', SWEEP_ROW_SPACING_M)
         # Planner used for sweep ROW legs. Set to DEFAULT_PLANNER_ID to run the
@@ -693,11 +738,14 @@ class FrontierExplorerNode(Node):
             )
             self._sweep_trigger_mode = 'fraction'
         self._sweep_fraction = self.get_parameter('sweep_fraction').value
+        self._sweep_new_area_m2 = self.get_parameter('sweep_new_area_m2').value
         self._sweep_retrigger_cooldown_s = self.get_parameter(
             'sweep_retrigger_cooldown_s'
         ).value
         self._camera_half_fov_rad = self.get_parameter('camera_half_fov_rad').value
         self._camera_mark_range_m = self.get_parameter('camera_mark_range_m').value
+        self._camera_min_range_m = self.get_parameter('camera_min_range_m').value
+        self._coverage_occlusion = bool(self.get_parameter('coverage_occlusion').value)
         self._costmap_safe_cost = self.get_parameter('costmap_safe_cost').value
         self._sweep_row_spacing_m = self.get_parameter('sweep_row_spacing_m').value
         self._sweep_row_planner_id = self.get_parameter('sweep_row_planner_id').value
@@ -719,9 +767,11 @@ class FrontierExplorerNode(Node):
         self.get_logger().info(
             f'Coverage policy: sweep_trigger_mode={self._sweep_trigger_mode} '
             f'sweep_fraction={self._sweep_fraction} '
+            f'sweep_new_area_m2={self._sweep_new_area_m2} '
             f'cooldown={self._sweep_retrigger_cooldown_s}s '
             f'camera=+/-{math.degrees(self._camera_half_fov_rad):.1f}deg '
-            f'@{self._camera_mark_range_m}m '
+            f'{self._camera_min_range_m}-{self._camera_mark_range_m}m '
+            f'occlusion={self._coverage_occlusion} '
             f'planner={self._default_planner_id} '
             f'row_planner={self._sweep_row_planner_id} '
             f'coverage_cost={self._coverage_cost} '
@@ -759,6 +809,11 @@ class FrontierExplorerNode(Node):
         # Snapped sweep nav points that failed: (x, y, expiry). See
         # SWEEP_FAILURE_RADIUS_M — distinct from _blacklist, which is frontier-only.
         self._sweep_failures = []
+        # Row abandonment — see SWEEP_ROW_MAX_FAILURES. _active_sweep_row is the row key
+        # (map-frame y) of the in-flight sweep goal, None for frontier goals.
+        self._active_sweep_row = None
+        self._row_failures = {}      # row key -> consecutive attempted failures
+        self._abandoned_rows = []    # (row y, expiry)
         self._failure_history = []  # list of [x, y, count] — persists across cooldowns
 
         # Stuck recovery — see module docstring. Set the first tick every known frontier
@@ -803,6 +858,8 @@ class FrontierExplorerNode(Node):
         # rclpy Time; while set and in the future, the dynamic sweep trigger is not
         # re-checked — see SWEEP_RETRIGGER_COOLDOWN_S.
         self._sweep_cooldown_until = None
+        # 'area' trigger baseline: un-swept free cells when the last sweep ended.
+        self._unswept_baseline = 0
 
         # Revisit points for abandoned cube chases: dicts with the cube estimate (x, y)
         # and where the robot stood when the chase was lost (rx, ry). See
@@ -953,6 +1010,9 @@ class FrontierExplorerNode(Node):
         self._path_epoch += 1
         self._current_target = None
         self._frontier_origin = None
+        # A goal cancelled for a cube chase is not a row failure — see
+        # _note_sweep_row_result; forget which row it was on.
+        self._active_sweep_row = None
         self._goal_start_time = None
         self._path_check_start_time = None
         self._last_progress_distance = None
@@ -997,6 +1057,8 @@ class FrontierExplorerNode(Node):
             robot_x, robot_y, robot_yaw,
             half_fov_rad=self._camera_half_fov_rad,
             mark_range_m=self._camera_mark_range_m,
+            min_range_m=self._camera_min_range_m,
+            occupancy=msg.data if self._coverage_occlusion else None,
         )
 
         coverage_msg = OccupancyGrid()
@@ -1110,6 +1172,7 @@ class FrontierExplorerNode(Node):
             seen = is_in_frustum(
                 robot_x, robot_y, robot_yaw, p['x'], p['y'],
                 self._camera_half_fov_rad, self._camera_mark_range_m,
+                self._camera_min_range_m,
             )
             if moved and seen:
                 self.get_logger().info(
@@ -1270,6 +1333,16 @@ class FrontierExplorerNode(Node):
                 f'{self._sweep_fraction * 100:.0f}% of known free space',
             )
             return
+        if self._sweep_trigger_mode == 'area' and not cooldown_active:
+            cell_area = msg.info.resolution * msg.info.resolution
+            new_m2 = (unswept_free - self._unswept_baseline) * cell_area
+            if new_m2 > self._sweep_new_area_m2:
+                self._begin_coverage_sweep(
+                    msg, robot_x, robot_y, frontiers_world,
+                    f'{new_m2:.1f} m^2 of un-swept floor added since the last sweep '
+                    f'(threshold {self._sweep_new_area_m2} m^2)',
+                )
+                return
 
         target = select_target(candidates, robot_x, robot_y)
 
@@ -1315,6 +1388,7 @@ class FrontierExplorerNode(Node):
         )
         yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
         self._frontier_origin = target
+        self._active_sweep_row = None
         # Frontier targets always need obstacle-aware planning.
         self._active_planner_id = self._default_planner_id
         self._sweep_row_retry = None
@@ -1428,6 +1502,7 @@ class FrontierExplorerNode(Node):
                 )
             else:
                 self._mode = 'FRONTIER'
+                self._unswept_baseline = unswept_free
                 self._sweep_cooldown_until = (
                     self.get_clock().now()
                     + Duration(seconds=self._sweep_retrigger_cooldown_s)
@@ -1458,7 +1533,7 @@ class FrontierExplorerNode(Node):
                 f'nearby in the costmap; marking it swept-but-skipped so an un-drivable '
                 f'pocket cannot block coverage completion forever.'
             )
-            self._mark_sweep_waypoint_unreachable(target[0], target[1])
+            self._mark_sweep_waypoint_unreachable(target[0], target[1], attempted=False)
             return
 
         nav_x, nav_y = nav_point
@@ -1472,7 +1547,7 @@ class FrontierExplorerNode(Node):
                 f'({target[0]:.2f}, {target[1]:.2f}) snapped to ({nav_x:.2f}, {nav_y:.2f}), '
                 f'which the robot is already standing on; marking it swept and skipping.'
             )
-            self._mark_sweep_waypoint_unreachable(nav_x, nav_y)
+            self._mark_sweep_waypoint_unreachable(nav_x, nav_y, attempted=False)
             return
         if self._recently_failed_sweep_point(nav_x, nav_y):
             self.get_logger().info(
@@ -1481,7 +1556,7 @@ class FrontierExplorerNode(Node):
                 f'within {SWEEP_FAILURE_RADIUS_M}m of a sweep point that just failed; '
                 f'skipping instead of spending another {NO_PROGRESS_TIMEOUT_S:.0f}s on it.'
             )
-            self._mark_sweep_waypoint_unreachable(nav_x, nav_y)
+            self._mark_sweep_waypoint_unreachable(nav_x, nav_y, attempted=False)
             return
 
         leg = target[2] if len(target) > 2 else SWEEP_LEG_TRANSIT
@@ -1524,6 +1599,9 @@ class FrontierExplorerNode(Node):
         )
         yaw = math.atan2(nav_y - robot_y, nav_x - robot_x)
         self._frontier_origin = None
+        # Keyed on the QUEUE point's y, not the snapped one: snapping moves points off
+        # the row line, and every entry of one row must share a key.
+        self._active_sweep_row = target[1]
         self._check_reachability(nav_x, nav_y, yaw)
 
     def _filter_blacklisted(self, frontiers_world):
@@ -1622,6 +1700,24 @@ class FrontierExplorerNode(Node):
                 (wx, wy, SWEEP_LEG_ROW if i % 2 else SWEEP_LEG_TRANSIT)
                 for i, (wx, wy) in enumerate(raw_waypoints)
             ]
+            # Leave out rows abandoned recently — see ABANDONED_ROW_MEMORY_S. Both legs
+            # of a run share its y, so a pair is always dropped together.
+            now = self.get_clock().now()
+            self._abandoned_rows = [a for a in self._abandoned_rows if a[1] > now]
+            if self._abandoned_rows:
+                tolerance = self._sweep_row_spacing_m / 2.0
+                before = len(self._sweep_queue)
+                self._sweep_queue = [
+                    w for w in self._sweep_queue
+                    if not any(abs(w[1] - ay) < tolerance for ay, _exp in self._abandoned_rows)
+                ]
+                if len(self._sweep_queue) != before:
+                    self.get_logger().info(
+                        f'Left {before - len(self._sweep_queue)} waypoint(s) on '
+                        f'{len(self._abandoned_rows)} recently abandoned row(s) out of '
+                        f'this sweep.'
+                    )
+            self._row_failures = {}
             # The previous cycle's entry says nothing about this queue's first row.
             self._pending_row_entry = None
             self.get_logger().info(
@@ -1837,7 +1933,7 @@ class FrontierExplorerNode(Node):
         self._path_check_start_time = None
         self._state = State.IDLE
 
-    def _mark_sweep_waypoint_unreachable(self, x, y):
+    def _mark_sweep_waypoint_unreachable(self, x, y, attempted=True):
         """Mark a failed sweep waypoint's cell swept-but-skipped, not blacklisted.
 
         A sweep waypoint (self._frontier_origin is None while it was in flight) has no
@@ -1849,8 +1945,13 @@ class FrontierExplorerNode(Node):
         it, that specific cell stays permanently un-swept and coverage completion
         (which requires unswept_free == 0) becomes permanently unreachable over one
         un-drivable pocket. Centralized here rather than duplicated at each call site.
+
+        attempted=False marks a cheap skip that cost no driving time; only attempted
+        failures count toward abandoning the row (see SWEEP_ROW_MAX_FAILURES).
         """
         self._record_sweep_failure(x, y)
+        if attempted:
+            self._note_sweep_row_result(succeeded=False)
         if self._swept_mask is None or self._latest_map is None:
             return
         mark_world_point_swept(
@@ -1859,6 +1960,32 @@ class FrontierExplorerNode(Node):
             self._latest_map.info.origin.position.x,
             self._latest_map.info.origin.position.y,
             x, y,
+        )
+
+    def _note_sweep_row_result(self, succeeded):
+        """Track consecutive failures per sweep row; abandon a row that keeps failing."""
+        row = self._active_sweep_row
+        self._active_sweep_row = None
+        if row is None:
+            return
+        if succeeded:
+            self._row_failures.pop(row, None)
+            return
+        count = self._row_failures.get(row, 0) + 1
+        self._row_failures[row] = count
+        if count < SWEEP_ROW_MAX_FAILURES:
+            return
+        before = len(self._sweep_queue)
+        self._sweep_queue = [w for w in self._sweep_queue if w[1] != row]
+        self._row_failures.pop(row, None)
+        expiry = self.get_clock().now() + Duration(seconds=ABANDONED_ROW_MEMORY_S)
+        self._abandoned_rows.append((row, expiry))
+        # The transit that led here may have set a row entry the dropped row owned.
+        self._pending_row_entry = None
+        self.get_logger().warn(
+            f'Sweep row y={row:.2f} failed {count} times in a row — abandoning it: '
+            f'dropped {before - len(self._sweep_queue)} remaining waypoint(s), and '
+            f'keeping it out of new sweeps for {ABANDONED_ROW_MEMORY_S:.0f}s.'
         )
 
     def _record_sweep_failure(self, x, y):
@@ -2173,6 +2300,8 @@ class FrontierExplorerNode(Node):
                 self._blacklist_target(x, y)
             elif self._current_target is not None:
                 self._mark_sweep_waypoint_unreachable(*self._current_target)
+        elif self._frontier_origin is None and self._current_target is not None:
+            self._note_sweep_row_result(succeeded=True)
 
         self._current_target = None
         self._frontier_origin = None

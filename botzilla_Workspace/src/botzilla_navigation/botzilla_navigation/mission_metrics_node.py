@@ -26,9 +26,27 @@ Ground truth: cube positions come from a layout file (see --cube-layout / the
 `cube_layout` parameter), in the SAME frame as the robot pose (map). Without one the node
 still records pose/state/coverage; it just cannot report per-cube inspection times.
 
+  floor_area_m2: 18.5      # optional: measured arena floor, the coverage denominator
   cubes:
     - {id: 1, x: 2.0, y: 0.5}
     - {id: 2, x: -1.0, y: 1.5}
+
+Coverage denominator: "swept / known free cells" rewards a policy for mapping LESS — the
+same floor seen over a smaller map is a bigger percentage. With floor_area_m2 (layout
+key, or the arena_floor_m2 parameter, which wins) every coverage record also carries
+swept_m2 / floor_area_m2, a denominator fixed for the whole campaign. That is the
+figure to compare arms on (research_discussion.md §1.3).
+
+Inspection uses the same geometry as the coverage map: swept_mask.is_in_frustum (range
+annulus 0.48-1.0 m, +/-28.5 deg) AND, once /map is available, an unobstructed line of
+sight (swept_mask.has_line_of_sight). A cube behind a box inside the cone is not
+inspected.
+
+Detection matching: every ranged detection within detect_max_range_m is projected into
+the map (cube_detections.project_detection) and matched to the nearest layout cube within
+cube_detections.MATCH_RADIUS_M. A match is that cube detected; no match is a false
+positive. Paired with cube_inspected this separates the strategy (did the camera point
+at it) from the detector (did YOLO fire).
 
 Record types written (each line is a complete JSON object with `t`, seconds since the
 node started, and `type`):
@@ -37,7 +55,9 @@ node started, and `type`):
   pose             x/y/yaw in the map frame plus cumulative distance travelled
   state            mission state and delivered-count, on every change
   coverage         total known-free cells vs. camera-swept cells
-  cube_detected    a /detected_cube message the perception stack actually produced
+  cube_detected    a /detected_cube message the perception stack actually produced,
+                   with its map position and matched cube_id (None = false positive)
+  cube_first_detected  the FIRST detection matched to each ground-truth cube
   cube_inspected   the FIRST time a ground-truth cube entered the camera frustum
   run_end          summary, on clean shutdown
 
@@ -52,7 +72,16 @@ import math
 import os
 import time
 
-from botzilla_navigation.swept_mask import is_in_frustum
+from botzilla_navigation.cube_detections import (
+    match_detection,
+    MATCH_RADIUS_M,
+    project_detection,
+)
+from botzilla_navigation.swept_mask import (
+    CAMERA_MIN_RANGE_M,
+    has_line_of_sight,
+    is_in_frustum,
+)
 from geometry_msgs.msg import Point
 from nav_msgs.msg import OccupancyGrid
 import rclpy
@@ -73,6 +102,11 @@ ROBOT_FRAME = 'base_link'
 # recorded data having baked one in — the raw pose stream is kept for exactly that reason.
 DEFAULT_HALF_FOV_RAD = 0.497
 DEFAULT_MARK_RANGE_M = 1.0
+DEFAULT_MIN_RANGE_M = CAMERA_MIN_RANGE_M
+# Detections further than this are recorded but never matched: the executor does not
+# act on them either (executor_node.cube_max_range_m), and the bearing-plus-depth
+# projection error grows with range.
+DEFAULT_DETECT_MAX_RANGE_M = 1.0
 
 # /swept_coverage_map encodes free cells as 0 (camera-swept) or 100 (not yet swept), and
 # everything else as -1 — see swept_mask.build_coverage_grid_data.
@@ -90,9 +124,19 @@ class MissionMetricsNode(Node):
         self.declare_parameter('coverage_sample_period_s', 2.0)
         self.declare_parameter('camera_half_fov_rad', DEFAULT_HALF_FOV_RAD)
         self.declare_parameter('camera_mark_range_m', DEFAULT_MARK_RANGE_M)
+        self.declare_parameter('camera_min_range_m', DEFAULT_MIN_RANGE_M)
+        self.declare_parameter('inspection_occlusion', True)
+        self.declare_parameter('detect_max_range_m', DEFAULT_DETECT_MAX_RANGE_M)
+        self.declare_parameter('match_radius_m', MATCH_RADIUS_M)
+        # 0 = take floor_area_m2 from the layout file, if it has one.
+        self.declare_parameter('arena_floor_m2', 0.0)
 
         self._half_fov_rad = self.get_parameter('camera_half_fov_rad').value
         self._mark_range_m = self.get_parameter('camera_mark_range_m').value
+        self._min_range_m = self.get_parameter('camera_min_range_m').value
+        self._inspection_occlusion = bool(self.get_parameter('inspection_occlusion').value)
+        self._detect_max_range_m = self.get_parameter('detect_max_range_m').value
+        self._match_radius_m = self.get_parameter('match_radius_m').value
         pose_hz = max(0.1, self.get_parameter('pose_sample_hz').value)
         coverage_period = max(0.1, self.get_parameter('coverage_sample_period_s').value)
 
@@ -102,14 +146,23 @@ class MissionMetricsNode(Node):
         # buffer at that moment is lost. Every record is flushed as it is written.
         self._fh = open(self._path, 'a', buffering=1)
 
+        self._floor_area_m2 = None
         self._cubes = self._load_layout(self.get_parameter('cube_layout').value)
+        if self.get_parameter('arena_floor_m2').value > 0.0:
+            self._floor_area_m2 = float(self.get_parameter('arena_floor_m2').value)
         self._inspected = {}          # cube id -> elapsed seconds first inspected
+        self._detected = {}           # cube id -> elapsed seconds first detected
+        self._detections_matched = 0
+        self._detections_false = 0    # ranged, in range, no cube within match radius
+        self._detections_unranged = 0  # z == 0: blind spot or depth failure, no position
+        self._false_spots = []        # distinct false-positive positions, [x, y]
+        self._latest_map = None
         self._last_pose = None        # (x, y, yaw)
         self._distance_m = 0.0
         self._state = None
         self._delivered = 0
         self._status_parse_failed = False
-        self._latest_coverage = None  # (total_free, swept_free)
+        self._latest_coverage = None  # (total_free, swept_free, cell_area_m2)
 
         # ── Subscriptions only. See the module docstring's safety property. ──
         map_qos = QoSProfile(depth=1)
@@ -118,6 +171,8 @@ class MissionMetricsNode(Node):
         self.create_subscription(
             OccupancyGrid, '/swept_coverage_map', self._coverage_cb, map_qos
         )
+        # Only for the inspection line-of-sight test — see the module docstring.
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
         self.create_subscription(String, '/mission/status', self._status_cb, 10)
         self.create_subscription(
             Point, '/detected_cube', self._cube_cb, qos_profile_sensor_data
@@ -135,14 +190,27 @@ class MissionMetricsNode(Node):
             'cube_count': len(self._cubes),
             'camera_half_fov_rad': self._half_fov_rad,
             'camera_mark_range_m': self._mark_range_m,
+            'camera_min_range_m': self._min_range_m,
+            'inspection_occlusion': self._inspection_occlusion,
+            'detect_max_range_m': self._detect_max_range_m,
+            'match_radius_m': self._match_radius_m,
+            'floor_area_m2': self._floor_area_m2,
             'pose_sample_hz': pose_hz,
             'wall_clock_start': time.time(),
         })
         self.get_logger().info(
             f'Metrics -> {self._path} '
             f'({len(self._cubes)} ground-truth cube(s), '
-            f'frustum +/-{math.degrees(self._half_fov_rad):.1f}deg @{self._mark_range_m}m)'
+            f'frustum +/-{math.degrees(self._half_fov_rad):.1f}deg '
+            f'@{self._min_range_m}-{self._mark_range_m}m, '
+            f'floor area {self._floor_area_m2 or "unset"} m^2)'
         )
+        if self._floor_area_m2 is None:
+            self.get_logger().warn(
+                'No arena floor area — coverage is recorded only as a share of known '
+                'free cells, which favours arms that map less. Add floor_area_m2 to the '
+                'layout or pass -p arena_floor_m2:=<m^2>.'
+            )
         if not self._cubes:
             self.get_logger().warn(
                 'No cube layout given — pose/state/coverage will be recorded, but '
@@ -175,6 +243,8 @@ class MissionMetricsNode(Node):
         try:
             with open(path) as fh:
                 doc = yaml.safe_load(fh) or {}
+            if doc.get('floor_area_m2') is not None:
+                self._floor_area_m2 = float(doc['floor_area_m2'])
             cubes = []
             for i, entry in enumerate(doc.get('cubes') or []):
                 cubes.append((entry.get('id', i + 1), float(entry['x']), float(entry['y'])))
@@ -239,12 +309,65 @@ class MissionMetricsNode(Node):
         This is the COLLECTION-side signal (what the detector saw), as opposed to the
         geometric cube_inspected record (what the camera was pointed at). Comparing the
         two is what quantifies detector loss independently of the exploration policy.
+
+        A ranged detection is projected into the map from the current pose and matched
+        against the layout; see the module docstring's "Detection matching".
         """
-        self._write('cube_detected', {
+        record = {
             'x_norm': round(msg.x, 4),
             'z_m': round(msg.z, 4),
             'state': self._state,
+            'map_x': None,
+            'map_y': None,
+            'cube_id': None,
+            'match_dist_m': None,
+            'in_range': 0.0 < msg.z <= self._detect_max_range_m,
+        }
+        pose = self._get_robot_pose()
+        if msg.z <= 0.0:
+            self._detections_unranged += 1
+        elif pose is not None:
+            mx, my = project_detection(
+                pose[0], pose[1], pose[2], msg.x, msg.z, self._half_fov_rad
+            )
+            record['map_x'], record['map_y'] = round(mx, 4), round(my, 4)
+            cube_id, dist = match_detection(mx, my, self._cubes, self._match_radius_m)
+            record['match_dist_m'] = round(dist, 4) if dist is not None else None
+            if record['in_range']:
+                if cube_id is not None:
+                    record['cube_id'] = cube_id
+                    self._detections_matched += 1
+                    self._record_first_detection(cube_id, msg.z, dist)
+                elif self._cubes:
+                    self._detections_false += 1
+                    self._note_false_spot(mx, my)
+        self._write('cube_detected', record)
+
+    def _record_first_detection(self, cube_id, range_m, match_dist):
+        if cube_id in self._detected:
+            return
+        elapsed = round(time.monotonic() - self._t0, 3)
+        self._detected[cube_id] = elapsed
+        self._write('cube_first_detected', {
+            'cube_id': cube_id,
+            'range_m': round(range_m, 4),
+            'match_dist_m': round(match_dist, 4),
+            'distance_travelled_m': round(self._distance_m, 4),
+            'state': self._state,
         })
+        self.get_logger().info(
+            f'Cube {cube_id} first detected at t={elapsed:.1f}s '
+            f'({range_m:.2f}m, matched within {match_dist:.2f}m)'
+        )
+
+    def _note_false_spot(self, x, y):
+        for spot in self._false_spots:
+            if math.hypot(x - spot[0], y - spot[1]) < self._match_radius_m:
+                return
+        self._false_spots.append([round(x, 3), round(y, 3)])
+
+    def _map_cb(self, msg: OccupancyGrid):
+        self._latest_map = msg
 
     def _coverage_cb(self, msg: OccupancyGrid):
         """Cache swept/total counts from /swept_coverage_map — see SWEPT_FREE."""
@@ -256,7 +379,7 @@ class MissionMetricsNode(Node):
                 total += 1
             elif value == UNSWEPT_FREE:
                 total += 1
-        self._latest_coverage = (total, swept)
+        self._latest_coverage = (total, swept, msg.info.resolution ** 2)
 
     # ------------------------------------------------------------------ #
     # Timers
@@ -283,13 +406,26 @@ class MissionMetricsNode(Node):
     def _sample_coverage(self):
         if self._latest_coverage is None:
             return
-        total, swept = self._latest_coverage
         self._write('coverage', {
+            **self._coverage_fields(),
+            'distance_m': round(self._distance_m, 4),
+        })
+
+    def _coverage_fields(self):
+        """Coverage against both denominators — see the module docstring."""
+        total, swept, cell_area = self._latest_coverage or (0, 0, 0.0)
+        swept_m2 = swept * cell_area
+        return {
             'total_free': total,
             'swept_free': swept,
             'swept_fraction': round(swept / total, 4) if total else None,
-            'distance_m': round(self._distance_m, 4),
-        })
+            'swept_m2': round(swept_m2, 3),
+            'known_free_m2': round(total * cell_area, 3),
+            'floor_area_m2': self._floor_area_m2,
+            'swept_fraction_of_floor': (
+                round(swept_m2 / self._floor_area_m2, 4) if self._floor_area_m2 else None
+            ),
+        }
 
     # ------------------------------------------------------------------ #
     # Inspection test — the paper's primary metric
@@ -309,7 +445,14 @@ class MissionMetricsNode(Node):
                 continue
             if not is_in_frustum(
                 robot_x, robot_y, robot_yaw, cube_x, cube_y,
-                self._half_fov_rad, self._mark_range_m,
+                self._half_fov_rad, self._mark_range_m, self._min_range_m,
+            ):
+                continue
+            grid = self._latest_map
+            if self._inspection_occlusion and grid is not None and not has_line_of_sight(
+                grid.data, grid.info.width, grid.info.height, grid.info.resolution,
+                grid.info.origin.position.x, grid.info.origin.position.y,
+                robot_x, robot_y, cube_x, cube_y,
             ):
                 continue
             dx, dy = cube_x - robot_x, cube_y - robot_y
@@ -356,17 +499,20 @@ class MissionMetricsNode(Node):
         """Write the run summary and close the file. Safe to call more than once."""
         if self._fh.closed:
             return
-        total, swept = self._latest_coverage or (0, 0)
         self._write('run_end', {
             'delivered': self._delivered,
             'final_state': self._state,
             'distance_m': round(self._distance_m, 4),
-            'total_free': total,
-            'swept_free': swept,
-            'swept_fraction': round(swept / total, 4) if total else None,
+            **self._coverage_fields(),
             'cubes_in_layout': len(self._cubes),
             'cubes_inspected': len(self._inspected),
             'inspection_times_s': self._inspected,
+            'cubes_detected': len(self._detected),
+            'detection_times_s': self._detected,
+            'detections_matched': self._detections_matched,
+            'detections_false': self._detections_false,
+            'detections_unranged': self._detections_unranged,
+            'false_positive_spots': self._false_spots,
         })
         self._fh.close()
 

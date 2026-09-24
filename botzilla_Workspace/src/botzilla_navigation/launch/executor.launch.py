@@ -57,9 +57,24 @@ def generate_launch_description():
     sweep_trigger_mode_arg = DeclareLaunchArgument(
         'sweep_trigger_mode',
         default_value='fraction',
-        description="Coverage sweep policy: 'fraction' (interleaved) or 'exhaustion'.",
+        description="Coverage sweep policy: 'fraction' (old interleaved), 'area' "
+                    "(interleaved, fixed trigger) or 'exhaustion'.",
     )
     sweep_trigger_mode = LaunchConfiguration('sweep_trigger_mode')
+    sweep_new_area_arg = DeclareLaunchArgument(
+        'sweep_new_area_m2',
+        default_value='3.0',
+        description="'area' policy only: sweep once this much un-swept floor (m^2) has "
+                    'been added since the last sweep ended.',
+    )
+    sweep_new_area_m2 = LaunchConfiguration('sweep_new_area_m2')
+    # Research runs: log detections, never chase. See executor_node "Detect-only mode".
+    detect_only_arg = DeclareLaunchArgument(
+        'detect_only',
+        default_value='false',
+        description='true = never chase a detected cube; keep searching.',
+    )
+    detect_only = LaunchConfiguration('detect_only')
 
     # Control arm for the straight-line sweep planner: 'GridBased' makes row legs
     # plan exactly as they did before botzilla_straightline_planner existed, so the
@@ -92,7 +107,10 @@ def generate_launch_description():
         executable='executor_node',
         name='executor_node',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'detect_only': ParameterValue(detect_only, value_type=bool),
+        }],
     )
 
     frontier_explorer = Node(
@@ -103,6 +121,7 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,
             'sweep_trigger_mode': sweep_trigger_mode,
+            'sweep_new_area_m2': ParameterValue(sweep_new_area_m2, value_type=float),
             'sweep_row_planner_id': sweep_row_planner_id,
             'default_planner_id': default_planner_id,
             'coverage_cost': ParameterValue(coverage_cost, value_type=int),
@@ -112,6 +131,8 @@ def generate_launch_description():
     return LaunchDescription([
         use_sim_time_arg,
         sweep_trigger_mode_arg,
+        sweep_new_area_arg,
+        detect_only_arg,
         sweep_row_planner_id_arg,
         default_planner_id_arg,
         coverage_cost_arg,

@@ -20,6 +20,19 @@ vs 0.138 for false positives further out). So a cell only counts as "swept" if i
 within a forward wedge (+/- half the horizontal FOV) AND within that 1m range at some
 point the robot passed it — marking further out would overstate what the detector could
 actually have seen there.
+
+Two further limits, both of which made the old mask overstate coverage (see
+research_discussion.md §1.3):
+
+  * Near-field blind ring. The camera sits 0.19 m up with a ~43 deg vertical FOV, so
+    with a level camera the floor only enters the image ~0.48 m ahead. Floor closer
+    than CAMERA_MIN_RANGE_M is never seen from that pose — the wedge is really an
+    annulus sector, and a spin in place covers a ring, not a disc.
+  * Occlusion. A cell only counts if the straight line from the robot to it crosses no
+    occupied map cell (has_line_of_sight). Floor behind a box or a chair leg inside the
+    1 m cone is not inspected. Star-Searcher and HEATS both require "not occluded".
+    Unknown cells do not block: they are mostly floor the LiDAR has not reached yet,
+    and blocking on them would make the mask lag the map for no benefit.
 """
 
 import math
@@ -41,27 +54,74 @@ CAMERA_HALF_FOV_RAD = 0.497  # ~28.5 deg, half of the Kinect's ~57 deg horizonta
 # executor_node.CUBE_MAX_RANGE_M, which gates which detections the mission actually acts
 # on; that constant's comment carries the reasoning and the regression to watch for.
 CAMERA_MARK_RANGE_M = 1.0
+# Closest floor the camera can see — see module docstring. 0.19 m mount height over
+# tan(21.5 deg), half the Kinect's ~43 deg vertical FOV, assuming zero tilt. Re-derive it
+# once the tilt is measured: a camera pitched down a few degrees pulls this in a lot.
+CAMERA_MIN_RANGE_M = 0.48
+# has_line_of_sight ignores occupied cells this close to the target. The target cell
+# itself (a cube, or a free cell right against a wall) must not occlude itself, and a
+# half-cell of map noise on the far side of a free cell should not hide it either.
+LOS_TARGET_CLEARANCE_M = 0.1
 
 
 def is_in_frustum(
     robot_x, robot_y, robot_yaw, point_x, point_y,
     half_fov_rad=CAMERA_HALF_FOV_RAD, mark_range_m=CAMERA_MARK_RANGE_M,
+    min_range_m=CAMERA_MIN_RANGE_M,
 ):
     """Whether world point (point_x, point_y) is inside the camera's detection cone.
 
-    The single definition of "the camera could have seen this spot": within mark_range_m
-    of the robot AND within +/- half_fov_rad of its heading. mark_swept_cells uses it per
-    grid cell to build the coverage map, and mission_metrics_node uses it per ground-truth
-    cube to timestamp first inspection. Those two must agree exactly — a coverage figure
-    and a per-cube inspection time computed from different geometry would not be
-    comparable — so the test lives here once rather than being written twice.
+    The single definition of "the camera could have seen this spot": between min_range_m
+    and mark_range_m from the robot AND within +/- half_fov_rad of its heading.
+    mark_swept_cells uses it per grid cell to build the coverage map, and
+    mission_metrics_node uses it per ground-truth cube to timestamp first inspection.
+    Those two must agree exactly — a coverage figure and a per-cube inspection time
+    computed from different geometry would not be comparable — so the test lives here
+    once rather than being written twice. Occlusion is a separate test
+    (has_line_of_sight) because it needs the map, which not every caller has.
     """
     dx, dy = point_x - robot_x, point_y - robot_y
-    if math.hypot(dx, dy) > mark_range_m:
+    dist = math.hypot(dx, dy)
+    if dist > mark_range_m or dist < min_range_m:
         return False
     relative_angle = math.atan2(dy, dx) - robot_yaw
     relative_angle = math.atan2(math.sin(relative_angle), math.cos(relative_angle))
     return abs(relative_angle) <= half_fov_rad
+
+
+def has_line_of_sight(
+    data, width, height, resolution, origin_x, origin_y, x0, y0, x1, y1,
+    target_clearance_m=LOS_TARGET_CLEARANCE_M,
+):
+    """Whether the segment (x0, y0) -> (x1, y1) crosses no occupied cell of the map.
+
+    Samples the segment every half cell, skipping the start cell (the robot) and the
+    last target_clearance_m before the target (see LOS_TARGET_CLEARANCE_M). Occupied
+    means value >= OCCUPIED_THRESHOLD, the same cut every other module uses; unknown
+    (-1) does not block — see the module docstring. Samples outside the grid do not
+    block either: there is nothing known there to block with.
+    """
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length <= 0.0:
+        return True
+    start_row, start_col = world_to_grid(x0, y0, resolution, origin_x, origin_y)
+    step = resolution * 0.5
+    samples = int(math.ceil(length / step))
+    stop = length - target_clearance_m
+    for k in range(1, samples + 1):
+        travelled = min(k * step, length)
+        if travelled > stop:
+            break
+        t = travelled / length
+        row, col = world_to_grid(x0 + dx * t, y0 + dy * t, resolution, origin_x, origin_y)
+        if (row, col) == (start_row, start_col):
+            continue
+        if not (0 <= row < height and 0 <= col < width):
+            continue
+        if data[row * width + col] >= OCCUPIED_THRESHOLD:
+            return False
+    return True
 
 
 def create_swept_mask(width, height):
@@ -72,16 +132,22 @@ def create_swept_mask(width, height):
 def mark_swept_cells(
     mask, width, height, resolution, origin_x, origin_y, robot_x, robot_y, robot_yaw,
     half_fov_rad=CAMERA_HALF_FOV_RAD, mark_range_m=CAMERA_MARK_RANGE_M,
+    min_range_m=CAMERA_MIN_RANGE_M, occupancy=None,
 ):
     """Mark cells within the camera's forward wedge of the robot's current pose as swept.
 
     Scans a mark_range_m bounding box of grid cells around the robot (in cells, not world
     units, so the scan cost is independent of map size) and marks each cell True iff it is
-    within mark_range_m of the robot AND within +/- half_fov_rad of the robot's heading.
+    inside is_in_frustum's annulus sector AND, when occupancy (the map's flat data, same
+    dimensions as mask) is given, visible along an unobstructed line (has_line_of_sight).
     Mutates mask in place. Returns the count of cells newly marked this call (for logging).
 
-    half_fov_rad/mark_range_m default to the module constants so direct callers and the
-    unit tests need not pass them; frontier_explorer_node passes its ROS parameters.
+    The line-of-sight test runs only on cells that pass the cheap geometric test and are
+    not already marked, so it costs a few thousand samples per call at 5 cm cells.
+
+    The camera parameters default to the module constants so direct callers and the unit
+    tests need not pass them; frontier_explorer_node passes its ROS parameters.
+    occupancy=None skips the occlusion test (the previous behaviour).
     """
     range_cells = max(1, math.ceil(mark_range_m / resolution))
     center_row, center_col = world_to_grid(robot_x, robot_y, resolution, origin_x, origin_y)
@@ -101,7 +167,13 @@ def mark_swept_cells(
                 continue
             cell_x, cell_y = grid_to_world(row, col, resolution, origin_x, origin_y)
             if not is_in_frustum(
-                robot_x, robot_y, robot_yaw, cell_x, cell_y, half_fov_rad, mark_range_m
+                robot_x, robot_y, robot_yaw, cell_x, cell_y,
+                half_fov_rad, mark_range_m, min_range_m,
+            ):
+                continue
+            if occupancy is not None and not has_line_of_sight(
+                occupancy, width, height, resolution, origin_x, origin_y,
+                robot_x, robot_y, cell_x, cell_y,
             ):
                 continue
             mask[i] = True

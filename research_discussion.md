@@ -566,8 +566,22 @@ locked until R is done. That makes "never leave a room half-searched" a precise 
 floor; inspection plans only what is still unseen:
 
 - **large open patches → rows** (continuous looking while driving, no stops);
-- **small scattered patches → viewpoints** (a pose plus heading chosen so one look covers the
-  most unseen floor). Suggested threshold: patches under ~2 m² (about four looks).
+- **everything else → viewpoints with a turn range** (suggested threshold: patches under ~2 m²,
+  about four looks).
+
+**Spins are viewpoints with a turn range.** A viewpoint is a *position plus the arc of headings to
+look through there*, and the planner chooses both:
+
+| Turn range | What the robot does | When it wins |
+|---|---|---|
+| ~0° (one heading) | Arrives pointed at the patch; one look | Small isolated patch in one direction |
+| Partial (e.g. 120°) | Stops and turns only through the unseen directions (the swept mask says which) | Unseen floor spread around one spot: beside furniture, corners |
+| Up to 360° | Full spin | Unseen floor all around, dense clutter |
+
+Each candidate is scored as unseen floor it would reveal (within the 0.48–1.0 m ring, over the
+chosen arc) against driving time plus turning time at 0.4 rad/s. "One look or partial spin" then
+falls out of the same score, with no separate rule. This is the "look only where needed" torch
+idea from §7.3, built into the planner.
 
 **Details that keep it robust:**
 
@@ -605,7 +619,7 @@ obvious. And with regions removed, the method is exactly B, so its ablation is c
 |---|---|---|
 | **Order of regions** | Region by region, finish before leaving | **Same (borrowed)** |
 | **Inside a region** | **Blended:** exploration and inspection viewpoints compete in one score (0.2/0.8) | **Sequenced:** explore the region, then inspect what's left |
-| **Inspection method** | Viewpoints only | **Per leftover patch:** rows for large open areas, viewpoints for small scattered ones |
+| **Inspection method** | Viewpoints only (the arm aims the camera) | **Per leftover patch:** rows for large open areas; viewpoints with a turn range (one look up to a partial or full spin) for the rest |
 | **When a region is done** | Implicitly, when no viewpoint scores above a threshold | Explicitly, when the swept mask shows ~90% of the region's floor covered |
 | **Camera** | Arm-mounted, aimed freely, 3–4 m range | Fixed, ~1 m, the robot must turn to look |
 
@@ -625,14 +639,15 @@ before investing in the full build. The ablations below give that early warning.
 
 | Variant | Regions | Inside a region | Inspection | Role |
 |---|---|---|---|---|
-| **Proposed** | ✓ | Sequenced | Rows + viewpoints by patch | The method |
+| **Proposed** | ✓ | Sequenced | Rows + viewpoints (with turn range) by patch | The method |
 | **D: HEATS-style** | ✓ | Blended | Viewpoints | State-of-the-art baseline |
 | **B: explore-then-sweep** | ✗ | Sequenced (whole map) | Rows | Classic baseline; also "no regions" ablation |
 | **C: interleaved** | ✗ | Switching (fixed trigger) | Rows | The earlier method, as a baseline |
 | **E: camera-range exploration** | ✗ | Greedy | Viewpoints (nearest seen/unseen boundary) | Star-Searcher's FUEL-3m-style control |
 | **Ablation 1** | ✓ | **Sequenced** | Viewpoints | Sequencing vs blending (vs D) |
 | **Ablation 2** | ✓ | Sequenced | **Rows only** | Whether viewpoints help (vs Proposed) |
-| *Optional: small tiles* | 1–2 m tiles | Sequenced | Rows + viewpoints | Whether rooms beat small units |
+| **Ablation 3** | ✓ | Sequenced | Rows + **one-look viewpoints (no turning)** | Whether spinning is worth its turning time |
+| *Optional: spin grid (small tiles)* | ~1 m tiles | Sequenced | Full spins at grid points | Whether rooms beat small units |
 
 Arm A (frontier-only) still comes free from B's runs.
 
@@ -640,12 +655,12 @@ Arm A (frontier-only) still comes free from B's runs.
 
 - **Essential:** Proposed, D, B × 5 runs = 15 runs.
 - **Recommended:** C and E × 5 = 10 runs.
-- **Ablations:** 1 and 2 × 3 runs = 6 runs; small tiles × 3 = 3 more if affordable.
-- **Total:** 25–34 runs, about 13–17 hours of lab time before failures. Same block protocol as
+- **Ablations:** 1, 2 and 3 × 3 runs = 9 runs; spin grid × 3 = 3 more if affordable.
+- **Total:** 28–37 runs, about 14–19 hours of lab time before failures. Same block protocol as
   §6.6 (shuffled order per block, battery check, paired layouts, frozen commit).
 
-The §7.5 primitive pilot is now mostly answered by Ablation 2 (rows only) and Ablation 1
-(viewpoints only) inside the full design. It remains useful as a cheap early warning (~6 h) if
+The §7.5 primitive pilot is now mostly answered inside the full design: Ablation 2 (rows only),
+Ablation 3 (no spinning) and the optional spin grid. It remains useful as a cheap early warning (~6 h) if
 run before the full build.
 
 ### 8.6 Paper framing
@@ -656,7 +671,8 @@ run before the full build.
 > for floor targets?*
 
 **Proposed answer:** region by region, exploring each region before inspecting it, with the
-inspection method chosen per unseen patch.
+inspection method chosen per unseen patch (rows, or viewpoints that take one look or spin
+through only the unseen directions).
 
 **Extended abstract vs full paper.** Two pages fit one question. The abstract can carry this
 single question with a compact result if the essential runs are done in time; otherwise it
@@ -677,11 +693,31 @@ comparison with the HEATS-style baseline as its centrepiece. Decide once the dea
      X m²");
    - detect-only mode and detection-to-cube matching;
    - fixed coverage denominator.
+   **Status (2026-09-24): all five built; unit tests plus a ROS smoke test pass; not yet run
+   on hardware.**
+   - Row abandonment: `SWEEP_ROW_MAX_FAILURES = 2`. Only attempted failures count; cheap skips
+     don't. The row is kept out of new sweeps for 300 s. On run 22 this would have skipped the
+     third ~70 s stall on y = −2.55.
+   - Swept mask: `CAMERA_MIN_RANGE_M = 0.48` in `is_in_frustum`, so the coverage map and the
+     cube-inspected metric share it. `has_line_of_sight` checks occupied `/map` cells; unknown
+     cells don't block. The explorer switch is `coverage_occlusion`, the metrics switch is
+     `inspection_occlusion`. Marking takes ~7 ms per tick.
+   - Trigger: `sweep_trigger_mode: area` (`--policy area`). It sweeps once un-swept floor
+     exceeds the count left when the last sweep ended by `sweep_new_area_m2` (3.0). The first
+     sweep still starts almost at once, because everything is new at the start. `fraction`
+     is unchanged, so old runs stay reproducible.
+   - Detect-only: executor `detect_only` (`--detect-only`) never chases. `mission_metrics_node`
+     places each ranged detection (≤ 1 m) on the map with `cube_detections.project_detection`
+     and matches it to the nearest layout cube within 0.5 m. It records
+     `cube_first_detected`; `run_end` has detection times, false-positive counts and distinct
+     false-positive spots.
+   - Denominator: `floor_area_m2` in the layout, or `--floor-area`. Coverage records now carry
+     `swept_m2` and `swept_fraction_of_floor`.
 2. **Decide the test arena:** several rooms or partitions (§8.3 condition).
 3. **Build the proposed method:** region segmentation with frozen boundaries (and the open-space
    fallback), inside vs exit frontier classification, region "done" tracking, and the per-patch
-   choice between rows and a viewpoint planner. Optionally run the rows vs viewpoints early
-   warning first (§8.5).
+   choice between rows and a viewpoint planner whose viewpoints carry a turn range (one look up
+   to a partial or full spin). Optionally run the rows vs viewpoints early warning first (§8.5).
 4. **Build arm E, then arm D** (D shares the region code and the viewpoint planner).
 5. **Hardware fixes (required before any counted run):** Kinect tilt and IR intrinsics, then
    check whether stalls drop. Stalls hit short frequent trips hardest, which arm D makes most, so

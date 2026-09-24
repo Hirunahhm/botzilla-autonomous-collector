@@ -42,6 +42,12 @@
 # it is the key in `inspection_times_s`, so stable ids let one cube be tracked
 # across layouts.
 
+# floor_area_m2: the arena's measured floor area (tape-measure it once per arena,
+# minus furniture footprints). It is the fixed coverage denominator: without it
+# coverage is only reported as a share of the floor the robot happened to map, which
+# rewards mapping less. Delete the line if the arena has not been measured yet.
+floor_area_m2: 20.0
+#Arena is not taped measured
 cubes:
   - {id: 1, x: 2.0, y: 0.5}
   - {id: 2, x: -1.0, y: 1.5}

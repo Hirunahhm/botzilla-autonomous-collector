@@ -48,6 +48,16 @@ velocity_smoother's mute switch (/velocity_smoother_enabled, latched) on every
 transition — enabled only for EXPLORING/DELIVERING, disabled everywhere this node
 drives — so the ownership claim above is actually enforced, not just documented.
 
+Detect-only mode
+----------------
+With the detect_only parameter set, a detection never interrupts EXPLORING: the robot
+keeps searching and the base is never taken from frontier_explorer_node. This is the
+mode every counted research run uses (research_discussion.md §6.2, §6.7). The comparison
+is between search strategies, and a chase costs a strategy time for reasons that have
+nothing to do with how it searches (YOLO gaps, TARGETING aborts). Detections are still
+published by yolo_node as usual; mission_metrics_node projects each one into the map and
+matches it against the layout, so nothing extra has to come from this node.
+
 Usage
 -----
     ros2 launch botzilla_navigation executor.launch.py
@@ -58,7 +68,7 @@ nav2.launch.py and a source of /detected_cube (yolo_node) already running.
 import math
 
 from action_msgs.msg import GoalStatus
-from botzilla_navigation.swept_mask import CAMERA_HALF_FOV_RAD
+from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point, PointStamped, Twist
 from nav2_msgs.action import NavigateToPose
 import rclpy
@@ -124,13 +134,6 @@ CAPTURE_GRACE_S = 2.0
 EXTRA_PUSH_S = 0.1
 # Consecutive z == 0.0 readings before believing the blind-spot signal.
 BLIND_SPOT_FRAMES = 2
-# yolo_node's /detected_cube.x is the cube centre's offset from the image centre,
-# normalised to +/-1 at the image edges (positive = right). Under a pinhole model the
-# edge of the image is the edge of the horizontal FOV, so a cube at depth z sits
-# -x * tan(half_fov) * z to the robot's left. Only used to estimate where a LOST cube
-# is for /cube_abandoned; the camera's few-cm offset from base_link is ignored, which
-# is well inside frontier_explorer_node's CUBE_REVISIT_RADIUS_M.
-CAMERA_HALF_FOV_TAN = math.tan(CAMERA_HALF_FOV_RAD)
 
 # ── Detach ───────────────────────────────────────────────────────────────────
 DETACH_SPEED = -0.10        # m/s, reverse
@@ -205,13 +208,18 @@ class ExecutorNode(Node):
         self.declare_parameter(
             'home_cube_suppress_radius_m', HOME_CUBE_SUPPRESS_RADIUS_M
         )
+        # See "Detect-only mode" in the module docstring. Off by default, so a bare
+        # launch still collects cubes.
+        self.declare_parameter('detect_only', False)
+        self._detect_only = bool(self.get_parameter('detect_only').value)
         self._cube_max_range_m = self.get_parameter('cube_max_range_m').value
         self._home_cube_suppress_radius_m = self.get_parameter(
             'home_cube_suppress_radius_m'
         ).value
         self.get_logger().info(
             f'Cube gating: max_range={self._cube_max_range_m}m '
-            f'home_suppress_radius={self._home_cube_suppress_radius_m}m'
+            f'home_suppress_radius={self._home_cube_suppress_radius_m}m '
+            f'detect_only={self._detect_only}'
         )
 
         self._state = State.STARTUP
@@ -305,6 +313,15 @@ class ExecutorNode(Node):
         if msg.z == 0.0 and self._state == State.EXPLORING:
             return
         if msg.z > self._cube_max_range_m:
+            return
+        if self._detect_only:
+            # Never chase. The detection is recorded by mission_metrics_node straight
+            # off /detected_cube; exploration carries on untouched.
+            self.get_logger().info(
+                f'Cube detected (x={msg.x:+.2f}, z={msg.z:.2f}m) — detect-only mode, '
+                f'not chasing.',
+                throttle_duration_sec=2.0,
+            )
             return
 
         self._target_cube = msg
@@ -609,17 +626,12 @@ class ExecutorNode(Node):
         return (dx * dx + dy * dy) < self._home_cube_suppress_radius_m ** 2
 
     def _update_cube_world_estimate(self, msg: Point):
-        """Project a ranged detection into the map frame — see CAMERA_HALF_FOV_TAN."""
+        """Project a ranged detection into the map frame — see cube_detections."""
         pose = self._get_robot_pose()
         if pose is None:
             return
         x, y, yaw = pose
-        forward = msg.z
-        left = -msg.x * CAMERA_HALF_FOV_TAN * msg.z
-        self._cube_world_estimate = (
-            x + forward * math.cos(yaw) - left * math.sin(yaw),
-            y + forward * math.sin(yaw) + left * math.cos(yaw),
-        )
+        self._cube_world_estimate = project_detection(x, y, yaw, msg.x, msg.z)
 
     def _publish_cube_abandoned(self):
         """Tell frontier_explorer_node where a cube we failed to collect still is."""

@@ -19,10 +19,18 @@
 #   ./run_full_mission.sh --yes        # clear leftover processes without asking
 #
 # Research options (all default OFF — a bare run is unchanged):
-#   --policy exhaustion|fraction   exploration/coverage policy arm for this run.
-#                                  'fraction' (default) is the shipped interleaved
-#                                  behaviour; 'exhaustion' is the explore-then-sweep
-#                                  baseline the go/no-go gate is measured under.
+#   --policy exhaustion|fraction|area
+#                                  exploration/coverage policy arm for this run.
+#                                  'fraction' (default) is the old interleaved
+#                                  behaviour, whose trigger never switched off;
+#                                  'area' is interleaved with the fixed trigger (arm
+#                                  C); 'exhaustion' is explore-then-sweep (arm B).
+#   --sweep-area M2                'area' policy only: sweep once this much un-swept
+#                                  floor has been added since the last sweep (3.0).
+#   --detect-only                  never chase a detected cube; keep searching. Every
+#                                  counted research run uses this.
+#   --floor-area M2                measured arena floor area, the fixed coverage
+#                                  denominator (overrides floor_area_m2 in --layout).
 #   --row-planner SweepStraight|GridBased
 #                                  planner used for coverage-sweep ROW legs.
 #                                  'SweepStraight' (default) drives the lawnmower
@@ -94,6 +102,9 @@ PLANNER=""         # empty => launch default (GridBased)
 COVERAGE_COST=""   # empty => launch default (0, off)
 COLLISION_MONITOR=0
 LAYOUT=""
+SWEEP_AREA=""      # empty => launch default (3.0)
+DETECT_ONLY=0
+FLOOR_AREA=""      # empty => take floor_area_m2 from the layout, if any
 
 # Printed by --help: the contiguous comment block at the top of this file. Derived
 # rather than a hardcoded line range, which silently goes stale whenever the header
@@ -117,6 +128,11 @@ while [ $# -gt 0 ]; do
         --coverage-cost) COVERAGE_COST="${2:-}"; shift ;;
         --coverage-cost=*) COVERAGE_COST="${1#*=}" ;;
         --collision-monitor) COLLISION_MONITOR=1 ;;
+        --sweep-area)  SWEEP_AREA="${2:-}"; shift ;;
+        --sweep-area=*) SWEEP_AREA="${1#*=}" ;;
+        --detect-only) DETECT_ONLY=1 ;;
+        --floor-area)  FLOOR_AREA="${2:-}"; shift ;;
+        --floor-area=*) FLOOR_AREA="${1#*=}" ;;
         --layout)      LAYOUT="${2:-}"; shift ;;
         --layout=*)    LAYOUT="${1#*=}" ;;
         -h|--help)     usage; exit 0 ;;
@@ -129,9 +145,25 @@ done
 # otherwise be accepted silently by rclpy and fall through to the default arm, and a
 # whole run would be recorded under the wrong label — the worst possible failure for
 # a campaign, because nothing about the resulting data looks wrong.
-if [ -n "$POLICY" ] && [ "$POLICY" != "exhaustion" ] && [ "$POLICY" != "fraction" ]; then
-    echo "ERROR: --policy must be 'exhaustion' or 'fraction' (got: '$POLICY')" >&2; exit 2
+if [ -n "$POLICY" ] && [ "$POLICY" != "exhaustion" ] && [ "$POLICY" != "fraction" ] \
+   && [ "$POLICY" != "area" ]; then
+    echo "ERROR: --policy must be 'exhaustion', 'fraction' or 'area' (got: '$POLICY')" >&2
+    exit 2
 fi
+# Positive decimals only: rclpy would reject a non-number at launch, but only after
+# the whole stack is up.
+for pair in "sweep-area:$SWEEP_AREA" "floor-area:$FLOOR_AREA"; do
+    val="${pair#*:}"
+    if [ -n "$val" ] && ! [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: --${pair%%:*} must be a positive number in m^2 (got: '$val')" >&2
+        exit 2
+    fi
+done
+if [ -n "$SWEEP_AREA" ] && [ "$POLICY" != "area" ]; then
+    echo "WARNING: --sweep-area only affects --policy area; it is ignored here." >&2
+fi
+# A fixed denominator is only recorded by the metrics node.
+[ -n "$FLOOR_AREA" ] && RUN_METRICS=1
 # Same reasoning: a typo'd planner id is accepted by rclpy, then rejected by Nav2 on
 # every single goal (InvalidPlanner), which looks like a dead robot rather than a
 # bad flag. Fail here instead.
@@ -386,6 +418,9 @@ fi
     echo "  \"planner\": \"${PLANNER:-GridBased (launch default)}\","
     echo "  \"row_planner\": \"${ROW_PLANNER:-SweepStraight (launch default)}\","
     echo "  \"coverage_cost\": ${COVERAGE_COST:-0},"
+    echo "  \"sweep_new_area_m2\": ${SWEEP_AREA:-3.0},"
+    echo "  \"detect_only\": $([ "$DETECT_ONLY" = 1 ] && echo true || echo false),"
+    echo "  \"floor_area_m2\": ${FLOOR_AREA:-null},"
     echo "  \"mission\": $([ "$RUN_MISSION" = 1 ] && echo true || echo false),"
     echo "  \"git_commit\": \"$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)\","
     echo "  \"git_dirty\": $(git -C "$REPO_ROOT" diff --quiet 2>/dev/null && echo false || echo true),"
@@ -396,6 +431,7 @@ fi
 if [ -n "$POLICY" ] || [ "$RUN_METRICS" = 1 ]; then
     step "research run"
     ok "policy   : ${POLICY:-fraction (launch default)}"
+    ok "detect   : $([ "$DETECT_ONLY" = 1 ] && echo 'detect-only (no chasing)' || echo 'chase + collect')"
     if [ "$RUN_METRICS" = 1 ]; then
         ok "metrics  : $LOG_DIR/metrics.jsonl"
         if [ -n "$LAYOUT" ]; then
@@ -476,6 +512,7 @@ if [ "$RUN_METRICS" = 1 ]; then
     next_step "mission metrics recorder"
     METRICS_ARGS=(--ros-args -p use_sim_time:=false -p "output_path:=$LOG_DIR/metrics.jsonl")
     [ -n "$LAYOUT" ] && METRICS_ARGS+=(-p "cube_layout:=$LAYOUT")
+    [ -n "$FLOOR_AREA" ] && METRICS_ARGS+=(-p "arena_floor_m2:=$FLOOR_AREA")
     start_bg "$LOG_DIR/metrics.log" \
         ros2 run botzilla_navigation mission_metrics_node "${METRICS_ARGS[@]}"
     wait_for_log "$LOG_DIR/metrics.log" "Metrics -> " 30 "metrics recorder writing"
@@ -498,6 +535,8 @@ if [ "$RUN_MISSION" = 1 ]; then
     [ -n "$ROW_PLANNER" ] && EXEC_ARGS+=("sweep_row_planner_id:=$ROW_PLANNER")
     [ -n "$PLANNER" ] && EXEC_ARGS+=("default_planner_id:=$PLANNER")
     [ -n "$COVERAGE_COST" ] && EXEC_ARGS+=("coverage_cost:=$COVERAGE_COST")
+    [ -n "$SWEEP_AREA" ] && EXEC_ARGS+=("sweep_new_area_m2:=$SWEEP_AREA")
+    [ "$DETECT_ONLY" = 1 ] && EXEC_ARGS+=("detect_only:=true")
     start_bg "$LOG_DIR/executor.log" \
         ros2 launch botzilla_navigation executor.launch.py "${EXEC_ARGS[@]}"
     wait_for_log "$LOG_DIR/executor.log" "HOME latched" 90 "HOME latched — mission running"

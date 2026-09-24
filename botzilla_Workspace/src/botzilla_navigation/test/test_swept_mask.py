@@ -14,8 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from botzilla_navigation.swept_mask import (  # noqa: E402,I100
     build_coverage_cost_data,
     build_coverage_grid_data,
+    CAMERA_MIN_RANGE_M,
     count_unswept_free,
     create_swept_mask,
+    has_line_of_sight,
     mark_swept_cells,
     mark_world_point_swept,
     resize_swept_mask,
@@ -210,3 +212,63 @@ def test_unmark_discs_no_centers_returns_equal_copy():
     mask = [True, False, True]
     out = unmark_discs(mask, 3, 1, 1.0, 0.0, 0.0, [], 0.5)
     assert out == mask and out is not mask
+
+
+# ── Blind ring and occlusion ────────────────────────────────────────────────
+
+
+def _open_grid(width, height):
+    return [0] * (width * height)
+
+
+def test_mark_swept_cells_skips_the_near_field_blind_ring():
+    """Floor closer than CAMERA_MIN_RANGE_M is below the image and must stay un-swept."""
+    width = height = 41
+    resolution = 0.05
+    mask = create_swept_mask(width, height)
+    # Robot at the centre of cell (20, 20), facing +x.
+    robot = (20.5 * resolution, 20.5 * resolution)
+    mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, robot[0], robot[1], 0.0)
+    assert mask[20 * width + 25] is False   # 0.25 m ahead: inside the blind ring
+    assert mask[20 * width + 34] is True    # 0.70 m ahead: seen
+    assert CAMERA_MIN_RANGE_M == 0.48
+
+
+def test_line_of_sight_blocked_by_occupied_cell():
+    width = height = 21
+    resolution = 0.1
+    grid = _open_grid(width, height)
+    grid[10 * width + 15] = 100  # a wall cell 0.5 m ahead of the robot
+    assert not has_line_of_sight(grid, width, height, resolution, 0.0, 0.0,
+                                 1.05, 1.05, 1.85, 1.05)
+    # A parallel line one row up misses it.
+    assert has_line_of_sight(grid, width, height, resolution, 0.0, 0.0,
+                             1.05, 1.25, 1.85, 1.25)
+
+
+def test_line_of_sight_ignores_unknown_and_the_target_cell():
+    width = height = 21
+    resolution = 0.1
+    grid = _open_grid(width, height)
+    grid[10 * width + 14] = -1   # unknown on the way: does not block
+    grid[10 * width + 18] = 100  # the target cell itself is occupied (a cube, a wall)
+    assert has_line_of_sight(grid, width, height, resolution, 0.0, 0.0,
+                             1.05, 1.05, 1.85, 1.05)
+
+
+def test_mark_swept_cells_with_occupancy_leaves_the_shadow_unswept():
+    width = height = 41
+    resolution = 0.05
+    grid = _open_grid(width, height)
+    grid[20 * width + 32] = 100  # obstacle 0.6 m dead ahead
+    mask_open = create_swept_mask(width, height)
+    mask_occ = create_swept_mask(width, height)
+    args = (width, height, resolution, 0.0, 0.0, 20.5 * resolution, 20.5 * resolution, 0.0)
+    mark_swept_cells(mask_open, *args)
+    mark_swept_cells(mask_occ, *args, occupancy=grid)
+    behind = 20 * width + 37     # 0.85 m ahead, straight behind the obstacle
+    assert mask_open[behind] is True
+    assert mask_occ[behind] is False
+    assert sum(mask_occ) < sum(mask_open)
+    # Occlusion only ever removes cells.
+    assert all(o or not c for o, c in zip(mask_open, mask_occ))
