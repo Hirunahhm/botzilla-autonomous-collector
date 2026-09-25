@@ -80,15 +80,15 @@ def generate_launch_description():
     search_strategy_arg = DeclareLaunchArgument(
         'search_strategy',
         default_value='sweep',
-        description="'sweep' (B/C), 'region' (proposed), 'heats' (D), "
-                    "'camera_greedy' (E).",
+        description="'sweep' (B/C), 'region' (proposed), 'interleaved' (C's timing "
+                    "with viewpoint inspection), 'heats' (D), 'camera_greedy' (E).",
     )
     search_strategy = LaunchConfiguration('search_strategy')
     inspection_mode_arg = DeclareLaunchArgument(
         'inspection_mode',
         default_value='mixed',
-        description="'region' only: 'mixed', 'viewpoints', 'rows', 'one_look', "
-                    "'spin_grid'.",
+        description="'region' and 'interleaved': 'mixed', 'viewpoints', 'rows', "
+                    "'one_look', 'spin_grid'.",
     )
     inspection_mode = LaunchConfiguration('inspection_mode')
 

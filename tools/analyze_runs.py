@@ -71,8 +71,8 @@ def load_run(path):
 
 def arm_label(config):
     strategy = config.get('strategy') or 'sweep'
-    if strategy == 'region':
-        return f"region/{config.get('inspection') or 'mixed'}"
+    if strategy in ('region', 'interleaved'):
+        return f"{strategy}/{config.get('inspection') or 'mixed'}"
     if strategy == 'sweep':
         policy = (config.get('policy') or 'fraction').split()[0]
         return f'sweep/{policy}'

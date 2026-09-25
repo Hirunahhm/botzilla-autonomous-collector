@@ -133,3 +133,26 @@ def test_heats_explore_gain_ignores_unknown_far_from_live_frontiers():
     for _ in range(2):
         s.report(Action('look', viewpoint=vp), True, 0.0)
     assert not s._explore_targets(sn).any()
+
+
+def test_interleaved_explores_until_the_trigger_then_inspects_with_viewpoints():
+    a, wall_col = two_rooms()
+    a[:, wall_col + 1:] = -1
+    door = [(r, wall_col) for r in range(a.shape[0]) if a[r, wall_col] == 0]
+    frontier = {'x': wall_col * RES, 'y': 1.5, 'cells': door, 'blacklisted': False}
+    s = make_strategy('interleaved', inspection_mode='viewpoints', trigger_m2=100.0)
+    # Unseen floor (~9 m^2) is under the 100 m^2 trigger: keep exploring.
+    assert s.next_action(snap(a, frontiers=[frontier])).kind == 'frontier'
+    s = make_strategy('interleaved', inspection_mode='viewpoints', trigger_m2=3.0)
+    act = s.next_action(snap(a, frontiers=[frontier]))
+    assert act.kind == 'look'   # a bout, with viewpoints, not rows
+    # Bout floor all seen: back to exploring, and the new baseline means no new bout.
+    seen = room_mask(a, wall_col)
+    assert s.next_action(snap(a, seen, frontiers=[frontier])).kind == 'frontier'
+
+
+def test_interleaved_finishes_when_no_frontiers_and_nothing_to_inspect():
+    a, wall_col = two_rooms()
+    s = make_strategy('interleaved', inspection_mode='viewpoints')
+    everything = np.ones(a.shape, dtype=bool)
+    assert s.next_action(snap(a, everything)).kind == 'done'

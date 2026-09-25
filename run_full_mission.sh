@@ -27,15 +27,18 @@
 #                                  C); 'exhaustion' is explore-then-sweep (arm B).
 #   --sweep-area M2                'area' policy only: sweep once this much un-swept
 #                                  floor has been added since the last sweep (3.0).
-#   --strategy sweep|region|heats|camera_greedy
+#   --strategy sweep|region|interleaved|heats|camera_greedy
 #                                  which arm decides where to go. 'sweep' (default)
 #                                  is frontier exploration + sweeps (--policy picks B
-#                                  or C); 'region' is the proposed method; 'heats' is
-#                                  arm D; 'camera_greedy' is arm E.
+#                                  or C); 'region' is the proposed method;
+#                                  'interleaved' is C's trigger with --inspection's
+#                                  primitives instead of rows; 'heats' is arm D;
+#                                  'camera_greedy' is arm E.
 #   --inspection mixed|viewpoints|rows|one_look|spin_grid
-#                                  'region' only: the inspection primitive. 'mixed'
-#                                  (default) is the proposed method; the others are
-#                                  ablations 1-3 and the optional spin grid.
+#                                  'region'/'interleaved': the inspection primitive.
+#                                  'mixed' (default) is the proposed method; the
+#                                  others are ablations 1-3 and the optional spin
+#                                  grid. 'interleaved' uses --sweep-area as trigger.
 #   --detect-only                  never chase a detected cube; keep searching. Every
 #                                  counted research run uses this.
 #   --floor-area M2                measured arena floor area, the fixed coverage
@@ -166,8 +169,8 @@ if [ -n "$POLICY" ] && [ "$POLICY" != "exhaustion" ] && [ "$POLICY" != "fraction
     exit 2
 fi
 case "${STRATEGY:-sweep}" in
-    sweep|region|heats|camera_greedy) ;;
-    *) echo "ERROR: --strategy must be sweep, region, heats or camera_greedy (got: '$STRATEGY')" >&2
+    sweep|region|interleaved|heats|camera_greedy) ;;
+    *) echo "ERROR: --strategy must be sweep, region, interleaved, heats or camera_greedy (got: '$STRATEGY')" >&2
        exit 2 ;;
 esac
 case "${INSPECTION:-mixed}" in
@@ -176,8 +179,8 @@ case "${INSPECTION:-mixed}" in
             "(got: '$INSPECTION')" >&2
        exit 2 ;;
 esac
-if [ -n "$INSPECTION" ] && [ "$STRATEGY" != "region" ]; then
-    echo "WARNING: --inspection only affects --strategy region; it is ignored here." >&2
+if [ -n "$INSPECTION" ] && [ "$STRATEGY" != "region" ] && [ "$STRATEGY" != "interleaved" ]; then
+    echo "WARNING: --inspection only affects --strategy region/interleaved; ignored here." >&2
 fi
 if [ -n "$POLICY" ] && [ -n "$STRATEGY" ] && [ "$STRATEGY" != "sweep" ]; then
     echo "WARNING: --policy only affects --strategy sweep; it is ignored here." >&2
@@ -191,7 +194,7 @@ for pair in "sweep-area:$SWEEP_AREA" "floor-area:$FLOOR_AREA"; do
         exit 2
     fi
 done
-if [ -n "$SWEEP_AREA" ] && [ "$POLICY" != "area" ]; then
+if [ -n "$SWEEP_AREA" ] && [ "$POLICY" != "area" ] && [ "$STRATEGY" != "interleaved" ]; then
     echo "WARNING: --sweep-area only affects --policy area; it is ignored here." >&2
 fi
 # A fixed denominator is only recorded by the metrics node.

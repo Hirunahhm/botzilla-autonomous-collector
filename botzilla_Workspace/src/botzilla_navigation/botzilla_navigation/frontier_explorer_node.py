@@ -691,7 +691,7 @@ SWEEP_RETRIGGER_COOLDOWN_S = 20.0
 SWEEP_TRIGGER_MODES = ('fraction', 'exhaustion', 'area')
 
 # Accepted values of the search_strategy parameter — see module docstring.
-SEARCH_STRATEGIES = ('sweep', 'region', 'heats', 'camera_greedy')
+SEARCH_STRATEGIES = ('sweep', 'region', 'interleaved', 'heats', 'camera_greedy')
 
 # Swept-mask marking period — see module docstring ("While looking ...").
 SWEPT_MARK_PERIOD_S = 0.5
@@ -952,6 +952,7 @@ class FrontierExplorerNode(Node):
                 min_range_m=self._camera_min_range_m,
                 max_range_m=self._camera_mark_range_m,
                 row_spacing_m=self._sweep_row_spacing_m,
+                trigger_m2=self._sweep_new_area_m2,
             )
         self._strategy_action = None     # the Action being executed, for report()
         self._strategy_given_up = False  # stop waiting on blacklisted frontiers

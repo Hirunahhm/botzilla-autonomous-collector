@@ -38,6 +38,16 @@ Strategies:
     are ordered by an open TSP tour and the first is executed. A region is done when no
     viewpoint in it has any gain left. Called "HEATS-style", never "HEATS".
 
+  InterleavedSearch — arm C's timing with the proposed method's inspection: frontier
+    exploration of the whole map, interrupted by an inspection BOUT whenever the unseen
+    known floor has grown by trigger_m2 since the last bout ended (the 'area' trigger of
+    frontier_explorer_node). A bout inspects all the floor known when it started, with
+    the same inspection_mode primitives as RegionSearch (so `viewpoints` gives
+    viewpoints with a turn range, spins included), until ~90% of it is seen or nothing
+    is left worth a stop; then exploration resumes. No regions. Compared with
+    RegionSearch under the same inspection_mode it isolates what region-by-region
+    ordering contributes; compared with arm C (rows) it isolates the primitive.
+
   CameraGreedySearch — arm E, Star-Searcher's FUEL-3m control: plain greedy
     exploration where "explored" means camera-seen. Viewpoints anywhere on the map,
     scored by camera-unseen cells (unknown or un-inspected floor) per second; LiDAR
@@ -76,9 +86,13 @@ REGION_DONE_FRACTION = 0.9
 # Unseen patches at least this large (and a row pass is allowed) get rows; smaller ones
 # get viewpoints. ~2 m^2 is about four looks' worth of floor (§8.3).
 ROW_PATCH_MIN_M2 = 2.0
-# Viewpoints must sit on cells the robot can turn in place on: published cost 50 is
-# about the circumscribed radius (see frontier_explorer_node COSTMAP_SAFE_COST).
-LOOK_MAX_COST = 50
+# Viewpoints must sit on cells the robot can turn in place on. Published cost follows
+# 100 * exp(-3 * (d - 0.165)) out to the 0.45 m inflation radius (see
+# frontier_explorer_node COSTMAP_SAFE_COST), and the robot sweeps a 0.419 m
+# circumscribed radius when it turns. 50 was first used here and is d = 0.40 m, just
+# INSIDE that radius: on hardware (run_logs/20260925-173335) 4 of 44 looks ended in
+# Nav2's own "Collision Ahead - Exiting Spin". 45 is d = 0.43 m, just outside it.
+LOOK_MAX_COST = 45
 SPIN_GRID_SPACING_M = 1.0
 # A failed viewpoint keeps new viewpoints this far away for this long.
 FAILED_LOOK_RADIUS_M = 0.4
@@ -102,6 +116,9 @@ HEATS_MAX_LOOKS_PER_FRONTIER = 2
 HEATS_FRONTIER_NEAR_M = 2.0
 # See frontier_explorer_node SWEEP_MIN_UNSWEPT_M.
 ROW_MIN_UNSWEPT_M = CAMERA_MIN_RANGE_M + 0.1
+# InterleavedSearch's bout trigger — frontier_explorer_node passes its
+# sweep_new_area_m2, so arm C and this arm always trigger on the same amount.
+INTERLEAVE_TRIGGER_M2 = 3.0
 
 
 class Snapshot:
@@ -437,6 +454,69 @@ class RegionSearch(_Base):
         return None
 
 
+class InterleavedSearch(RegionSearch):
+    """Exploration interrupted by inspection bouts, no regions — see module docstring.
+
+    Reuses RegionSearch's inspection (_inspect) with the bout's cells as the "region";
+    _finish_region is overridden to end the bout and return to exploring.
+    """
+
+    def __init__(self, trigger_m2=INTERLEAVE_TRIGGER_M2, **kwargs):
+        super().__init__(**kwargs)
+        self.trigger_m2 = trigger_m2
+        self.phase = 'explore'        # explore | inspect
+        self.baseline_m2 = 0.0        # unseen floor when the last bout ended
+        self.bouts = 0
+        self._rebaseline = False
+        self._bout_actions = 0        # actions the current bout has produced
+        self._last_bout_empty = False
+
+    def _finish_region(self, why):
+        self.bouts += 1
+        self._last_bout_empty = self._bout_actions == 0
+        self.events.append(f'inspection bout done ({why}); {self.bouts} so far')
+        self.phase = 'explore'
+        self.active_keys = None
+        self._rebaseline = True
+
+    def next_action(self, snap):
+        grid = snap.grid
+        cell_area = grid.resolution ** 2
+        unseen_m2 = float(np.count_nonzero(grid.free & ~snap.seen)) * cell_area
+        empty = np.zeros_like(grid.free)
+        for _ in range(3):
+            if self._rebaseline:
+                self.baseline_m2 = unseen_m2
+                self._rebaseline = False
+            if self.phase == 'explore':
+                f = self._nearest_frontier(snap)
+                new_m2 = unseen_m2 - self.baseline_m2
+                if f is not None and new_m2 <= self.trigger_m2:
+                    self.last_view = (np.zeros(grid.free.shape, dtype=np.int32), empty, empty)
+                    return Action('frontier', f'exploring ({new_m2:.1f} of '
+                                  f'{self.trigger_m2} m^2 new unseen floor before the '
+                                  f'next inspection bout)', target=(f['x'], f['y']))
+                if f is None and self._last_bout_empty:
+                    return self._exit_or_finish(snap, 'last inspection bout found '
+                                                      'nothing worth a stop')
+                self.active_keys = keys_from_mask(grid, grid.free)
+                self.phase = 'inspect'
+                self.rows_done = False
+                self.spin_queue = None
+                self._bout_actions = 0
+                why = (f'{new_m2:.1f} m^2 of new unseen floor' if f is not None
+                       else 'no frontiers left')
+                self.events.append(f'inspection bout started ({why}); inspecting '
+                                   f'{len(self.active_keys) * cell_area:.1f} m^2')
+            action = self._inspect(snap)
+            if action is not None:
+                self._bout_actions += 1
+                bout = mask_from_keys(grid, self.active_keys)
+                self.last_view = (np.zeros(grid.free.shape, dtype=np.int32), bout, empty)
+                return action
+        return Action('wait', 'no decision after several bout hand-offs')
+
+
 class HeatsSearch(_Base):
     """Arm D, HEATS-style two-stage search — see module docstring."""
 
@@ -573,8 +653,12 @@ class CameraGreedySearch(_Base):
 
 def make_strategy(name, inspection_mode='mixed', **kwargs):
     """Build the strategy for frontier_explorer_node's search_strategy parameter."""
+    trigger_m2 = kwargs.pop('trigger_m2', INTERLEAVE_TRIGGER_M2)
     if name == 'region':
         return RegionSearch(inspection_mode=inspection_mode, **kwargs)
+    if name == 'interleaved':
+        return InterleavedSearch(inspection_mode=inspection_mode, trigger_m2=trigger_m2,
+                                 **kwargs)
     if name == 'heats':
         kwargs.pop('row_spacing_m', None)
         return HeatsSearch(**kwargs)
