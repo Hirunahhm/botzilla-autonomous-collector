@@ -111,3 +111,20 @@ def test_keeps_partially_swept_runs():
         row_spacing_m=1.0, min_run_m=1.0, swept_mask=swept_mask,
     )
     assert waypoints == [(0.5, 0.5), (4.5, 0.5)]
+
+
+def test_min_unswept_drops_a_run_whose_remainder_is_only_its_entry_strip():
+    # One 3 m run (60 cells at 5 cm). The first 0.45 m is un-swept — the strip the
+    # camera's blind ring leaves at the entry — the rest swept.
+    width, height, res = 60, 1, 0.05
+    data = [0] * width
+    mask = [col >= 9 for col in range(width)]
+    kept = generate_coverage_waypoints(data, width, height, res, 0.0, 0.0, 0.5,
+                                       swept_mask=mask)
+    assert len(kept) == 2   # the all-swept rule alone keeps it
+    dropped = generate_coverage_waypoints(data, width, height, res, 0.0, 0.0, 0.5,
+                                          swept_mask=mask, min_unswept_m=0.58)
+    assert dropped == []
+    mask = [col >= 20 for col in range(width)]   # 1.0 m un-swept: worth driving
+    assert len(generate_coverage_waypoints(data, width, height, res, 0.0, 0.0, 0.5,
+                                           swept_mask=mask, min_unswept_m=0.58)) == 2

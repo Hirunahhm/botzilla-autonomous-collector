@@ -752,6 +752,37 @@ comparison with the HEATS-style baseline as its centrepiece. Decide once the dea
        always predicted and never marked, and the same look repeated forever. Windows now
        round down, and a look just done isn't repeated for 60 s.
      - The first tile cap (24 m²) split normal rooms into tiles; it is now 40 m².
+   - **Harness check of every arm (2026-09-26).** Fake two-room map, ~18 m² of floor; the fake
+     robot never stalls, so these numbers only show that each arm completes, not which is
+     better. All nine configurations now finish:
+
+     | Arm | Floor seen | Finished at |
+     |---|---|---|
+     | Proposed (mixed) | 93% | 130 s |
+     | Ablation 1 (viewpoints) | 93% | 149 s |
+     | Ablation 2 (rows) | 74% | 54 s |
+     | Ablation 3 (one-look) | 92% | 100 s |
+     | Spin grid | 84% | 132 s |
+     | D (HEATS-style) | 96% | 270 s |
+     | E (camera-greedy) | 96% | 159 s |
+     | B (explore-then-sweep) | 76% | 76 s |
+     | C (interleaved, area trigger) | 85% | 90 s |
+
+     Found and fixed in this pass:
+     - **Rows can't see where they start (a finding for the paper).** With the 0.48 m blind
+       ring the swept mask now models, every row leaves a ~0.5 m unseen strip at its entry,
+       and driving it again from the same end never closes it. Arms B/C re-queued the same
+       rows forever. Now a run whose unseen remainder is under 0.58 m isn't queued
+       (`SWEEP_MIN_UNSWEPT_M`), and the sweep completes when no row is worth driving,
+       instead of at exactly 0 unseen cells. This is also why rows-only arms stop around
+       75–85% here, while arms that can turn reach 90%+.
+     - HEATS-style exploration gain counted every unknown cell, including patches the LiDAR
+       never resolves, so the arm kept returning to them with zero inspection gain. It now
+       counts unknown cells within 0.3 m of live frontiers, and stops counting a frontier
+       after two looks aimed near it.
+     - Old explorer behaviour: if the nearest frontier was within 0.3 m it waited for a map
+       update that never came, and arm B never left its start. It now takes the nearest
+       frontier at least 0.3 m away.
 5. **Hardware fixes (required before any counted run):** Kinect tilt and IR intrinsics, then
    check whether stalls drop. Stalls hit short frequent trips hardest, which arm D makes most, so
    this protects D from an unfair disadvantage.

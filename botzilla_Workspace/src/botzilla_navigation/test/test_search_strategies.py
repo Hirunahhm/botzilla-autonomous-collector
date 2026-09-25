@@ -113,3 +113,23 @@ def test_blacklisted_frontiers_mean_wait_until_given_up():
     everything = np.ones(a.shape, dtype=bool)
     assert s.next_action(snap(a, everything, frontiers=[f])).kind == 'wait'
     assert s.next_action(snap(a, everything, frontiers=[f], given_up=True)).kind == 'done'
+
+
+def test_heats_explore_gain_ignores_unknown_far_from_live_frontiers():
+    a, wall_col = two_rooms()
+    a[20:24, 20:24] = -1     # an unknown speckle with no frontier cluster reported
+    s = make_strategy('heats')
+    sn = snap(a)
+    assert not s._explore_targets(sn).any()
+    cells = [(19, c) for c in range(20, 24)]
+    f = {'x': 1.1, 'y': 0.95, 'cells': cells, 'blacklisted': False}
+    sn = snap(a, frontiers=[f])
+    assert s._explore_targets(sn).any()
+    # After two looks aimed near it, that frontier no longer attracts the arm.
+    s._last_frontiers = [f]
+    from botzilla_navigation.search_strategies import Action
+    from botzilla_navigation.viewpoint_planning import Viewpoint
+    vp = Viewpoint(1.0, 1.0, 20, 20, 0.0, 0.0, 0.0, 1.0, 1.0, gain_explore_m2=0.3)
+    for _ in range(2):
+        s.report(Action('look', viewpoint=vp), True, 0.0)
+    assert not s._explore_targets(sn).any()

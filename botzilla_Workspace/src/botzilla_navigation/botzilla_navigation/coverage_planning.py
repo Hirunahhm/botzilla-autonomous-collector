@@ -40,7 +40,7 @@ def _find_free_runs(row_values, min_run_cells):
 
 def generate_coverage_waypoints(
     data, width, height, resolution, origin_x, origin_y, row_spacing_m, min_run_m=0.3,
-    swept_mask=None,
+    swept_mask=None, min_unswept_m=0.0,
 ):
     """Boustrophedon sweep of every known free-space row, as world (x, y) waypoints.
 
@@ -59,10 +59,18 @@ def generate_coverage_waypoints(
     again would waste time better spent on newly-mapped space. swept_mask=None preserves
     the original behavior (every qualifying run included) unchanged.
 
+    min_unswept_m raises that bar: a run is also dropped when its un-swept cells add up
+    to less than this. The camera cannot see the ~0.48 m straight ahead of it
+    (swept_mask.CAMERA_MIN_RANGE_M), so driving a run leaves its first half-metre
+    un-swept, and driving it again from the same end leaves the same strip. Measured in
+    the fake-Nav2 harness: with only the all-swept rule the sweep re-queued the same
+    rows forever, ~1800 cells never closing. 0.0 keeps the all-swept rule alone.
+
     Returns [] if no row has a qualifying run (e.g. nothing free has been mapped yet).
     """
     row_spacing_cells = max(1, round(row_spacing_m / resolution))
     min_run_cells = max(1, round(min_run_m / resolution))
+    min_unswept_cells = max(1, int(round(min_unswept_m / resolution)))
 
     waypoints = []
     for pass_index, row in enumerate(range(0, height, row_spacing_cells)):
@@ -72,9 +80,10 @@ def generate_coverage_waypoints(
             row_base = row * width
             runs = [
                 (start_col, end_col) for (start_col, end_col) in runs
-                if not all(
-                    swept_mask[row_base + col] for col in range(start_col, end_col + 1)
-                )
+                if sum(
+                    1 for col in range(start_col, end_col + 1)
+                    if not swept_mask[row_base + col]
+                ) >= min_unswept_cells
             ]
         left_to_right = pass_index % 2 == 0
         if not left_to_right:

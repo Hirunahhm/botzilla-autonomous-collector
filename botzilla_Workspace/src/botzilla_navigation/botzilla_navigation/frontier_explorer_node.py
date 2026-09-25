@@ -352,6 +352,7 @@ import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Bool, String
@@ -596,6 +597,11 @@ SWEEP_SWATH_WIDTH_M = 2.0 * CAMERA_MARK_RANGE_M * math.sin(CAMERA_HALF_FOV_RAD)
 SWEEP_ROW_OVERLAP = 0.10
 SWEEP_ROW_SPACING_M = round(SWEEP_SWATH_WIDTH_M * (1.0 - SWEEP_ROW_OVERLAP), 2)  # 0.86 m
 SWEEP_MIN_RUN_M = 0.3
+# A run whose un-swept remainder is shorter than this is not queued again — see
+# coverage_planning.generate_coverage_waypoints(min_unswept_m). The blind ring plus a
+# 0.1 m margin: a remainder that short is the strip at the run's own entry, which
+# driving the run again from the same end can never see.
+SWEEP_MIN_UNSWEPT_M = CAMERA_MIN_RANGE_M + 0.1
 
 # Coverage cost — see module docstring's "Coverage cost" section. Published scale
 # (0-100, the same scale as /global_costmap/costmap); the layer maps 100 -> internal 252.
@@ -921,6 +927,9 @@ class FrontierExplorerNode(Node):
         # rclpy Time; while set and in the future, the dynamic sweep trigger is not
         # re-checked — see SWEEP_RETRIGGER_COOLDOWN_S.
         self._sweep_cooldown_until = None
+        # Length of the last sweep queue as generated — 0 means nothing was left worth
+        # sweeping, which (with no frontiers) completes the mission.
+        self._last_sweep_queue_len = None
         # 'area' trigger baseline: un-swept free cells when the last sweep ended.
         self._unswept_baseline = 0
 
@@ -1457,7 +1466,16 @@ class FrontierExplorerNode(Node):
                 )
                 return
 
-        target = select_target(candidates, robot_x, robot_y)
+        # Nearest frontier the robot is not already standing on. Picking the plain
+        # nearest and waiting when it is within MIN_TARGET_DISTANCE_M livelocks: the
+        # map only changes when the robot moves, so "wait for the next map update"
+        # can wait forever while other frontiers sit untouched. Caught in the
+        # fake-Nav2 harness (explore-then-sweep never left its start pose).
+        far = [
+            c for c in candidates
+            if distance(robot_x, robot_y, c[0], c[1]) >= MIN_TARGET_DISTANCE_M
+        ]
+        target = select_target(far or candidates, robot_x, robot_y)
         self._dispatch_frontier(target, robot_x, robot_y, len(clusters))
 
     def _dispatch_frontier(self, target, robot_x, robot_y, n_clusters):
@@ -1865,6 +1883,15 @@ class FrontierExplorerNode(Node):
                 self._publish_coverage_complete(
                     'sweep queue exhausted, no frontiers left, fully swept'
                 )
+            elif not candidates and self._last_sweep_queue_len == 0:
+                # Nothing left that a row could still reveal (see SWEEP_MIN_UNSWEPT_M):
+                # the remaining un-swept floor is entry strips, occluded pockets and
+                # unreachable nooks. Requiring exactly zero here looped forever once
+                # the swept mask stopped counting floor the camera cannot see.
+                self._publish_coverage_complete(
+                    f'no frontiers left and no row worth driving '
+                    f'({unswept_free} un-swept cell(s) remain, none reachable by a row)'
+                )
             else:
                 self._mode = 'FRONTIER'
                 self._unswept_baseline = unswept_free
@@ -2057,8 +2084,9 @@ class FrontierExplorerNode(Node):
                 msg.data, msg.info.width, msg.info.height, msg.info.resolution,
                 msg.info.origin.position.x, msg.info.origin.position.y,
                 row_spacing_m=self._sweep_row_spacing_m, min_run_m=SWEEP_MIN_RUN_M,
-                swept_mask=self._planning_mask(),
+                swept_mask=self._planning_mask(), min_unswept_m=SWEEP_MIN_UNSWEPT_M,
             )
+            self._last_sweep_queue_len = len(raw_waypoints)
             # Tag entry/exit role now — see SWEEP_LEG_TRANSIT. Keeping the planning
             # module's output a plain point list leaves its unit tests untouched.
             self._sweep_queue = [
@@ -2701,7 +2729,7 @@ def main(args=None):
     node = FrontierExplorerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

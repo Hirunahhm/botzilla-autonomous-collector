@@ -53,7 +53,7 @@ from botzilla_navigation.region_segmentation import (
     mask_from_keys,
     segment_regions,
 )
-from botzilla_navigation.swept_mask import CAMERA_HALF_FOV_RAD
+from botzilla_navigation.swept_mask import CAMERA_HALF_FOV_RAD, CAMERA_MIN_RANGE_M
 from botzilla_navigation.viewpoint_planning import (
     candidate_cells,
     costmap_ok_mask,
@@ -92,6 +92,16 @@ REPEAT_LOOK_MEMORY_S = 60.0
 # useful mapping range indoors is far more, but the gain has to stay local to the
 # viewpoint for the blend to mean anything).
 HEATS_EXPLORE_RADIUS_M = 2.0
+# HEATS-style exploration gain counts only unknown cells within this distance of a live
+# frontier, and a frontier stops counting after this many looks aimed near it. Counting
+# every unknown cell was tried first: unknown patches the LiDAR never resolves (behind
+# furniture, map speckle) kept a steady 0.2 m^2 of "gain" alive, and the arm kept
+# returning to look at them with zero inspection gain (caught by the fake-Nav2 harness).
+HEATS_FRONTIER_BAND_M = 0.3
+HEATS_MAX_LOOKS_PER_FRONTIER = 2
+HEATS_FRONTIER_NEAR_M = 2.0
+# See frontier_explorer_node SWEEP_MIN_UNSWEPT_M.
+ROW_MIN_UNSWEPT_M = CAMERA_MIN_RANGE_M + 0.1
 
 
 class Snapshot:
@@ -392,7 +402,7 @@ class RegionSearch(_Base):
         return generate_coverage_waypoints(
             masked.ravel().tolist(), grid.width, grid.height, grid.resolution,
             grid.origin_x, grid.origin_y, row_spacing_m=self.row_spacing_m,
-            swept_mask=snap.seen.ravel().tolist(),
+            swept_mask=snap.seen.ravel().tolist(), min_unswept_m=ROW_MIN_UNSWEPT_M,
         )
 
     def _spin_grid(self, snap, region, targets, seen_frac):
@@ -428,8 +438,48 @@ class HeatsSearch(_Base):
         self.seed = None
         self.done_keys = set()
         self.regions_done = 0
+        self._frontier_looks = []   # [x, y, count] — see HEATS_MAX_LOOKS_PER_FRONTIER
+
+    def _frontier_record(self, x, y):
+        for rec in self._frontier_looks:
+            if math.hypot(rec[0] - x, rec[1] - y) < 0.5:
+                return rec
+        return None
+
+    def _explore_targets(self, snap):
+        """Unknown cells near live frontiers not yet looked at too often."""
+        grid = snap.grid
+        seeds = np.zeros_like(grid.unknown)
+        for f in snap.frontiers:
+            if f['blacklisted'] or not f['cells']:
+                continue
+            rec = self._frontier_record(f['x'], f['y'])
+            if rec is not None and rec[2] >= HEATS_MAX_LOOKS_PER_FRONTIER:
+                continue
+            rows, cols = zip(*f['cells'])
+            seeds[list(rows), list(cols)] = True
+        band = max(1, int(round(HEATS_FRONTIER_BAND_M / grid.resolution)))
+        near = ndimage.binary_dilation(seeds, iterations=band)
+        return near & grid.unknown
+
+    def report(self, action, succeeded, now):
+        super().report(action, succeeded, now)
+        if action is None or action.kind != 'look' or action.viewpoint is None:
+            return
+        vp = action.viewpoint
+        if vp.gain_explore_m2 <= 0.0:
+            return
+        for f in getattr(self, '_last_frontiers', []):
+            if math.hypot(f['x'] - vp.x, f['y'] - vp.y) > HEATS_FRONTIER_NEAR_M:
+                continue
+            rec = self._frontier_record(f['x'], f['y'])
+            if rec is None:
+                self._frontier_looks.append([f['x'], f['y'], 1])
+            else:
+                rec[2] += 1
 
     def next_action(self, snap):
+        self._last_frontiers = [f for f in snap.frontiers if not f['blacklisted']]
         for _ in range(4):
             action = self._step(snap)
             if action is not None:
@@ -470,7 +520,7 @@ class HeatsSearch(_Base):
         targets = region & ~snap.seen
         table_i, padded_i, cost_ok = self._look_setup(snap, targets)
         table_e = self._table(grid.resolution, explore=True)
-        padded_e = PaddedGrids(grid.unknown, grid.occupied, table_e.pad)
+        padded_e = PaddedGrids(self._explore_targets(snap), grid.occupied, table_e.pad)
         candidates = candidate_cells(grid, region, cost_ok, avoid=self._avoid(snap.now))
         top = plan_heats(grid, padded_i, table_i, padded_e, table_e, candidates,
                          snap.robot, self.w_explore, self.w_inspect, fov_rad=self.fov_rad,
