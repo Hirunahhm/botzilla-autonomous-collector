@@ -990,6 +990,9 @@ class FrontierExplorerNode(Node):
         # recorded by mission_metrics_node so the analysis can count stalls and turning
         # per arm without parsing this node's log text.
         self._events_pub = self.create_publisher(String, '/explorer/events', 50)
+        # The strategy's regions, for watching the segmentation in RViz (Map display):
+        # active region 99 (black), other regions 30-70 (greys), done regions 10.
+        self._regions_pub = self.create_publisher(OccupancyGrid, '/explorer/regions', map_qos)
 
         # Ground truth for what the planner will actually accept — see
         # COSTMAP_SAFE_COST above for why the raw /map alone isn't enough.
@@ -1589,6 +1592,7 @@ class FrontierExplorerNode(Node):
         )
         self._emit_event('strategy_action', kind=action.kind, reason=action.reason,
                          decide_ms=round(took * 1000))
+        self._publish_regions(msg)
         self._strategy_action = action
         if action.kind != 'wait':
             self._stuck_since = None
@@ -1615,6 +1619,24 @@ class FrontierExplorerNode(Node):
             self._handle_strategy_wait()
         elif action.kind == 'done':
             self._publish_coverage_complete(action.reason)
+
+    def _publish_regions(self, msg):
+        """Publish the strategy's last segmentation on /explorer/regions."""
+        view = getattr(self._strategy, 'last_view', None)
+        if view is None:
+            return
+        labels, active, done = view
+        out = np.full(labels.shape, -1, dtype=np.int8)
+        others = labels > 0
+        out[others] = (30 + (labels[others] * 13) % 41).astype(np.int8)
+        out[done] = 10
+        out[active] = 99
+        grid = OccupancyGrid()
+        grid.header.frame_id = MAP_FRAME
+        grid.header.stamp = self.get_clock().now().to_msg()
+        grid.info = msg.info
+        grid.data = out.ravel().tolist()
+        self._regions_pub.publish(grid)
 
     def _handle_strategy_wait(self):
         """Only blacklisted frontiers left: back up a few times, then stop waiting."""

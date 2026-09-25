@@ -144,6 +144,9 @@ class _Base:
         self._tables = {}
         self._failed = []  # (x, y, expiry)
         self._done_looks = []  # (x, y, heading, span, expiry)
+        # Region labels as of the last decision, for /explorer/regions in RViz:
+        # (labels (h, w) int, active (h, w) bool, done (h, w) bool) or None.
+        self.last_view = None
         self.events = []   # human-readable decisions, drained by the node for logging
 
     def _table(self, resolution, explore=False):
@@ -316,6 +319,7 @@ class RegionSearch(_Base):
         grid = snap.grid
         done_mask = mask_from_keys(grid, self.done_keys)
         seg = segment_regions(grid, exclude=done_mask)
+        self.last_view = (seg.labels, np.zeros_like(done_mask), done_mask)
 
         region_id = None
         if self.phase in ('explore', 'inspect') and self.seed is not None:
@@ -328,6 +332,11 @@ class RegionSearch(_Base):
             region_id = self._select(snap, seg)
             if region_id is None:
                 return self._exit_or_finish(snap, 'no unfinished region known')
+
+        if region_id is not None:
+            active = (mask_from_keys(grid, self.active_keys) if self.active_keys
+                      else seg.cells(region_id))
+            self.last_view = (seg.labels, active, done_mask)
 
         if self.phase == 'explore':
             inside = [f for f in snap.frontiers
@@ -507,7 +516,9 @@ class HeatsSearch(_Base):
 
     def _step(self, snap):
         grid = snap.grid
-        seg = segment_regions(grid, exclude=mask_from_keys(grid, self.done_keys))
+        done_mask = mask_from_keys(grid, self.done_keys)
+        seg = segment_regions(grid, exclude=done_mask)
+        self.last_view = (seg.labels, np.zeros_like(done_mask), done_mask)
         region_id = None
         if self.seed is not None:
             region_id = _region_seed_label(seg, grid, self.seed)
@@ -515,6 +526,7 @@ class HeatsSearch(_Base):
             region_id = self._select(snap, seg)
             if region_id is None:
                 return self._exit_or_finish(snap, 'no unfinished region known')
+        self.last_view = (seg.labels, seg.cells(region_id), done_mask)
 
         region = seg.cells(region_id)
         targets = region & ~snap.seen

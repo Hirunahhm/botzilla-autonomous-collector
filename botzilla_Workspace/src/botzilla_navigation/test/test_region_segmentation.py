@@ -54,12 +54,56 @@ def test_wide_opening_is_one_region():
     assert len(seg.ids) == 1
 
 
-def test_large_open_space_is_tiled():
-    a = np.zeros((200, 200), dtype=int)   # 10 x 10 m, no walls at all
-    seg = segment_regions(grid_of(a), tile_m=4.0, max_region_area_m2=24.0)
-    assert len(seg.ids) >= 6
-    for region_id in seg.ids:
-        assert seg.cells(region_id).sum() * RES * RES <= 16.0 + 1e-6
+def enclose(free):
+    """Occupancy grid of `free` floor with a one-cell wall around it, unknown outside."""
+    from scipy import ndimage
+    a = np.full(free.shape, -1, dtype=int)
+    a[free] = 0
+    a[ndimage.binary_dilation(free) & ~free] = 100
+    return a
+
+
+def areas(seg):
+    return sorted((round(float(seg.cells(i).sum()) * RES * RES, 1) for i in seg.ids),
+                  reverse=True)
+
+
+def test_l_shaped_room_splits_into_its_two_arms():
+    free = np.zeros((170, 170), dtype=bool)
+    free[5:85, 5:165] = True     # 4 m x 8 m arm
+    free[85:165, 5:85] = True    # 4 m x 4 m arm
+    assert areas(segment_regions(grid_of(enclose(free)))) == [32.0, 16.0]
+
+
+def test_small_l_still_splits_but_a_small_room_does_not():
+    free = np.zeros((130, 130), dtype=bool)
+    free[5:65, 5:125] = True
+    free[65:125, 5:65] = True
+    assert areas(segment_regions(grid_of(enclose(free)))) == [18.0, 9.0]
+    square = np.zeros((130, 130), dtype=bool)
+    square[5:125, 5:125] = True
+    assert areas(segment_regions(grid_of(enclose(square)))) == [36.0]
+
+
+def test_rectangular_room_with_furniture_is_not_split_by_shape():
+    free = np.zeros((130, 130), dtype=bool)
+    free[5:125, 5:125] = True
+    a = enclose(free)
+    for r, c in ((30, 30), (30, 80), (80, 50), (95, 95)):   # tables well inside
+        a[r:r + 8, c:c + 12] = 100
+    seg = segment_regions(grid_of(a))
+    assert len(seg.ids) == 1
+
+
+def test_large_open_space_is_halved_not_tiled_from_the_start_pose():
+    free = np.pad(np.ones((200, 200), dtype=bool), 5)    # 10 x 10 m, no walls inside
+    seg = segment_regions(grid_of(enclose(free), ox=-5.25, oy=-5.25))
+    assert areas(seg) == [25.0, 25.0, 25.0, 25.0]
+    # The cuts follow the room, not the map origin: moving the origin (the robot's
+    # start) must not move them relative to the room.
+    seg2 = segment_regions(grid_of(enclose(free), ox=-2.0, oy=-7.0))
+    assert np.array_equal(seg.labels > 0, seg2.labels > 0)
+    assert len(seg2.ids) == 4
 
 
 def test_excluded_cells_get_no_region():

@@ -169,6 +169,7 @@ class MissionMetricsNode(Node):
         self._detections_unranged = 0  # z == 0: blind spot or depth failure, no position
         self._false_spots = []        # distinct false-positive positions, [x, y]
         self._latest_map = None
+        self._latest_swept_map = None
         self._last_pose = None        # (x, y, yaw)
         self._distance_m = 0.0
         self._state = None
@@ -405,6 +406,7 @@ class MissionMetricsNode(Node):
 
     def _coverage_cb(self, msg: OccupancyGrid):
         """Cache swept/total counts from /swept_coverage_map — see SWEPT_FREE."""
+        self._latest_swept_map = msg
         swept = 0
         total = 0
         for value in msg.data:
@@ -553,6 +555,37 @@ class MissionMetricsNode(Node):
             'explorer_events': self._events,
         })
         self._fh.close()
+        self._save_final_maps()
+
+    def _save_final_maps(self):
+        """Save the last /map and /swept_coverage_map next to the metrics file.
+
+        map_final.npz holds the grids (int8, row-major, -1 unknown) with their origin
+        and resolution, for figures and for re-checking segmentation offline — RTAB-Map
+        does not keep the grid when the stack is stopped. Never raises: losing the maps
+        must not lose the run_end record written just before.
+        """
+        if self._latest_map is None:
+            return
+        try:
+            import numpy as np   # only needed here; keeps the node's import cheap
+            info = self._latest_map.info
+            arrays = {
+                'map': np.asarray(self._latest_map.data, dtype=np.int8).reshape(
+                    info.height, info.width),
+                'origin_x': info.origin.position.x,
+                'origin_y': info.origin.position.y,
+                'resolution': info.resolution,
+            }
+            sw = self._latest_swept_map
+            if sw is not None and sw.info.width == info.width and \
+                    sw.info.height == info.height:
+                arrays['swept'] = np.asarray(sw.data, dtype=np.int8).reshape(
+                    info.height, info.width)
+            np.savez_compressed(
+                os.path.join(os.path.dirname(self._path), 'map_final.npz'), **arrays)
+        except Exception as exc:  # noqa: B902 — see docstring
+            self.get_logger().warn(f'Could not save the final map: {exc}')
 
 
 def main(args=None):
