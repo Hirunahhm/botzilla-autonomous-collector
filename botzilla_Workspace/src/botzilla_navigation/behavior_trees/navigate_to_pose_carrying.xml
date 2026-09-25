@@ -1,0 +1,63 @@
+<!--
+  navigate_to_pose_carrying.xml: the tree for executor_node's HOME goal while a cube is
+  held in the arms (DELIVERING). Same as navigate_to_pose_backup_first.xml except the
+  recovery.
+
+  No BackUp. The grabber has no lock and the arms only hold a cube while the robot
+  moves forward: reversing slides the cube out of them. The controller is already
+  kept from reversing during delivery (executor_node sets FollowPath.min_vel_x to 0), but
+  the recovery tree's BackUp is a separate behaviour and ignores that. In
+  run_logs/20260925-214416 it ran twice while carrying (104 s and 916 s after HOME latched).
+
+  Recovery is: clear both costmaps, then Spin a quarter turn. There is no round-robin
+  fallback. If the spin cannot be done where the robot is (Nav2's "Collision Ahead -
+  Exiting Spin"), the Sequence fails, the recovery fails, and NavigateToPose aborts.
+  executor_node then releases the cube where it is and resumes exploring: the cube is
+  abandoned rather than dragged backwards out of the arms. RecoveryNode still allows up
+  to 6 clear-and-spin attempts while each spin succeeds.
+
+  Sent per goal through NavigateToPose's behavior_tree field (executor_node
+  _send_home_goal), never as bt_navigator's default, so every other goal keeps the
+  BackUp-first recovery.
+-->
+
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated/>
+          <Sequence name="CarryingRecovery">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            <Spin spin_dist="1.57" error_code_id="{spin_error_code}"/>
+          </Sequence>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

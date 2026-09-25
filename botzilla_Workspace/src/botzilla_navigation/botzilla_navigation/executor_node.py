@@ -66,8 +66,10 @@ nav2.launch.py and a source of /detected_cube (yolo_node) already running.
 """
 
 import math
+import os
 
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point, PointStamped, Twist
 from nav2_msgs.action import NavigateToPose
@@ -177,6 +179,12 @@ HOME_TF_WAIT_S = 60.0       # how long to wait at STARTUP for map->base_link
 # DELIVERING ends (success, failure, or timeout) — every other state, including
 # EXPLORING, keeps the wedge-escape behaviour untouched.
 NAV2_MIN_VEL_X_DEFAULT = -0.10  # must match FollowPath.min_vel_x in nav2_params.yaml
+# The controller limit above does not cover Nav2's recovery behaviours: the default
+# tree's BackUp still reversed the robot while carrying (twice in
+# run_logs/20260925-214416). The HOME goal therefore uses its own behavior tree whose
+# only recovery is clear-costmaps-then-Spin; if the spin is impossible the goal aborts and
+# the cube is released here (see _do_delivering). See navigate_to_pose_carrying.xml.
+CARRYING_BT = 'navigate_to_pose_carrying.xml'
 
 CONTROL_PERIOD_S = 0.1      # 10 Hz
 MAP_FRAME = 'map'
@@ -266,6 +274,10 @@ class ExecutorNode(Node):
         self.create_subscription(Point, 'detected_cube', self._cube_cb, 10)
 
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._carrying_bt_path = os.path.join(
+            get_package_share_directory('botzilla_navigation'), 'behavior_trees',
+            CARRYING_BT,
+        )
         self._controller_param_client = AsyncParameterClient(self, 'controller_server')
 
         # Hold exploration off until HOME is latched — otherwise the robot could
@@ -503,9 +515,13 @@ class ExecutorNode(Node):
                 # Releasing here is deliberate. The robot is somewhere short of HOME,
                 # but dropping the cube and carrying on beats wedging the whole
                 # mission on one failed route — and the cube stays findable.
+                # With the carrying tree this is also the path when a recovery spin
+                # was impossible: rather than back up with the cube, give it up here.
                 self.get_logger().warn(
-                    f'Delivery goal ended with status {status} instead of SUCCEEDED. '
-                    f'Releasing the cube here and resuming exploration.'
+                    f'Delivery goal ended with status {status} instead of SUCCEEDED '
+                    f'(route failed, or a recovery spin was impossible and backing up '
+                    f'would drop the cube). Releasing the cube here and resuming '
+                    f'exploration.'
                 )
                 self._transition(State.DETACHING, 'Delivery failed; releasing anyway.')
             return
@@ -562,6 +578,8 @@ class ExecutorNode(Node):
 
         x, y, yaw = self._home
         goal = NavigateToPose.Goal()
+        # Carrying: recovery may spin but never back up — see CARRYING_BT.
+        goal.behavior_tree = self._carrying_bt_path
         goal.pose.header.frame_id = MAP_FRAME
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = x
