@@ -68,6 +68,7 @@ from botzilla_navigation.viewpoint_planning import (
     candidate_cells,
     costmap_ok_mask,
     DEFAULT_SPANS_RAD,
+    estimate_look_time,
     FULL_SPIN_RAD,
     MIN_GAIN_M2,
     order_open_tour,
@@ -116,6 +117,19 @@ HEATS_MAX_LOOKS_PER_FRONTIER = 2
 HEATS_FRONTIER_NEAR_M = 2.0
 # See frontier_explorer_node SWEEP_MIN_UNSWEPT_M.
 ROW_MIN_UNSWEPT_M = CAMERA_MIN_RANGE_M + 0.1
+# Rows vs viewpoints per patch (mixed and one_look) — see RegionSearch._choose_rows.
+# Measured cost of a leg on the real robot, fitted to the 2026-09-25 shakedown runs
+# (hardware_shakedown_runs.md §5.6): 21 row legs and 26 transit legs, failures and
+# stalls included. Row legs took ~31 s plus ~3.9 s per metre whether or not they ran
+# near furniture (open 1.8 m legs 38 s, short 0.6 m legs 34 s, only half succeeded);
+# transit legs ~27 s plus ~4.0 s per metre. A first model of 0.15 m/s + 4 s per stop,
+# with a stall penalty only for legs near obstacles, under-estimated rows about 3x and
+# sent a patch to rows that then took the whole of run 1c.
+ROW_LEG_BASE_S = 31.0
+ROW_LEG_S_PER_M = 3.9
+TRANSIT_LEG_BASE_S = 27.0
+TRANSIT_LEG_S_PER_M = 4.0
+
 # InterleavedSearch's bout trigger — frontier_explorer_node passes its
 # sweep_new_area_m2, so arm C and this arm always trigger on the same amount.
 INTERLEAVE_TRIGGER_M2 = 3.0
@@ -228,6 +242,18 @@ class _Base:
         if any(f['blacklisted'] for f in snap.frontiers) and not snap.frontiers_given_up:
             return Action('wait', f'{why}; only blacklisted frontiers remain')
         return Action('done', f'{why}; no frontiers left')
+
+    def _table_full(self, resolution):
+        """Stride-1 camera RayTable, for simulating which cells a look would see."""
+        key = (round(resolution, 4), 'full')
+        if key not in self._tables:
+            kwargs = {'stride': 1}
+            if self._min_range_m is not None:
+                kwargs['min_range_m'] = self._min_range_m
+            if self._max_range_m is not None:
+                kwargs['max_range_m'] = self._max_range_m
+            self._tables[key] = RayTable(resolution, **kwargs)
+        return self._tables[key]
 
     def _look_setup(self, snap, targets):
         table = self._table(snap.grid.resolution)
@@ -385,14 +411,21 @@ class RegionSearch(_Base):
         targets = region & ~snap.seen
         mode = self.inspection_mode
 
-        if mode in ('mixed', 'rows', 'one_look') and not self.rows_done:
+        if mode == 'rows' and not self.rows_done:
             self.rows_done = True
-            min_patch = 0.0 if mode == 'rows' else self.row_patch_min_m2
-            waypoints = self._row_waypoints(snap, targets, min_patch)
+            waypoints = self._row_waypoints(snap, targets, 0.0)
             if waypoints:
-                return Action('rows', f'row pass over un-seen patches >= {min_patch} m^2 '
+                return Action('rows', f'row pass over all un-seen patches '
                               f'({len(waypoints) // 2} run(s)); {seen_frac:.0%} seen',
                               waypoints=waypoints)
+        if mode in ('mixed', 'one_look') and not self.rows_done:
+            self.rows_done = True
+            spans = (0.0,) if mode == 'one_look' else DEFAULT_SPANS_RAD
+            waypoints = self._choose_rows(snap, region, targets, spans)
+            if waypoints:
+                return Action('rows', f'row pass over the patches where rows are '
+                              f'estimated faster ({len(waypoints) // 2} run(s)); '
+                              f'{seen_frac:.0%} seen', waypoints=waypoints)
         if mode == 'rows':
             self._finish_region(f'row pass complete, {seen_frac:.0%} seen')
             return None
@@ -410,6 +443,73 @@ class RegionSearch(_Base):
                                 f'{seen_frac:.0%} seen')
             return None
         return Action('look', f'{vp!r}; region {seen_frac:.0%} seen', viewpoint=vp)
+
+    def _choose_rows(self, snap, region, targets, spans):
+        """Row waypoints over the patches where rows beat viewpoints on estimated time.
+
+        The first `mixed` sent every patch >= row_patch_min_m2 to rows. Right after a
+        region is explored the whole room is one unseen patch, so on hardware the row pass
+        took the entire run and no viewpoint was ever used (run_logs/20260925-162128 and
+        -192138), while viewpoint-only arms saw about twice the floor. Patch size says
+        nothing about which primitive is faster; time does. For every patch of at least
+        row_patch_min_m2 this estimates both:
+
+          rows       every leg at its measured cost (ROW_LEG_* for row legs,
+                     TRANSIT_LEG_* for the legs between rows)
+          viewpoints estimate_look_time: the planner itself, simulated greedily until
+                     90% of the patch is seen, each look at its measured cost
+
+        and keeps the patch for rows only if rows are faster. Everything else is left to
+        the viewpoint loop. Each decision is logged with both estimates.
+        """
+        grid = snap.grid
+        cell_area = grid.resolution ** 2
+        labels, n = ndimage.label(targets, structure=np.ones((3, 3), dtype=bool))
+        if n == 0:
+            return []
+        table, _, cost_ok = self._look_setup(snap, targets)
+        table_full = self._table_full(grid.resolution)
+        chosen = np.zeros_like(targets)
+        for k in range(1, n + 1):
+            patch = labels == k
+            area = float(np.count_nonzero(patch)) * cell_area
+            if area < self.row_patch_min_m2:
+                continue
+            legs = self._row_waypoints(snap, patch, 0.0)
+            if not legs:
+                continue
+            t_rows = self._row_time(snap.robot, legs)
+            t_look, looks, frac = estimate_look_time(
+                grid, patch, region, cost_ok, snap.robot, table, table_full,
+                spans=spans, fov_rad=self.fov_rad)
+            use_rows = t_rows < t_look
+            self.events.append(
+                f'patch {area:.1f} m^2: rows ~{t_rows:.0f} s ({len(legs)} legs) vs '
+                f'viewpoints ~{t_look:.0f} s ({looks} looks, '
+                f'{frac:.0%} simulated) -> {"rows" if use_rows else "viewpoints"}')
+            if use_rows:
+                chosen |= patch
+        if not chosen.any():
+            return []
+        return self._row_waypoints(snap, chosen, 0.0)
+
+    @staticmethod
+    def _row_time(robot, waypoints):
+        """Estimated seconds to drive waypoints from robot at the measured leg costs.
+
+        Waypoints come in (entry, exit) pairs, so legs alternate transit (to a row's
+        entry) and row (along it).
+        """
+        seconds = 0.0
+        px, py = robot[0], robot[1]
+        for k, (x, y) in enumerate(waypoints):
+            d = math.hypot(x - px, y - py)
+            if k % 2 == 0:
+                seconds += TRANSIT_LEG_BASE_S + TRANSIT_LEG_S_PER_M * d
+            else:
+                seconds += ROW_LEG_BASE_S + ROW_LEG_S_PER_M * d
+            px, py = x, y
+        return seconds
 
     def _row_waypoints(self, snap, targets, min_patch_m2):
         grid = snap.grid

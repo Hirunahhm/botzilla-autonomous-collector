@@ -90,3 +90,29 @@ def test_open_tour_is_optimal_for_a_line():
     assert order_open_tour((0.0, 0.0), pts) == [1, 2, 0]
     many = [(float(i), 0.0) for i in range(10, 0, -1)]
     assert order_open_tour((0.0, 0.0), many) == list(range(9, -1, -1))
+
+
+def test_estimate_look_time_covers_a_patch_and_is_finite():
+    from botzilla_navigation.viewpoint_planning import estimate_look_time
+    g, _ = open_grid()
+    targets = np.zeros_like(g.free)
+    targets[30:50, 30:50] = True               # 1 m x 1 m patch
+    table = RayTable(RES, 0.48, 1.0)
+    full = RayTable(RES, 0.48, 1.0, stride=1)
+    seconds, looks, frac = estimate_look_time(
+        g, targets, np.ones_like(g.free), np.ones_like(g.free), (2.0, 2.0, 0.0),
+        table, full)
+    assert 0 < seconds < 300 and looks >= 1 and frac >= 0.9
+
+
+def test_estimate_look_time_is_infinite_when_nothing_is_visible():
+    from botzilla_navigation.viewpoint_planning import estimate_look_time
+    g, _ = open_grid()
+    targets = np.zeros_like(g.free)
+    targets[40, 40] = True
+    allowed = np.zeros_like(g.free)            # no place to stand
+    table = RayTable(RES, 0.48, 1.0)
+    full = RayTable(RES, 0.48, 1.0, stride=1)
+    seconds, looks, _ = estimate_look_time(
+        g, targets, allowed, np.ones_like(g.free), (2.0, 2.0, 0.0), table, full)
+    assert seconds == float('inf') and looks == 0

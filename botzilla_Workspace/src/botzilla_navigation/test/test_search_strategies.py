@@ -33,8 +33,10 @@ def room_mask(a, wall_col, left=True):
 
 
 def test_region_search_rows_first_then_next_room_then_done():
+    # Room ORDER, not the primitive: `rows` so every room's first action is a row pass.
+    # (`mixed` now picks viewpoints for rooms this small — see the tests further down.)
     a, wall_col = two_rooms()
-    s = make_strategy('region', inspection_mode='mixed')
+    s = make_strategy('region', inspection_mode='rows')
     act = s.next_action(snap(a))
     assert act.kind == 'rows' and act.waypoints
     # Every row waypoint is in the left room: the right room is locked until done.
@@ -156,3 +158,41 @@ def test_interleaved_finishes_when_no_frontiers_and_nothing_to_inspect():
     s = make_strategy('interleaved', inspection_mode='viewpoints')
     everything = np.ones(a.shape, dtype=bool)
     assert s.next_action(snap(a, everything)).kind == 'done'
+
+
+def _mixed_first_action(a):
+    s = make_strategy('region', inspection_mode='mixed')
+    act = s.next_action(snap(a, robot=(0.5, 0.5, 0.0)))
+    return act, s.events
+
+
+def test_mixed_picks_rows_for_a_long_open_hall():
+    from test_region_segmentation import enclose
+    free = np.zeros((50, 250), dtype=bool)
+    free[5:45, 5:245] = True                   # 2 m x 12 m, nothing in it
+    act, events = _mixed_first_action(enclose(free))
+    assert act.kind == 'rows'
+    assert any('-> rows' in e for e in events)
+
+
+def test_mixed_picks_viewpoints_for_a_room_full_of_desks():
+    from test_region_segmentation import enclose
+    free = np.zeros((130, 130), dtype=bool)
+    free[5:125, 5:125] = True
+    a = enclose(free)
+    for r in range(20, 120, 22):
+        for c in range(20, 120, 30):
+            a[r:r + 10, c:c + 14] = 100          # desks: rows would pass close to them
+    act, events = _mixed_first_action(a)
+    assert act.kind == 'look'
+    assert any('-> viewpoints' in e for e in events)
+
+
+def test_interleaved_mixed_uses_the_same_choice():
+    from test_region_segmentation import enclose
+    free = np.zeros((50, 250), dtype=bool)
+    free[5:45, 5:245] = True
+    s = make_strategy('interleaved', inspection_mode='mixed', trigger_m2=3.0)
+    act = s.next_action(snap(enclose(free), robot=(0.5, 0.5, 0.0)))
+    assert act.kind == 'rows'
+    assert any('-> rows' in e for e in s.events)

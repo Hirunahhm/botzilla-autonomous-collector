@@ -83,7 +83,7 @@ class RayTable:
         self.cell_area = resolution * resolution * stride * stride
         reach = int(math.ceil(max_range_m / resolution))
         self.pad = reach + 1
-        drs, dcs, bins, rays = [], [], [], []
+        drs, dcs, bins, bearings, rays = [], [], [], [], []
         for dr in range(-reach, reach + 1, stride):
             for dc in range(-reach, reach + 1, stride):
                 dist = math.hypot(dr, dc) * resolution
@@ -92,12 +92,14 @@ class RayTable:
                 bearing = math.atan2(dr, dc) % (2.0 * math.pi)
                 drs.append(dr)
                 dcs.append(dc)
+                bearings.append(bearing)
                 bins.append(int(bearing / (2.0 * math.pi) * bin_count) % bin_count)
                 rays.append(self._ray(dr, dc, dist, resolution, target_clearance_m))
         self.n = len(drs)
         self.dr = np.array(drs, dtype=np.int64)
         self.dc = np.array(dcs, dtype=np.int64)
         self.bins = np.array(bins, dtype=np.int64)
+        self.bearing = np.array(bearings, dtype=float)
         longest = max((len(r) for r in rays), default=1) or 1
         # Padded with (0, 0): the candidate's own cell, which is free by construction,
         # so padding never blocks.
@@ -270,7 +272,7 @@ def costmap_ok_mask(grid, costmap, max_cost):
 
 def plan_looks(grid, padded, table, candidates, robot, spans=DEFAULT_SPANS_RAD,
                fov_rad=2.0 * CAMERA_HALF_FOV_RAD, overhead_s=STOP_OVERHEAD_S,
-               min_gain_m2=MIN_GAIN_M2, top_k=1):
+               min_gain_m2=MIN_GAIN_M2, top_k=1, lin_speed=LINEAR_SPEED_MPS):
     """Best viewpoints by seen area per second — see module docstring.
 
     Returns up to top_k Viewpoints, best first; [] if none reveals min_gain_m2.
@@ -284,7 +286,8 @@ def plan_looks(grid, padded, table, candidates, robot, spans=DEFAULT_SPANS_RAD,
         best = None
         for span in spans:
             gains, headings = window_gains(hist, fov_rad, span)
-            times = travel_time(robot, x, y, headings, span, overhead_s=overhead_s)
+            times = travel_time(robot, x, y, headings, span, lin_speed=lin_speed,
+                                overhead_s=overhead_s)
             scores = gains * table.cell_area / times
             s = int(np.argmax(scores))
             if best is None or scores[s] > best[0]:
@@ -333,6 +336,85 @@ def plan_heats(grid, padded_inspect, table_inspect, padded_explore, table_explor
                                  float(times[s]), float(utility[s]), gain_e))
     results.sort(key=lambda v: v.score, reverse=True)
     return results[:top_k]
+
+
+# Estimating how long viewpoints would take to cover a patch (estimate_look_time):
+# candidates on a coarser lattice than when actually choosing a look, and a cap on the
+# simulated looks, to keep the estimate to about a second on the Jetson.
+ESTIMATE_CANDIDATE_SPACING_M = 0.5
+ESTIMATE_MAX_LOOKS = 20
+# Measured cost of driving to a viewpoint on the real robot, fitted to the 62 viewpoint
+# legs of the 2026-09-25 shakedown runs (hardware_shakedown_runs.md §5.6): 11.5 s for
+# 0.5 m legs, 15.6 s for 1.7 m legs, i.e. ~9.8 s per stop plus ~3.4 s per metre. The
+# planner's own STOP_OVERHEAD_S / LINEAR_SPEED_MPS assumed 4 s and 6.7 s per metre. Used
+# only by estimate_look_time (the rows-vs-viewpoints comparison), so that both sides of
+# the comparison are measured costs; the planner's choice of looks is unchanged.
+MEASURED_LOOK_STOP_S = 9.8
+MEASURED_LOOK_SPEED_MPS = 1.0 / 3.4
+
+
+def look_cells(padded, table, row, col, heading, span, fov_rad):
+    """(rows, cols) of the target cells a look would actually see — for simulation.
+
+    Same visibility as visible_histogram, but returns the cells inside the swept arc
+    [heading - fov/2, heading + span + fov/2] instead of a histogram. Use a stride-1
+    RayTable so every cell is accounted for, not just a sample.
+    """
+    r0 = row + padded.pad
+    c0 = col + padded.pad
+    hit = padded.targets[r0 + table.dr, c0 + table.dc]
+    if not hit.any():
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    idx = np.flatnonzero(hit)
+    blocked = padded.occupied[r0 + table.ray_r[idx], c0 + table.ray_c[idx]].any(axis=1)
+    idx = idx[~blocked]
+    rel = np.mod(table.bearing[idx] - (heading - fov_rad / 2.0), 2.0 * math.pi)
+    idx = idx[rel <= span + fov_rad + 1e-9]
+    return row + table.dr[idx], col + table.dc[idx]
+
+
+def estimate_look_time(grid, targets, allowed, cost_ok, robot, table, table_full,
+                       spans=DEFAULT_SPANS_RAD, fov_rad=2.0 * CAMERA_HALF_FOV_RAD,
+                       goal_fraction=0.9, max_looks=ESTIMATE_MAX_LOOKS):
+    """Seconds for viewpoints to see goal_fraction of `targets`, by greedy simulation.
+
+    Repeats what the planner would do — pick the best look, pretend it happened, mark
+    the cells it would see, move the robot there — and adds up each look's time. If the
+    cap is hit first, the time is extrapolated at the rate reached so far. Returns
+    (seconds, looks, fraction covered); seconds is inf if no look sees anything.
+    """
+    targets = targets.copy()
+    total = int(np.count_nonzero(targets))
+    if total == 0:
+        return 0.0, 0, 1.0
+    goal = goal_fraction * total
+    candidates = candidate_cells(grid, allowed, cost_ok,
+                                 spacing_m=ESTIMATE_CANDIDATE_SPACING_M)
+    seconds, covered, looks = 0.0, 0, 0
+    for _ in range(max_looks):
+        padded = PaddedGrids(targets, grid.occupied, table.pad)
+        best = plan_looks(grid, padded, table, candidates, robot, spans=spans,
+                          fov_rad=fov_rad, top_k=1, overhead_s=MEASURED_LOOK_STOP_S,
+                          lin_speed=MEASURED_LOOK_SPEED_MPS)
+        if not best:
+            break
+        vp = best[0]
+        full = PaddedGrids(targets, grid.occupied, table_full.pad)
+        rr, cc = look_cells(full, table_full, vp.row, vp.col, vp.heading, vp.span, fov_rad)
+        if rr.size == 0:
+            break
+        targets[rr, cc] = False
+        covered += int(rr.size)
+        seconds += vp.time_s
+        looks += 1
+        robot = (vp.x, vp.y, vp.heading + vp.span)
+        if covered >= goal:
+            break
+    if covered == 0:
+        return math.inf, 0, 0.0
+    if covered < goal:
+        seconds *= goal / covered
+    return seconds, looks, covered / total
 
 
 def order_open_tour(start, points):

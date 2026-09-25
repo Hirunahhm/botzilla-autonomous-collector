@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # timed_run.sh — one hardware run with a fixed timer.
 #
-#   tools/timed_run.sh LABEL MINUTES [run_full_mission.sh args...]
+#   tools/timed_run.sh LABEL MINUTES [--collect] [run_full_mission.sh args...]
 #   tools/timed_run.sh heats 5 --strategy heats
+#   tools/timed_run.sh heats_full 15 --collect --strategy heats
 #
-# Starts run_full_mission.sh (--yes --detect-only --metrics are always added), waits for
+# Starts run_full_mission.sh (--yes --metrics always added, and --detect-only unless
+# --collect is given: with --collect the robot chases, collects and delivers cubes to
+# HOME — the full mission cycle), waits for
 # the executor to latch HOME, runs MINUTES from that moment, then stops the stack with
 # SIGTERM. SIGINT would not work: a script started in the background ignores it, which
 # once left the robot exploring three minutes past its timer. The run directory is found
@@ -12,9 +15,11 @@
 # timestamped ones by name.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL=$1; MINUTES=$2; shift 2
+MODE=(--detect-only)
+if [ "${1:-}" = "--collect" ]; then MODE=(); shift; fi
 cd "$REPO"
 before=$(ls -1t run_logs | head -1)
-setsid ./run_full_mission.sh --yes --detect-only --metrics "$@" \
+setsid ./run_full_mission.sh --yes "${MODE[@]}" --metrics "$@" \
     > "/tmp/timed_run_$LABEL.out" 2>&1 &
 MPID=$!
 for _ in $(seq 1 60); do

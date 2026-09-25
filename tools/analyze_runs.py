@@ -19,8 +19,21 @@ Arms are labelled from run_config.json: the strategy (and inspection mode for
 'region'), or for 'sweep' the policy — e.g. region/mixed, heats, camera_greedy,
 sweep/exhaustion (arm B), sweep/area (arm C).
 
+Full-cycle runs (collection on, `timed_run.sh --collect`) also report the cubes
+DELIVERED to HOME within the budget, the time of each delivery, and how many chases were
+started (entries into TARGETING).
+
+Offline ground truth (--layout FILE): a layout measured AFTER the runs can still be
+applied, because every run records the robot pose at 10 Hz, every detection with its
+map position, and the final map (map_final.npz). With --layout, inspected and detected
+times are recomputed from those records with the same geometry the metrics node uses
+(swept_mask.is_in_frustum + has_line_of_sight on the final map; detections matched with
+cube_detections.match_detection). Valid only if HOME and the cubes were in the same
+places in every run — the map frame is the start pose.
+
 Usage:
   tools/analyze_runs.py run_logs                       # every run under run_logs/
+  tools/analyze_runs.py run_logs --all --layout layouts/lab.yaml   # offline ground truth
   tools/analyze_runs.py run_logs --since 20261001      # only runs from a date on
   tools/analyze_runs.py run_logs --csv runs.csv        # also write one row per run
   tools/analyze_runs.py run_logs --reference region/mixed   # rank tests vs this arm
@@ -43,6 +56,58 @@ except ImportError:   # the summary still works; only the p-values need scipy
     stats = None
 
 CHECKPOINTS_MIN = (5, 10, 15)
+
+# The pure geometry helpers live in the workspace package; import them from source so
+# this script runs without sourcing ROS.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                                'botzilla_Workspace', 'src', 'botzilla_navigation'))
+
+
+def load_layout(path):
+    """[(id, x, y), ...] from a layout YAML (same format mission_metrics_node reads)."""
+    import yaml
+    with open(path) as fh:
+        doc = yaml.safe_load(fh) or {}
+    return [(e.get('id', i + 1), float(e['x']), float(e['y']))
+            for i, e in enumerate(doc.get('cubes') or [])]
+
+
+def offline_ground_truth(run_dir, records, layout, t0, t_end):
+    """Inspected / detected times per cube, recomputed from the logs — see docstring."""
+    from botzilla_navigation.cube_detections import match_detection
+    from botzilla_navigation.swept_mask import has_line_of_sight, is_in_frustum
+    import numpy as np
+    start = next((r for r in records if r.get('type') == 'run_start'), {})
+    half_fov = start.get('camera_half_fov_rad', 0.497)
+    max_r = start.get('camera_mark_range_m', 1.0)
+    min_r = start.get('camera_min_range_m', 0.48)
+    grid = None
+    map_path = os.path.join(run_dir, 'map_final.npz')
+    if os.path.isfile(map_path):
+        z = np.load(map_path)
+        m = z['map']
+        grid = (m.ravel().tolist(), m.shape[1], m.shape[0], float(z['resolution']),
+                float(z['origin_x']), float(z['origin_y']))
+    inspected, detected = {}, {}
+    for r in records:
+        if r.get('type') != 'pose' or not t0 <= r['t'] <= t_end:
+            continue
+        for cid, cx, cy in layout:
+            if cid in inspected:
+                continue
+            if not is_in_frustum(r['x'], r['y'], r['yaw'], cx, cy, half_fov, max_r, min_r):
+                continue
+            if grid is not None and not has_line_of_sight(*grid, r['x'], r['y'], cx, cy):
+                continue
+            inspected[cid] = r['t'] - t0
+    for r in records:
+        if (r.get('type') != 'cube_detected' or not t0 <= r['t'] <= t_end
+                or not r.get('in_range') or r.get('map_x') is None):
+            continue
+        cid, _ = match_detection(r['map_x'], r['map_y'], layout)
+        if cid is not None and cid not in detected:
+            detected[cid] = r['t'] - t0
+    return inspected, detected
 
 
 def load_run(path):
@@ -83,10 +148,10 @@ def wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
-def analyze(config, records, budget_s):
+def analyze(config, records, budget_s, layout=None, run_dir=None):
     """Metrics for one run — see module docstring."""
     start = next((r for r in records if r.get('type') == 'run_start'), {})
-    cube_count = start.get('cube_count') or 0
+    cube_count = len(layout) if layout else (start.get('cube_count') or 0)
     t0 = next((r['t'] for r in records
                if r.get('type') == 'state' and r.get('state') == 'EXPLORING'), None)
     if t0 is None:
@@ -97,10 +162,26 @@ def analyze(config, records, budget_s):
     def within(r):
         return t0 <= r['t'] <= t_end
 
-    inspected = {r['cube_id']: r['t'] - t0 for r in records
-                 if r.get('type') == 'cube_inspected' and within(r)}
-    detected = {r['cube_id']: r['t'] - t0 for r in records
-                if r.get('type') == 'cube_first_detected' and within(r)}
+    if layout:
+        inspected, detected = offline_ground_truth(run_dir, records, layout, t0, t_end)
+    else:
+        inspected = {r['cube_id']: r['t'] - t0 for r in records
+                     if r.get('type') == 'cube_inspected' and within(r)}
+        detected = {r['cube_id']: r['t'] - t0 for r in records
+                    if r.get('type') == 'cube_first_detected' and within(r)}
+
+    # Full-cycle runs: deliveries to HOME (delivered count increments) and chases started.
+    deliveries, chases, prev_delivered, prev_state = [], 0, 0, None
+    for r in records:
+        if r.get('type') != 'state' or 'state' not in r:
+            continue
+        if within(r):
+            if r['state'] == 'TARGETING' and prev_state != 'TARGETING':
+                chases += 1
+            if r.get('delivered', 0) > prev_delivered:
+                deliveries.append(round(r['t'] - t0, 1))
+        prev_delivered = max(prev_delivered, r.get('delivered', 0))
+        prev_state = r['state']
     false_det = sum(1 for r in records if r.get('type') == 'cube_detected' and within(r)
                     and r.get('in_range') and r.get('cube_id') is None and cube_count)
 
@@ -160,6 +241,10 @@ def analyze(config, records, budget_s):
         'stalls': stalls,
         'looks': looks,
         'false_detections': false_det,
+        'collect': not config.get('detect_only', False),
+        'delivered': len(deliveries),
+        'delivery_times_s': deliveries,
+        'chases': chases,
         'battery_start_v': battery,
     }
 
@@ -178,7 +263,7 @@ SUMMARY_COLUMNS = (
     ('coverage_5min', 'cov 5m'), ('coverage_10min', 'cov 10m'),
     ('coverage_15min', 'cov 15m'), ('coverage_auc_pct', 'cov AUC'),
     ('distance_m', 'dist m'), ('turning_deg', 'turn deg'), ('stalls', 'stalls'),
-    ('false_detections', 'false det'),
+    ('false_detections', 'false det'), ('delivered', 'delivered'), ('chases', 'chases'),
 )
 
 
@@ -230,6 +315,8 @@ def main(argv=None):
     ap.add_argument('--csv', help='write one row per run to this file')
     ap.add_argument('--reference', default='region/mixed',
                     help='arm the rank tests compare against')
+    ap.add_argument('--layout', help='cube layout YAML measured after the runs (offline '
+                                     'inspected/detected times; see module docstring)')
     args = ap.parse_args(argv)
 
     run_dirs = []
@@ -248,7 +335,8 @@ def main(argv=None):
             continue
         config, records = loaded
         config['_dir'] = os.path.basename(os.path.normpath(d))
-        row = analyze(config, records, args.budget_min * 60.0)
+        row = analyze(config, records, args.budget_min * 60.0,
+                      layout=load_layout(args.layout) if args.layout else None, run_dir=d)
         if row['counted'] or args.all:
             rows.append(row)
         else:
@@ -263,12 +351,14 @@ def main(argv=None):
 
     print('## Runs\n')
     print('| run | arm | layout | min | inspected % | detected % | cov 15m | AUC | '
-          'stalls | counted |')
-    print('|---|---|---|---|---|---|---|---|---|---|')
+          'stalls | delivered | counted |')
+    print('|---|---|---|---|---|---|---|---|---|---|---|')
     for r in rows:
         print(f"| {r['run']} | {r['arm']} | {r['layout'] or '—'} | {r['duration_min']} | "
               f"{r['inspected_pct']} | {r['detected_pct']} | {r['coverage_15min']} | "
-              f"{r['coverage_auc_pct']} | {r['stalls']} | {'yes' if r['counted'] else 'no'} |")
+              f"{r['coverage_auc_pct']} | {r['stalls']} | "
+              f"{r['delivered'] if r['collect'] else '—'} | "
+              f"{'yes' if r['counted'] else 'no'} |")
     print_summary(rows, args.reference)
 
     if args.csv:
