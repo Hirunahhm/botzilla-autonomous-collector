@@ -75,6 +75,7 @@ from geometry_msgs.msg import Point, PointStamped, Twist
 from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
@@ -168,6 +169,31 @@ MAX_ANGULAR_ACCEL = 1.5     # rad/s^2 -> 0 to MAX_ANGULAR in ~0.25s
 # ── Delivery ─────────────────────────────────────────────────────────────────
 # Generous: the route home can span the whole arena and Nav2 may run recoveries.
 DELIVERY_TIMEOUT_S = 300.0
+# Delivery progress watchdog. If the robot gets no closer to HOME by at least
+# DELIVERY_PROGRESS_M for DELIVERY_NO_PROGRESS_S, the HOME goal is cancelled and the
+# cube released here, exactly like a failed delivery. Needed because the total timeout
+# above is a poor backstop: in run_logs/20260926-151617 the carrying tree's recovery
+# spin was refused ("Collision Ahead") at 330 s and bt_navigator then never finished the
+# goal: no abort, no new path, no result. The robot sat holding the cube for over
+# 200 s until the run was stopped by hand, and the 300 s timeout would have waited
+# until 609 s. 45 s leaves room for a normal replan plus one spin recovery.
+DELIVERY_NO_PROGRESS_S = 45.0
+DELIVERY_PROGRESS_M = 0.15
+
+# Per-spot limit on cubes the robot cannot collect. A spot where a cube has failed
+# SPOT_FAIL_LIMIT times (a chase lost while targeting/approaching, or a cube released
+# short of HOME) within SPOT_FAIL_RADIUS_M is ignored for SPOT_SUPPRESS_S: detections
+# projected there do not start a new chase. Without it one uncollectable cube can take
+# minutes: run_logs/20260926-153034 chased and lost the same two spots 17 times in the
+# last 4.5 minutes, and run_logs/20260926-190103 captured the same wedged cube 4 times
+# (released each time by the delivery watchdog) over ~4 minutes. After SPOT_SUPPRESS_S the
+# spot is cleared, so the cube can be tried again from a different approach.
+SPOT_FAIL_RADIUS_M = 0.5
+SPOT_FAIL_LIMIT = 2
+SPOT_SUPPRESS_S = 180.0
+# A held cube sits between the arms, about this far ahead of base_link; used to place a
+# release short of HOME.
+HELD_CUBE_OFFSET_M = 0.3
 HOME_TF_WAIT_S = 60.0       # how long to wait at STARTUP for map->base_link
 
 # nav2_params.yaml's FollowPath.min_vel_x is deliberately -0.10 (not 0.0) so DWB can
@@ -244,12 +270,25 @@ class ExecutorNode(Node):
         self._phase_start = self.get_clock().now()
         self._startup_start = self.get_clock().now()
         self._cubes_delivered = 0
+        # Only a cube released AT HOME counts as delivered. A cube released short of HOME
+        # (route failed, delivery watchdog, timeout) is counted here instead: before this,
+        # every release was counted as a delivery, which in run_logs/20260926-155118
+        # counted one cube twice (released 5.2 m from HOME by the watchdog, then picked
+        # up and delivered again).
+        self._cubes_released_short = 0
+        self._delivery_arrived = False
+        # Per-spot failure memory — see SPOT_FAIL_LIMIT. Each entry is
+        # [x, y, failures, suppressed_until (rclpy Time) or None].
+        self._failed_spots = []
         self._last_cmd_linear = 0.0   # for slew-limiting, see MAX_LINEAR_ACCEL
         self._last_cmd_angular = 0.0
 
         self._nav_goal_handle = None
         self._nav_result = None      # None while in flight; GoalStatus once finished
         self._nav_sent_time = None
+        # Delivery progress watchdog — see DELIVERY_NO_PROGRESS_S.
+        self._home_best_dist = None
+        self._home_progress_time = None
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -326,6 +365,16 @@ class ExecutorNode(Node):
             return
         if msg.z > self._cube_max_range_m:
             return
+        if self._state == State.EXPLORING and msg.z > 0.0:
+            spot = self._detection_position(msg)
+            if spot is not None and self._spot_suppressed(*spot):
+                self.get_logger().info(
+                    f'Cube detected at ({spot[0]:.2f}, {spot[1]:.2f}), a spot that failed '
+                    f'{SPOT_FAIL_LIMIT} times recently; not chasing it (see '
+                    f'SPOT_FAIL_LIMIT).',
+                    throttle_duration_sec=5.0,
+                )
+                return
         if self._detect_only:
             # Never chase. The detection is recorded by mission_metrics_node straight
             # off /detected_cube; exploration carries on untouched.
@@ -510,6 +559,7 @@ class ExecutorNode(Node):
             self._nav_result = None
             self._nav_goal_handle = None
             if status == GoalStatus.STATUS_SUCCEEDED:
+                self._delivery_arrived = True
                 self._transition(State.DETACHING, 'Arrived HOME.')
             else:
                 # Releasing here is deliberate. The robot is somewhere short of HOME,
@@ -529,6 +579,32 @@ class ExecutorNode(Node):
         if self._nav_sent_time is None:
             return
         elapsed = (now - self._nav_sent_time).nanoseconds / 1e9
+
+        pose = self._get_robot_pose()
+        if pose is not None and self._home is not None:
+            dist = math.hypot(pose[0] - self._home[0], pose[1] - self._home[1])
+            if (self._home_best_dist is None
+                    or dist < self._home_best_dist - DELIVERY_PROGRESS_M):
+                self._home_best_dist = dist
+                self._home_progress_time = now
+        stuck_s = (
+            (now - self._home_progress_time).nanoseconds / 1e9
+            if self._home_progress_time is not None else 0.0
+        )
+        if stuck_s > DELIVERY_NO_PROGRESS_S:
+            away = f'{self._home_best_dist:.2f}m' if self._home_best_dist is not None else '?'
+            self.get_logger().warn(
+                f'No progress towards HOME for {stuck_s:.0f}s (still {away} away); '
+                f'cancelling the delivery and releasing the cube here rather than '
+                f'waiting on Nav2.'
+            )
+            if self._nav_goal_handle is not None:
+                self._nav_goal_handle.cancel_goal_async()
+                self._nav_goal_handle = None
+            self._nav_sent_time = None
+            self._transition(State.DETACHING, 'Delivery made no progress; releasing.')
+            return
+
         if elapsed > DELIVERY_TIMEOUT_S:
             self.get_logger().warn(
                 f'Delivery exceeded {DELIVERY_TIMEOUT_S:.0f}s; giving up on the route '
@@ -553,10 +629,18 @@ class ExecutorNode(Node):
         if elapsed - DETACH_SETTLE_S < DETACH_TIME_S:
             cmd.linear.x = DETACH_SPEED
             return
-        self._cubes_delivered += 1
-        self.get_logger().info(
-            f'Cube released. Total delivered: {self._cubes_delivered}.'
-        )
+        if self._delivery_arrived:
+            self._cubes_delivered += 1
+            self.get_logger().info(
+                f'Cube released at HOME. Total delivered: {self._cubes_delivered}.'
+            )
+        else:
+            self._cubes_released_short += 1
+            self.get_logger().info(
+                f'Cube released short of HOME (not counted as delivered). Delivered: '
+                f'{self._cubes_delivered}, released short: {self._cubes_released_short}.'
+            )
+        self._delivery_arrived = False
         self._resume_exploring('Delivery complete.')
 
     # ------------------------------------------------------------------ #
@@ -588,6 +672,9 @@ class ExecutorNode(Node):
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self._nav_sent_time = self.get_clock().now()
+        self._delivery_arrived = False
+        self._home_best_dist = None
+        self._home_progress_time = self._nav_sent_time
         self.get_logger().info(f'Sending NavigateToPose to HOME ({x:.2f}, {y:.2f}).')
         self._nav_client.send_goal_async(goal).add_done_callback(self._goal_response_cb)
 
@@ -651,10 +738,46 @@ class ExecutorNode(Node):
         x, y, yaw = pose
         self._cube_world_estimate = project_detection(x, y, yaw, msg.x, msg.z)
 
+    def _detection_position(self, msg: Point):
+        """Map-frame (x, y) of a ranged detection from the current pose, or None."""
+        pose = self._get_robot_pose()
+        if pose is None:
+            return None
+        return project_detection(pose[0], pose[1], pose[2], msg.x, msg.z)
+
+    def _note_failed_spot(self, x, y, why):
+        """Count a failure at (x, y); suppress the spot at SPOT_FAIL_LIMIT failures."""
+        now = self.get_clock().now()
+        for spot in self._failed_spots:
+            if math.hypot(spot[0] - x, spot[1] - y) < SPOT_FAIL_RADIUS_M:
+                break
+        else:
+            spot = [x, y, 0, None]
+            self._failed_spots.append(spot)
+        spot[2] += 1
+        if spot[2] >= SPOT_FAIL_LIMIT and spot[3] is None:
+            spot[3] = now + Duration(seconds=SPOT_SUPPRESS_S)
+            self.get_logger().warn(
+                f'{spot[2]} failures near ({spot[0]:.2f}, {spot[1]:.2f}) (latest: {why}); '
+                f'ignoring detections there for {SPOT_SUPPRESS_S:.0f}s.'
+            )
+
+    def _spot_suppressed(self, x, y):
+        """True if (x, y) lies in a currently suppressed spot; clears expired ones."""
+        now = self.get_clock().now()
+        for spot in self._failed_spots:
+            if spot[3] is not None and now >= spot[3]:
+                spot[2], spot[3] = 0, None   # expired: give the cube another chance
+        return any(
+            spot[3] is not None and math.hypot(spot[0] - x, spot[1] - y) < SPOT_FAIL_RADIUS_M
+            for spot in self._failed_spots
+        )
+
     def _publish_cube_abandoned(self):
         """Tell frontier_explorer_node where a cube we failed to collect still is."""
         if self._cube_world_estimate is None:
             return
+        self._note_failed_spot(*self._cube_world_estimate, 'chase lost')
         out = PointStamped()
         out.header.frame_id = MAP_FRAME
         out.header.stamp = self.get_clock().now().to_msg()
@@ -687,6 +810,15 @@ class ExecutorNode(Node):
         self._last_cmd_angular = 0.0
         if new_state in (State.TARGETING, State.APPROACHING):
             self._blind_spot_frames = 0
+        if new_state == State.DETACHING and not self._delivery_arrived:
+            # Released short of HOME: the cube stays where the arms are now.
+            pose = self._get_robot_pose()
+            if pose is not None:
+                self._note_failed_spot(
+                    pose[0] + HELD_CUBE_OFFSET_M * math.cos(pose[2]),
+                    pose[1] + HELD_CUBE_OFFSET_M * math.sin(pose[2]),
+                    'released short of HOME',
+                )
         if new_state == State.DETACHING:
             # Covers every DELIVERING exit (arrived, failed, timed out) uniformly,
             # and is a harmless no-op on paths that never lowered it in the first
@@ -721,7 +853,8 @@ class ExecutorNode(Node):
         )
         self._status_pub.publish(String(data=(
             f'state={self._state} home={home} cube={cube} '
-            f'delivered={self._cubes_delivered}'
+            f'delivered={self._cubes_delivered} '
+            f'released_short={self._cubes_released_short}'
         )))
 
 
