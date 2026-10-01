@@ -209,6 +209,39 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
+    # ------------------------------------------------------------------ #
+    # 7. pointcloud_to_laserscan — Gazebo's rgbd_camera already publishes
+    #    /camera/points natively (bridged above), so sim only needs this
+    #    node, not depth_image_proc. Crushes it into a virtual 2D scan on
+    #    /scan_camera, height-filtered to 0.05m-0.30m — matches hardware.launch.py
+    #    exactly so the same nav2 costmap config (scan_camera observation
+    #    source) works unchanged in both. See hardware.launch.py's docstring
+    #    for the height-band reasoning.
+    # ------------------------------------------------------------------ #
+    pointcloud_to_laserscan = Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        output='screen',
+        remappings=[
+            ('cloud_in', '/camera/points'),
+            ('scan', '/scan_camera'),
+        ],
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'target_frame': 'base_link',
+            'transform_tolerance': 0.01,
+            'min_height': 0.05,
+            'max_height': 0.30,
+            'angle_min': -0.5,
+            'angle_max': 0.5,
+            'range_min': 0.55,
+            'range_max': 3.0,
+            'use_inf': True,
+            'inf_epsilon': 1.0,
+        }],
+    )
+
     return LaunchDescription([
         gz_headless_arg,
         use_sim_time_arg,
@@ -222,4 +255,5 @@ def generate_launch_description():
         odom_covariance_relay,
         ekf_node,
         yolo_node,
+        pointcloud_to_laserscan,
     ])

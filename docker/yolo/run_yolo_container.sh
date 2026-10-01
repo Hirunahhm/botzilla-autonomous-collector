@@ -56,6 +56,7 @@ exec docker run --rm "${TTY_FLAGS[@]}" \
     -e FASTRTPS_DEFAULT_PROFILES_FILE=/fastdds_udp_only.xml \
     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
     -e RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}" \
+    -e ROS_DISCOVERY_SERVER="${ROS_DISCOVERY_SERVER:-}" \
     -v "${REPO_ROOT}:${REPO_ROOT}" \
     -v "${WS}:/ws" \
     -w "${REPO_ROOT}" \

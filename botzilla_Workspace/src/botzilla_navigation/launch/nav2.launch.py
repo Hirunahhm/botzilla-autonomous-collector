@@ -55,6 +55,20 @@ from launch_ros.actions import Node
 
 SIM_PARAMS_FILENAME = 'nav2_params_sim.yaml'
 
+# velocity_smoother collapses an opposing command smaller than its reversal deadband to
+# zero, on the reasoning that the physical base could not have executed it anyway (measured
+# mechanical deadband: 0.009 m/s, 0.121 rad/s). Simulation has no such deadband, so those
+# same commands ARE executable there and discarding them deadlocks the robot: DWB emits
+# alternating +/-0.021 rad/s heading corrections, every one is collapsed, the robot never
+# turns, and the correction never stops being needed. Confirmed live in Gazebo with 2.37 m
+# of clear floor ahead and zero ObstacleFootprint vetoes — the robot simply stops.
+#
+# Near-zero rather than exactly zero: the reversal-confirmation path (3 cycles) is still
+# wanted for genuine direction changes, and only the "too small to be real intent"
+# shortcut needs disabling. Hardware keeps the node's own defaults.
+SIM_REVERSAL_DEADBAND_X = 0.002       # m/s
+SIM_REVERSAL_DEADBAND_THETA = 0.005   # rad/s
+
 
 def _resolve_param_files(context):
     """Build the ordered params list, appending the sim overlay when running on sim time.
@@ -78,6 +92,9 @@ def _launch_nav2(context, *_args, **_kwargs):
     param_files, use_sim_time = _resolve_param_files(context)
     autostart = LaunchConfiguration('autostart')
     params = param_files + [{'use_sim_time': use_sim_time}]
+    collision_monitor = (
+        LaunchConfiguration('collision_monitor').perform(context).lower() == 'true'
+    )
 
     lifecycle_nodes = [
         'controller_server',
@@ -96,9 +113,26 @@ def _launch_nav2(context, *_args, **_kwargs):
     # planner_server/bt_navigator publish no velocity, so remapping them is harmless but
     # pointless — keep the remap targeted so the topic graph stays readable.
     velocity_publishers = {'controller_server', 'behavior_server'}
+    # Recovery order: BackUp before Spin. Set here rather than in nav2_params.yaml
+    # because the value has to be an absolute path, which only resolves at launch.
+    # Scoped to bt_navigator alone for the same reason the cmd_vel remap is scoped —
+    # keep per-node settings off nodes that have no use for them.
+    #
+    # Without this, bt_navigator falls back to nav2's built-in tree and the reorder
+    # reaches almost nothing: in run 18, 32 of 41 goals (78%) went through the DEFAULT
+    # tree, and only 9 through navigate_to_pose_sweep_straight.xml. See that file and
+    # navigate_to_pose_backup_first.xml for why Spin-first is wrong on this robot.
+    default_bt = os.path.join(
+        get_package_share_directory('botzilla_navigation'),
+        'behavior_trees', 'navigate_to_pose_backup_first.xml',
+    )
     nodes = [
         Node(
-            package=pkg, executable=exe, name=exe, output='screen', parameters=params,
+            package=pkg, executable=exe, name=exe, output='screen',
+            parameters=(
+                params + [{'default_nav_to_pose_bt_xml': default_bt}]
+                if exe == 'bt_navigator' else params
+            ),
             remappings=([('cmd_vel', 'cmd_vel_nav')] if exe in velocity_publishers else []),
         )
         for pkg, exe in servers
@@ -121,13 +155,42 @@ def _launch_nav2(context, *_args, **_kwargs):
     # Deliberately not a lifecycle node: it must be transporting velocity before and after
     # the managed nodes transition, and adding it to lifecycle_nodes would make the whole
     # navigation bringup fail if it were absent.
+    # Reversal deadbands are overridden ONLY on sim time — see SIM_REVERSAL_DEADBAND_*.
+    # On hardware the parameters are left unset so the node's own measured defaults apply.
+    smoother_params = {'use_sim_time': use_sim_time}
+    if use_sim_time:
+        smoother_params['reversal_deadband_x'] = SIM_REVERSAL_DEADBAND_X
+        smoother_params['reversal_deadband_theta'] = SIM_REVERSAL_DEADBAND_THETA
+    # With the collision monitor enabled it is spliced in ahead of the smoother, so the
+    # smoother's input moves from 'cmd_vel_nav' to the monitor's checked output. With it
+    # disabled nothing is remapped and the chain is exactly as it was.
+    smoother_remaps = [('cmd_vel_nav', 'cmd_vel_safe')] if collision_monitor else []
     nodes.append(Node(
         package='botzilla_control',
         executable='velocity_smoother',
         name='velocity_smoother',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
+        parameters=[smoother_params],
+        remappings=smoother_remaps,
     ))
+
+    # COLLISION MONITOR (opt-in): 'cmd_vel_nav' -> 'cmd_vel_safe'. See
+    # config/collision_monitor.yaml for why it is off by default and what it guards
+    # against — chiefly that the arms stop the bumpers from ever triggering, so without
+    # it nothing checks for contact independently of the costmap.
+    if collision_monitor:
+        monitor_params = os.path.join(
+            get_package_share_directory('botzilla_navigation'),
+            'config', 'collision_monitor.yaml',
+        )
+        nodes.append(Node(
+            package='nav2_collision_monitor',
+            executable='collision_monitor',
+            name='collision_monitor',
+            output='screen',
+            parameters=[monitor_params, {'use_sim_time': use_sim_time}],
+        ))
+        lifecycle_nodes.append('collision_monitor')
 
     nodes.append(Node(
         package='nav2_lifecycle_manager',
@@ -166,10 +229,20 @@ def generate_launch_description():
         default_value='true',
         description='Automatically bring the lifecycle nodes up to the active state',
     )
+    collision_monitor_arg = DeclareLaunchArgument(
+        'collision_monitor',
+        default_value='false',
+        description=(
+            'Splice nav2_collision_monitor into the cmd_vel chain as an independent, '
+            'scan-based stop before contact. Off by default: it changes the chain that '
+            "this file's docstring records a third-party node silently breaking."
+        ),
+    )
 
     return LaunchDescription([
         use_sim_time_arg,
         params_file_arg,
         autostart_arg,
+        collision_monitor_arg,
         OpaqueFunction(function=_launch_nav2),
     ])

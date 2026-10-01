@@ -187,6 +187,22 @@ class KinectBridge(Node):
                 return
             stamp = self.latest_depth_stamp.to_msg()
 
+            # Also republish camera_info stamped to the DEPTH frame, not just the RGB
+            # frame above. depth_image_proc's PointCloudXyzNode (used to build a virtual
+            # 2D scan from depth for low-obstacle detection) uses image_transport's
+            # CameraSubscriber, which exact-time-synchronizes image+camera_info with no
+            # approximate/slop option — confirmed live: 0 synchronized pairs the whole
+            # time camera_info only carried the RGB stamp, despite both topics flowing.
+            # camera_info's content is static regardless of which stamp it carries, so
+            # publishing it twice (once per RGB frame, once per depth frame) costs
+            # nothing and satisfies both consumers: RTAB-Map's approx_sync (which
+            # doesn't care which nearby stamp it gets) and this exact-sync one (which
+            # does).
+            if self.publisher_camera_info.get_subscription_count() > 0:
+                self._camera_info_msg.header.stamp = stamp
+                self._camera_info_msg.header.frame_id = CAMERA_OPTICAL_FRAME
+                self.publisher_camera_info.publish(self._camera_info_msg)
+
             if self.publisher_depth.get_subscription_count() > 0:
                 msg = Image()
                 msg.header.stamp = stamp

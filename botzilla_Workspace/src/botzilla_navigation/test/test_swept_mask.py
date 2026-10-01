@@ -1,0 +1,274 @@
+"""
+test_swept_mask.py.
+
+Pure pytest for botzilla_navigation.swept_mask — no ROS imports, runnable directly with
+`python3 -m pytest` without sourcing a ROS environment.
+"""
+
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from botzilla_navigation.swept_mask import (  # noqa: E402,I100
+    build_coverage_cost_data,
+    build_coverage_grid_data,
+    CAMERA_MIN_RANGE_M,
+    count_unswept_free,
+    create_swept_mask,
+    has_line_of_sight,
+    mark_swept_cells,
+    mark_world_point_swept,
+    resize_swept_mask,
+    should_trigger_sweep,
+    unmark_discs,
+)
+
+
+def test_create_swept_mask_all_false():
+    mask = create_swept_mask(5, 4)
+    assert len(mask) == 20
+    assert all(cell is False for cell in mask)
+
+
+def test_mark_swept_cells_marks_cell_dead_ahead_within_range():
+    width, height, resolution = 21, 21, 1.0
+    mask = create_swept_mask(width, height)
+    # Robot at the center of cell (row=10, col=10), facing +x (yaw=0).
+    robot_x, robot_y = 10.5, 10.5
+    marked = mark_swept_cells(
+        mask, width, height, resolution, 0.0, 0.0, robot_x, robot_y, 0.0
+    )
+    assert marked > 0
+    # Cell (row=10, col=11) is 1.0m straight ahead — within range and dead-center of FOV.
+    assert mask[10 * width + 11] is True
+
+
+def test_mark_swept_cells_respects_range_cap():
+    width, height, resolution = 21, 21, 1.0
+    mask = create_swept_mask(width, height)
+    robot_x, robot_y = 10.5, 10.5
+    mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, robot_x, robot_y, 0.0)
+    # Cell (row=10, col=12) is 2.0m straight ahead — beyond CAMERA_MARK_RANGE_M (1.0m).
+    assert mask[10 * width + 12] is False
+
+
+def test_mark_swept_cells_respects_fov_cap():
+    width, height, resolution = 21, 21, 1.0
+    mask = create_swept_mask(width, height)
+    robot_x, robot_y = 10.5, 10.5
+    mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, robot_x, robot_y, 0.0)
+    # Cell (row=11, col=10) is 1.0m directly to the side (90 deg off heading) — within
+    # range but well outside +/- CAMERA_HALF_FOV_RAD (~28.5 deg).
+    assert mask[11 * width + 10] is False
+
+
+def test_mark_swept_cells_returns_newly_marked_count():
+    width, height, resolution = 21, 21, 1.0
+    mask = create_swept_mask(width, height)
+    marked = mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, 10.5, 10.5, 0.0)
+    assert marked == sum(1 for cell in mask if cell)
+    # A second call over the same pose marks nothing new — every qualifying cell is
+    # already True.
+    marked_again = mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, 10.5, 10.5, 0.0)
+    assert marked_again == 0
+
+
+def test_mark_swept_cells_heading_rotates_the_wedge():
+    # Same geometry as the "dead ahead" test, but facing +y (yaw=pi/2) instead of +x —
+    # the cell that was dead ahead before should now be a 90 deg side cell (unmarked),
+    # and the cell above the robot should be the one marked instead.
+    width, height, resolution = 21, 21, 1.0
+    mask = create_swept_mask(width, height)
+    mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, 10.5, 10.5, math.pi / 2.0)
+    assert mask[10 * width + 11] is False  # +x cell, now to the side
+    assert mask[11 * width + 10] is True   # +y cell, now dead ahead
+
+
+def test_mark_world_point_swept_marks_exactly_one_cell():
+    width, height, resolution = 5, 5, 1.0
+    mask = create_swept_mask(width, height)
+    mark_world_point_swept(mask, width, height, resolution, 0.0, 0.0, 2.5, 3.5)
+    assert mask[3 * width + 2] is True
+    assert sum(1 for cell in mask if cell) == 1
+
+
+def test_mark_world_point_swept_out_of_bounds_is_a_no_op():
+    width, height, resolution = 5, 5, 1.0
+    mask = create_swept_mask(width, height)
+    mark_world_point_swept(mask, width, height, resolution, 0.0, 0.0, 500.0, 500.0)
+    assert sum(1 for cell in mask if cell) == 0
+
+
+def test_resize_swept_mask_relocates_cell_across_asymmetric_origin_shift():
+    old_width, old_height, resolution = 3, 3, 1.0
+    old_origin_x, old_origin_y = 0.0, 0.0
+    old_mask = create_swept_mask(old_width, old_height)
+    old_mask[1 * old_width + 1] = True  # world center (1.5, 1.5)
+
+    new_width, new_height = 5, 5
+    new_origin_x, new_origin_y = -1.0, -2.0  # shifted by different amounts per axis
+
+    new_mask = resize_swept_mask(
+        old_mask, old_width, old_height, resolution, old_origin_x, old_origin_y,
+        new_width, new_height, new_origin_x, new_origin_y,
+    )
+    # world (1.5, 1.5) in the new grid: col = int((1.5 - -1.0)/1.0) = 2,
+    # row = int((1.5 - -2.0)/1.0) = 3
+    assert new_mask[3 * new_width + 2] is True
+    assert sum(1 for cell in new_mask if cell) == 1
+
+
+def test_resize_swept_mask_no_change_is_identity():
+    width, height, resolution = 4, 4, 1.0
+    mask = create_swept_mask(width, height)
+    mask[2 * width + 1] = True
+    resized = resize_swept_mask(
+        mask, width, height, resolution, 0.0, 0.0, width, height, 0.0, 0.0
+    )
+    assert resized == mask
+
+
+def test_count_unswept_free():
+    # width=3, height=2. Row 0: free(0), occupied(100), unknown(-1).
+    # Row 1: free(50), free(0), occupied(100).
+    data = [0, 100, -1, 50, 0, 100]
+    mask = [True, False, False, False, True, False]
+    total_free, unswept_free = count_unswept_free(data, mask, 3, 2)
+    assert total_free == 3       # indices 0, 3, 4
+    assert unswept_free == 1     # index 3 only
+
+
+def test_should_trigger_sweep_threshold():
+    assert should_trigger_sweep(100, 20, 0.15) is True
+    assert should_trigger_sweep(100, 15, 0.15) is False  # exactly at threshold, not over
+    assert should_trigger_sweep(100, 10, 0.15) is False
+    assert should_trigger_sweep(0, 0, 0.15) is False
+
+
+def test_build_coverage_grid_data():
+    # Same layout as test_count_unswept_free: width=3, height=2.
+    # Row 0: free(0), occupied(100), unknown(-1). Row 1: free(50), free(0), occupied(100).
+    data = [0, 100, -1, 50, 0, 100]
+    mask = [True, False, False, False, True, False]
+    grid = build_coverage_grid_data(data, mask, 3, 2)
+    assert grid == [
+        0, -1, -1,    # swept-free -> 0, occupied -> -1, unknown -> -1
+        100, 0, -1,   # un-swept-free -> 100, swept-free -> 0, occupied -> -1
+    ]
+
+
+def test_coverage_cost_zero_max_cost_is_all_zero():
+    data = [0] * 25
+    mask = [True] * 25
+    assert build_coverage_cost_data(data, mask, 5, 5, 1.0, 1.0, 0) == [0] * 25
+
+
+def test_coverage_cost_fully_swept_free_is_max_and_non_free_is_zero():
+    width, height = 5, 5
+    data = [0] * 25
+    data[12] = 100   # wall
+    data[0] = -1     # unknown
+    mask = [True] * 25
+    out = build_coverage_cost_data(data, mask, width, height, 1.0, 1.0, 15)
+    assert out[12] == 0
+    assert out[0] == 0
+    assert out[6] == 15
+    assert all(v in (0, 15) for v in out)
+
+
+def test_coverage_cost_unswept_is_zero_and_boundary_is_graded():
+    width, height = 10, 1
+    data = [0] * 10
+    mask = [col < 5 for col in range(10)]
+    out = build_coverage_cost_data(data, mask, width, height, 1.0, 1.0, 30)
+    assert out[0] == 30          # deep in swept region
+    assert out[9] == 0           # deep in un-swept region
+    assert out[4] == 20          # window cols 3..5: 2 of 3 swept
+    assert out[5] == 10          # window cols 4..6: 1 of 3 swept
+
+
+def test_coverage_cost_walls_do_not_dilute_denominator():
+    width, height = 3, 1
+    data = [100, 0, 100]
+    mask = [False, True, False]
+    out = build_coverage_cost_data(data, mask, width, height, 1.0, 1.0, 20)
+    assert out[1] == 20
+
+
+def test_unmark_discs_clears_only_within_radius_and_copies():
+    width, height = 11, 11
+    mask = [True] * (width * height)
+    out = unmark_discs(mask, width, height, 1.0, 0.0, 0.0, [(5.5, 5.5)], 1.0)
+    assert all(mask)                          # original untouched
+    assert out[5 * width + 5] is False        # centre
+    assert out[5 * width + 6] is False        # 1.0 m away, on the radius
+    assert out[6 * width + 6] is True         # 1.41 m diagonal, outside
+    assert out[5 * width + 7] is True         # 2.0 m away
+
+
+def test_unmark_discs_no_centers_returns_equal_copy():
+    mask = [True, False, True]
+    out = unmark_discs(mask, 3, 1, 1.0, 0.0, 0.0, [], 0.5)
+    assert out == mask and out is not mask
+
+
+# ── Blind ring and occlusion ────────────────────────────────────────────────
+
+
+def _open_grid(width, height):
+    return [0] * (width * height)
+
+
+def test_mark_swept_cells_skips_the_near_field_blind_ring():
+    """Floor closer than CAMERA_MIN_RANGE_M is below the image and must stay un-swept."""
+    width = height = 41
+    resolution = 0.05
+    mask = create_swept_mask(width, height)
+    # Robot at the centre of cell (20, 20), facing +x.
+    robot = (20.5 * resolution, 20.5 * resolution)
+    mark_swept_cells(mask, width, height, resolution, 0.0, 0.0, robot[0], robot[1], 0.0)
+    assert mask[20 * width + 25] is False   # 0.25 m ahead: inside the blind ring
+    assert mask[20 * width + 34] is True    # 0.70 m ahead: seen
+    assert CAMERA_MIN_RANGE_M == 0.48
+
+
+def test_line_of_sight_blocked_by_occupied_cell():
+    width = height = 21
+    resolution = 0.1
+    grid = _open_grid(width, height)
+    grid[10 * width + 15] = 100  # a wall cell 0.5 m ahead of the robot
+    assert not has_line_of_sight(grid, width, height, resolution, 0.0, 0.0,
+                                 1.05, 1.05, 1.85, 1.05)
+    # A parallel line one row up misses it.
+    assert has_line_of_sight(grid, width, height, resolution, 0.0, 0.0,
+                             1.05, 1.25, 1.85, 1.25)
+
+
+def test_line_of_sight_ignores_unknown_and_the_target_cell():
+    width = height = 21
+    resolution = 0.1
+    grid = _open_grid(width, height)
+    grid[10 * width + 14] = -1   # unknown on the way: does not block
+    grid[10 * width + 18] = 100  # the target cell itself is occupied (a cube, a wall)
+    assert has_line_of_sight(grid, width, height, resolution, 0.0, 0.0,
+                             1.05, 1.05, 1.85, 1.05)
+
+
+def test_mark_swept_cells_with_occupancy_leaves_the_shadow_unswept():
+    width = height = 41
+    resolution = 0.05
+    grid = _open_grid(width, height)
+    grid[20 * width + 32] = 100  # obstacle 0.6 m dead ahead
+    mask_open = create_swept_mask(width, height)
+    mask_occ = create_swept_mask(width, height)
+    args = (width, height, resolution, 0.0, 0.0, 20.5 * resolution, 20.5 * resolution, 0.0)
+    mark_swept_cells(mask_open, *args)
+    mark_swept_cells(mask_occ, *args, occupancy=grid)
+    behind = 20 * width + 37     # 0.85 m ahead, straight behind the obstacle
+    assert mask_open[behind] is True
+    assert mask_occ[behind] is False
+    assert sum(mask_occ) < sum(mask_open)
+    # Occlusion only ever removes cells.
+    assert all(o or not c for o, c in zip(mask_open, mask_occ))

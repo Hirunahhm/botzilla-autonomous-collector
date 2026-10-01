@@ -1,0 +1,73 @@
+<!--
+  Nav2's stock navigate_to_pose_w_replanning_and_recovery.xml with exactly one
+  change: the RecoveryActions RoundRobin tries BackUp BEFORE Spin, instead of
+  Spin -> Wait -> BackUp.
+
+  Why: this robot cannot pivot in a tight spot. The footprint's circumscribed
+  radius is sqrt(0.36^2 + 0.215^2) = 0.419 m, so an in-place turn needs 0.84 m of
+  clear DIAMETER — and that is dominated by the 0.36 m arm reach, not by the
+  footprint padding, so it cannot be tuned away. Measured live in run 18
+  (2026-09-06) at a deadlock: Spin aborted with "Collision Ahead - Exiting Spin"
+  5 times, while rear clearance was 0.934 m and the footprint reversed 0.30 m
+  scored cost 80 — comfortably drivable. Spin-first therefore spends two of the
+  three round-robin slots (Spin, then Wait) on manoeuvres the geometry forbids
+  before reaching the one that works.
+
+  Backing up also RELIEVES the geometry rather than fighting it: once the robot
+  has 0.30 m more room, the subsequent Spin has a chance of succeeding, so the
+  reorder makes the later slots more useful too.
+
+  Set as bt_navigator's default_nav_to_pose_bt_xml. That matters — in run 18,
+  32 of 41 goals (78%) used the DEFAULT tree, not the sweep tree, so reordering
+  only navigate_to_pose_sweep_straight.xml would have missed most of them.
+-->
+
+<!--
+  This Behavior Tree replans the global path periodically at 1 Hz and it also has
+  recovery actions specific to planning / control as well as general system issues.
+  This will be continuous if a kinematically valid planner is selected.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <Sequence>
+        <Fallback>
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+        </Fallback>
+        <ReactiveFallback name="RecoveryFallback">
+          <GoalUpdated/>
+          <RoundRobin name="RecoveryActions">
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <BackUp backup_dist="0.30" backup_speed="0.15" error_code_id="{backup_code_id}"/>
+            <Spin spin_dist="1.57" error_code_id="{spin_error_code}"/>
+            <Wait wait_duration="5.0"/>
+          </RoundRobin>
+        </ReactiveFallback>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

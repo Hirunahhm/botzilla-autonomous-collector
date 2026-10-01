@@ -17,7 +17,11 @@ cycle, and what RTAB-Map does with it.
 
 Usage:
   mkdir -p /tmp/claude-1000/hwtest
-  ros2 launch botzilla_bringup hardware_debug.launch.py serial_port:=/dev/ttyUSB0 lidar_port:=/dev/ttyUSB1
+  ros2 launch botzilla_bringup hardware_debug.launch.py
+  # defaults point at /dev/serial/by-id/... (stable per-device symlinks, immune to
+  # ttyUSB0/ttyUSB1 enumeration order flipping on reboot/replug) — override only if
+  # this exact Kobuki/RPLIDAR unit pair changes:
+  #   ros2 launch botzilla_bringup hardware_debug.launch.py serial_port:=/dev/ttyUSB0 lidar_port:=/dev/ttyUSB1
   # then, separately:
   ros2 launch botzilla_navigation rtabmap_debug.launch.py use_sim_time:=false depth_topic:=/camera/depth/image_meters
 """
@@ -47,13 +51,20 @@ def generate_launch_description():
 
     serial_port_arg = DeclareLaunchArgument(
         'serial_port',
-        default_value='/dev/ttyUSB0',
-        description='Serial port for the Kobuki base (e.g. /dev/ttyUSB0)',
+        default_value=(
+            '/dev/serial/by-id/'
+            'usb-Yujin_Robot_iClebo_Kobuki_kobuki_AI02MTI8-if00-port0'
+        ),
+        description='Serial port for the Kobuki base',
     )
     lidar_port_arg = DeclareLaunchArgument(
         'lidar_port',
-        default_value='/dev/ttyUSB1',
-        description='Serial port for the RPLIDAR C1 (e.g. /dev/ttyUSB1)',
+        default_value=(
+            '/dev/serial/by-id/'
+            'usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_'
+            'fed4f56bdc6ff011b4f08f301045c30f-if00-port0'
+        ),
+        description='Serial port for the RPLIDAR C1',
     )
 
     robot_state_publisher = Node(

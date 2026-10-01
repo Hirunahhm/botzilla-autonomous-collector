@@ -28,3 +28,4 @@ datasets/vids/
 
 # LLM Instructions
 CLAUDE.md
+run_logs/

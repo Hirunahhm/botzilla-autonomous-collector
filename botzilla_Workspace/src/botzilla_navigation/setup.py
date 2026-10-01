@@ -14,6 +14,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'behavior_trees'),
+            glob('behavior_trees/*.xml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -31,6 +33,7 @@ setup(
             'odom_covariance_relay = botzilla_navigation.odom_covariance_relay:main',
             'frontier_explorer_node = botzilla_navigation.frontier_explorer_node:main',
             'executor_node = botzilla_navigation.executor_node:main',
+            'mission_metrics_node = botzilla_navigation.mission_metrics_node:main',
         ],
     },
 )

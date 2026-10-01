@@ -47,11 +47,29 @@ Safety
 A commanded stop is NOT rate-limited on the way down to zero when it comes from an empty
 input stream — see DECEL_TO_STOP_IMMEDIATELY. Ramping a stop would mean overshooting into
 whatever prompted it.
+
+Mute switch
+-----------
+This node publishes unconditionally on a timer "so /cmd_vel always has a live publisher" —
+which is exactly the problem when something else also legitimately owns /cmd_vel.
+executor_node.py drives the base directly during TARGETING/APPROACHING/CAPTURING/DETACHING,
+and this node kept running the whole time regardless, decaying whatever Nav2's last command
+was to zero on its own clock. That produced two independent publishers racing on /cmd_vel:
+most visibly right after a NavigateToPose goal succeeds, where this node is still mid-decay
+of real leftover velocity at the exact moment executor_node starts its own reverse ramp for
+DETACHING — hardware testing traced a vibration/jerk at the instant DETACHING's reverse
+began to precisely this collision, which no amount of delay on executor_node's own side
+could fix since this node keeps publishing regardless. The 'velocity_smoother_enabled'
+topic (latched, default True so this node behaves unchanged when run without executor_node)
+lets executor_node mute this node to a full stop of publishing — not a decay to zero, an
+actual absence of publishing — whenever it takes over the base itself.
 """
 
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool
 
 # Output rate. Matches nav2_params.yaml's controller_frequency (20 Hz) so the smoother
 # neither starves the base nor invents intermediate setpoints the controller never asked
@@ -83,6 +101,92 @@ DECEL_TO_STOP_IMMEDIATELY = True
 
 DIAGNOSTIC_PERIOD_S = 10.0
 
+# --- Gap tracing --------------------------------------------------------------------
+# Added while investigating a reported "moves, stops, moves, stops" pattern plus abrupt
+# speed drops. Correlating existing logs first (before adding anything) already showed 9
+# of 13 hard timeouts in a 270s run landing 0.31-0.39s after a Nav2 goal boundary (Reached
+# the goal / goal finished / stalled+CANCELED) — i.e. almost exactly INPUT_TIMEOUT_S after
+# controller_server stops publishing between one goal ending and the next being dispatched.
+# GAP_NOTICE_S is set below INPUT_TIMEOUT_S so near-miss gaps that DON'T reach the hard
+# cutoff are visible too — without this there is no way to tell "the gap is usually ~0.15s
+# and once in a while spikes over 0.3s" from "gaps are normally near-zero and this is a
+# distinct rare fault", and that distinction is the difference between "retune the
+# threshold" and "something is actually stalling."
+GAP_NOTICE_S = 0.15
+
+# --- Reversal hysteresis -----------------------------------------------------------
+# Acceleration limiting alone does not stop the robot looking jerky, because it bounds how
+# FAST the command changes but not how OFTEN it changes direction. Measured on hardware
+# over 164 s of exploring, per stage of the chain:
+#
+#                        max step/cycle          sign flips
+#   /cmd_vel_nav (DWB)   0.300 m/s, 0.800 rad/s   x=92  theta=143
+#   /cmd_vel (smoothed)  0.040 m/s, 0.125 rad/s   x=65  theta=109
+#
+# The smoother was doing its job on magnitude (7.5x and 6.4x reduction, exactly its decel
+# limits) and yet two thirds of the reversals still reached the base — it faithfully ramped
+# through every one of them. A ramped reversal is still a reversal: the robot visibly stops
+# and goes the other way ~40 times a minute.
+#
+# The reversals originate in DWB: dwb_plugins::StandardTrajectoryGenerator re-samples the
+# entire velocity range every cycle, so when the score landscape is nearly flat (a noisy
+# costmap, a path that shifts slightly) the argmax can jump from +max to -max between
+# consecutive cycles. Fixing it there would mean LimitedAccelGenerator, which was A/B'd on
+# this robot and nearly stopped it translating (0.12 m in 89 s vs 20.2 m) — see the long
+# note in nav2_params.yaml. So it is filtered here instead.
+#
+# Rule: a command that opposes the current direction of travel must persist for
+# REVERSAL_CONFIRM_CYCLES before it is honoured. While unconfirmed, the target is treated
+# as zero, so the robot DECELERATES rather than latching — which is where it was heading on
+# the way to reversing anyway. Nothing is lost if the flip was real (it costs
+# REVERSAL_CONFIRM_CYCLES / PUBLISH_RATE_HZ = 0.15 s of extra braking, during which the
+# robot is already slowing), and a spurious one-cycle flip becomes a slight slow-down
+# instead of a direction change.
+#
+# This deliberately does NOT delay stopping, and does not delay the reverse-escape
+# behaviour that min_vel_x=-0.10 exists for: a genuine escape command persists for many
+# cycles and confirms immediately.
+REVERSAL_CONFIRM_CYCLES = 3
+
+# A reversal smaller than this is dithering around zero, not a real change of intent, and
+# is collapsed straight to zero without ever being confirmed.
+#
+# X was originally 0.01 m/s — sized just above the base's measured linear deadband
+# (0.009 m/s) so no physically-executable command was ever silently discarded. That
+# turned out to be too tight: it meant almost every DWB linear reversal, however small,
+# skipped the deadband and went straight into the 3-cycle confirmation path, while THETA's
+# deadband (0.05 rad/s) sits well below its own measured deadband (0.121 rad/s) and so
+# pre-filters a much larger share of angular jitter before confirmation is even considered.
+# Measured effect on hardware: reversal suppression cut angular flips ~62% but linear only
+# ~34% over the same run — the axes were not being filtered comparably.
+#
+# Raised to 0.025 m/s (12.5% of max_vel_x=0.2, matching THETA's 0.05/max_vel_theta=0.4
+# ratio) to close that gap. Trade-off: commands in 0.009-0.025 m/s — a physically real but
+# marginal crawl-speed correction — now get collapsed as dithering instead of confirmed.
+# Accepted because that band is barely above the hardware's own deadband to begin with; the
+# reverse-escape behaviour (min_vel_x=-0.10) is unaffected since it is 4x this threshold and
+# was never at risk of being collapsed.
+REVERSAL_DEADBAND_X = 0.025       # m/s
+REVERSAL_DEADBAND_THETA = 0.05    # rad/s
+
+# BOTH of the above are sized against the PHYSICAL base's mechanical deadband (measured:
+# 0.009 m/s linear, 0.121 rad/s angular). That is what makes discarding a smaller command
+# free on hardware — the wheels would not have turned for it anyway.
+#
+# Simulation has no mechanical deadband: Gazebo delivers 0.021 rad/s exactly. There the
+# same collapse throws away a command the robot COULD have executed, and that deadlocks
+# it. Observed live in Gazebo: DWB needing a small heading correction emits alternating
+# +/-0.021 rad/s, every one is a reversal under REVERSAL_DEADBAND_THETA and is collapsed
+# to zero, the robot never rotates, the heading error never shrinks, so DWB emits the same
+# correction forever. From outside that looks like a robot frozen in open floor with no
+# obstacle in front of it — confirmed at the time with 2.37 m of clear space ahead, zero
+# ObstacleFootprint vetoes (0/9828 forward trajectories) and cost 0 across the whole
+# footprint. Nothing else was wrong; only this.
+#
+# So both are ROS parameters, defaulting to exactly the constants above (hardware
+# behaviour is unchanged), and nav2.launch.py passes near-zero values when
+# use_sim_time:=true. See SIM_REVERSAL_DEADBAND_* there.
+
 
 class VelocitySmoother(Node):
     """Acceleration-limits 'cmd_vel_nav' onto 'cmd_vel' — see the module docstring."""
@@ -91,15 +195,45 @@ class VelocitySmoother(Node):
         """Wire up the input subscription, output publisher, and the two timers."""
         super().__init__('velocity_smoother')
 
+        # Deadbands below which an opposing command is treated as dithering and collapsed
+        # to zero. Defaults are the hardware-measured constants, so an unparameterised
+        # launch behaves exactly as before; sim passes near-zero. See the constants' block
+        # comment for why the two platforms must differ here.
+        self.declare_parameter('reversal_deadband_x', REVERSAL_DEADBAND_X)
+        self.declare_parameter('reversal_deadband_theta', REVERSAL_DEADBAND_THETA)
+        self._reversal_deadband_x = self.get_parameter('reversal_deadband_x').value
+        self._reversal_deadband_theta = self.get_parameter('reversal_deadband_theta').value
+        self.get_logger().info(
+            f'Reversal deadbands: x={self._reversal_deadband_x} m/s '
+            f'theta={self._reversal_deadband_theta} rad/s'
+        )
+
         self._target = Twist()      # latest command from Nav2
         self._output = Twist()      # what we last published (the ramp's current state)
+        self._enabled = True        # see 'Mute switch' in the module docstring
         self._last_input_time = None
         self._input_count = 0
         self._output_count = 0
         self._timed_out = False
+        # Consecutive cycles the input has opposed our direction of travel, per axis.
+        self._flip_cycles = {'x': 0, 'theta': 0}
+        self._suppressed_flips = 0
+        # Gap tracing (see GAP_NOTICE_S) — counts near-miss gaps that never reach the hard
+        # INPUT_TIMEOUT_S cutoff, so the diagnostic line can distinguish "gaps are usually
+        # small and this was a one-off" from "gaps are chronically close to the cliff edge."
+        self._near_miss_gaps = 0
+        self._max_gap_this_period = 0.0
 
         self._sub = self.create_subscription(Twist, 'cmd_vel_nav', self._input_cb, 10)
         self._pub = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        # Latched, matching executor_node's /exploration_enabled pattern — a late
+        # subscriber (this node) must see the current value even if the publisher
+        # (executor_node) started first and already published before we came up.
+        enable_qos = QoSProfile(depth=1)
+        enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self._enabled_sub = self.create_subscription(
+            Bool, 'velocity_smoother_enabled', self._enabled_cb, enable_qos)
 
         self._period = 1.0 / PUBLISH_RATE_HZ
         self.create_timer(self._period, self._tick)
@@ -110,9 +244,39 @@ class VelocitySmoother(Node):
             f'accel limits x={MAX_ACCEL_X} theta={MAX_ACCEL_THETA}, '
             f'decel x={MAX_DECEL_X} theta={MAX_DECEL_THETA}')
 
+    def _enabled_cb(self, msg):
+        was_enabled = self._enabled
+        self._enabled = msg.data
+        if was_enabled and not self._enabled:
+            self.get_logger().info(
+                'Disabled — another controller owns /cmd_vel; going fully silent '
+                '(not even a decayed zero).')
+            # The robot is about to be driven by whoever just took over, not by our
+            # ramp resuming from wherever it happened to be — start the ramp state
+            # clean so a later re-enable doesn't resume from stale leftover velocity.
+            self._output = Twist()
+            self._flip_cycles = {'x': 0, 'theta': 0}
+        elif not was_enabled and self._enabled:
+            self.get_logger().info('Re-enabled — resuming cmd_vel_nav -> cmd_vel.')
+
     def _input_cb(self, msg):
+        now = self.get_clock().now()
+        if self._last_input_time is not None:
+            gap = (now - self._last_input_time).nanoseconds / 1e9
+            if gap > self._max_gap_this_period:
+                self._max_gap_this_period = gap
+            # Below INPUT_TIMEOUT_S: _tick's watchdog never sees this, so without this line
+            # it is invisible that the gap happened at all. Log the output value at the
+            # START of the gap (self._output, not yet touched by this message) so a report
+            # of "was moving at X, then a gap" is directly readable off one log line.
+            if GAP_NOTICE_S <= gap <= INPUT_TIMEOUT_S:
+                self._near_miss_gaps += 1
+                self.get_logger().info(
+                    f'cmd_vel_nav near-miss gap {gap:.3f}s (< {INPUT_TIMEOUT_S}s cutoff) '
+                    f'— output was ({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+                    'going into it')
         self._target = msg
-        self._last_input_time = self.get_clock().now()
+        self._last_input_time = now
         self._input_count += 1
         if self._timed_out:
             self.get_logger().info('cmd_vel_nav resumed after timeout.')
@@ -149,7 +313,34 @@ class VelocitySmoother(Node):
             return target
         return current + (limit if delta > 0 else -limit)
 
+    def _confirm_reversal(self, axis, current, target, deadband):
+        """Hold off a direction reversal until it persists — see REVERSAL_CONFIRM_CYCLES.
+
+        Returns the target to actually ramp toward. Zero means "keep decelerating while we
+        decide", which is the same direction the ramp would travel anyway on its way to
+        reversing, so waiting costs nothing but a little extra braking.
+        """
+        # Not a reversal: same sign, or either side is already at rest.
+        if current == 0.0 or target == 0.0 or (target * current) > 0.0:
+            self._flip_cycles[axis] = 0
+            return target
+
+        # Opposing, but too small to be a real change of intent — treat it as a stop.
+        if abs(target) < deadband:
+            self._flip_cycles[axis] = 0
+            return 0.0
+
+        self._flip_cycles[axis] += 1
+        if self._flip_cycles[axis] >= REVERSAL_CONFIRM_CYCLES:
+            self._flip_cycles[axis] = 0
+            return target
+
+        self._suppressed_flips += 1
+        return 0.0
+
     def _tick(self):
+        if not self._enabled:
+            return   # another controller owns /cmd_vel — see 'Mute switch' above
         if self._last_input_time is None:
             return   # never commanded — stay silent rather than publish zeros at boot
 
@@ -157,7 +348,10 @@ class VelocitySmoother(Node):
         if age > INPUT_TIMEOUT_S:
             if not self._timed_out:
                 self.get_logger().warn(
-                    f'No cmd_vel_nav for {age:.2f}s (> {INPUT_TIMEOUT_S}s) — commanding stop.')
+                    f'No cmd_vel_nav for {age:.2f}s (> {INPUT_TIMEOUT_S}s) — commanding stop. '
+                    f'Output was ({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+                    'the instant before this (dropped with no ramp — see '
+                    'DECEL_TO_STOP_IMMEDIATELY).')
                 self._timed_out = True
             self._target = Twist()   # zero
             if DECEL_TO_STOP_IMMEDIATELY:
@@ -165,13 +359,25 @@ class VelocitySmoother(Node):
                 self._publish()
                 return
 
+        goal_x = self._confirm_reversal(
+            'x', self._output.linear.x, self._target.linear.x, self._reversal_deadband_x)
+        goal_th = self._confirm_reversal(
+            'theta', self._output.angular.z, self._target.angular.z,
+            self._reversal_deadband_theta)
+
         self._output.linear.x = self._ramp(
-            self._output.linear.x, self._target.linear.x,
-            MAX_ACCEL_X, MAX_DECEL_X, self._period)
+            self._output.linear.x, goal_x, MAX_ACCEL_X, MAX_DECEL_X, self._period)
         self._output.angular.z = self._ramp(
-            self._output.angular.z, self._target.angular.z,
-            MAX_ACCEL_THETA, MAX_DECEL_THETA, self._period)
+            self._output.angular.z, goal_th, MAX_ACCEL_THETA, MAX_DECEL_THETA, self._period)
         self._publish()
+        # Full-resolution per-tick trace (20 Hz). No-op unless this node's log level is
+        # DEBUG (e.g. --log-level velocity_smoother:=debug) — for tracing the exact
+        # controller-to-smoother path of one stutter/spike episode after the fact.
+        self.get_logger().debug(
+            f'[tick] target=({self._target.linear.x:.3f},{self._target.angular.z:.3f}) '
+            f'goal=({goal_x:.3f},{goal_th:.3f}) '
+            f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+            f'flip_cycles=({self._flip_cycles["x"]},{self._flip_cycles["theta"]})')
 
     def _publish(self):
         self._pub.publish(self._output)
@@ -188,7 +394,12 @@ class VelocitySmoother(Node):
         self.get_logger().info(
             f'[smoother] in={in_hz:.1f}Hz out={out_hz:.1f}Hz '
             f'target=({self._target.linear.x:.3f},{self._target.angular.z:.3f}) '
-            f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f})')
+            f'output=({self._output.linear.x:.3f},{self._output.angular.z:.3f}) '
+            f'flips_suppressed={self._suppressed_flips} '
+            f'near_miss_gaps={self._near_miss_gaps} max_gap={self._max_gap_this_period:.3f}s')
+        self._suppressed_flips = 0
+        self._near_miss_gaps = 0
+        self._max_gap_this_period = 0.0
 
 
 def main(args=None):

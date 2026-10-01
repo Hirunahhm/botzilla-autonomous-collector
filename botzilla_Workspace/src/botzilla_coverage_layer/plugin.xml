@@ -1,0 +1,8 @@
+<library path="botzilla_coverage_layer_plugin">
+  <class type="botzilla_coverage_layer::CoverageCostLayer" base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Soft penalty on camera-inspected floor, read from frontier_explorer_node's
+      /coverage_cost_map. Max-combined, never reaches inscribed cost.
+    </description>
+  </class>
+</library>

@@ -1,0 +1,9 @@
+<library path="botzilla_straightline_planner_plugin">
+  <class type="botzilla_straightline_planner::StraightLinePlanner" base_class_type="nav2_core::GlobalPlanner">
+    <description>
+      Straight-line global planner for pre-validated boustrophedon sweep legs.
+      Interpolates between start and goal and fails rather than reroute around
+      obstacles; not intended for general-purpose frontier navigation.
+    </description>
+  </class>
+</library>

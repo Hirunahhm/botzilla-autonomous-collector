@@ -63,27 +63,43 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      # Back to 0.0 — reverse is no longer sampled during normal path following.
+      # -0.10: a bounded reverse escape. This value has flip-flopped twice, so the whole
+      # history is here — read it before changing it again.
       #
-      # This was set to -0.10 in sim after a robot wedged against a wall had no escape
-      # trajectory: forward was blocked, "the path-alignment critics kept pulling it back
-      # toward the blocked heading", and it oscillated until the watchdog gave up despite
-      # open floor behind it. That symptom is now understood to be the SAME bug fixed at
-      # PathAlign.forward_point_distance below: those critics were blind to heading, so
-      # they could not reward turning away from the blockage. Allowing reverse treated the
-      # symptom, and on hardware it backfired badly — with reversing legal AND heading
-      # unscored, DWB reversed 1295 times vs 349 forward and reached 0 of 12 goals.
+      # It was -0.10 in sim, because a robot wedged against a wall had no escape trajectory
+      # and oscillated until the watchdog gave up despite open floor behind it. It was then
+      # set to 0.0 because that symptom was traced to a DIFFERENT bug — PathAlign/GoalAlign
+      # had forward_point_distance 0.1, so both heading-aware critics were blind and could
+      # not reward turning away from a blockage. With reversing legal AND heading unscored,
+      # DWB reversed 1295 times vs 349 forward and reached 0 of 12 goals. Disabling reverse
+      # was the right call at that moment: the align critics were broken.
       #
-      # With the align critics actually able to see heading, the robot can now be rewarded
-      # for turning toward free space instead of reversing into it blind. That matters
-      # because the depth camera faces forward: sustained reverse driving is unsensed, and
-      # the local costmap is lidar-only (it cannot see anything below the lidar plane).
+      # They are fixed now (forward_point_distance 0.325, measured: reverse commands went
+      # 1295 -> 0). What 0.0 then exposed is that DWB had no escape at all. Measured on
+      # hardware, twice in one session, in two different parts of the arena:
       #
-      # vx=0 is still sampled, so pure in-place rotation remains available. The BackUp
-      # recovery behaviour is unaffected — it lives in behavior_server, not DWB, and still
-      # reverses when genuinely wedged. That is the right place for reversing: a
-      # deliberate, bounded, supervised escape rather than a routine path-following option.
-      min_vel_x: 0.0
+      #   - ObstacleFootprintCritic rejected 419 of 419 sampled trajectories
+      #     ("Trajectory Hits Obstacle"), leaving in-place rotation as the only legal motion
+      #   - forward cmd count froze (503) while rotation climbed to 2419 over 140 s
+      #   - the footprint's REAR edge was in inscribed cells 47 times vs 655 for the front:
+      #     nose-in to a wall with the floor behind it clear
+      #   - behavior_server's BackUp could not rescue it either — DriveOnHeading aborts
+      #     "Collision Ahead" because its check trips at t=0 when the footprint already
+      #     overlaps a lethal cell. So the "recovery handles it" assumption was simply false.
+      #
+      # The remaining objection to reverse was that it is unsensed. That was about the
+      # forward-facing depth camera, and it does not apply to what actually fills the local
+      # costmap: the RPLidar C1 is 360 deg and the local costmap's voxel_layer reads /scan
+      # only, so reversing is exactly as well sensed as driving forward. (The real blind
+      # spot is vertical, not directional — the lidar sits at z=0.24 m and cannot see the
+      # ground-level grabber arms' obstacles in ANY direction. That needs
+      # pointcloud_to_laserscan, and no min_vel_x value addresses it.)
+      #
+      # Kept small deliberately: -0.10 is half of max_vel_x, enough to back out of a wedge
+      # but not fast enough to make reversing an attractive way to follow a path. The check
+      # that this has not regressed is the forward/reverse split on /cmd_vel — reverse
+      # should be ~0 during normal path following and appear only when wedged.
+      min_vel_x: -0.10
       min_vel_y: 0.0
       max_vel_x: 0.2
       max_vel_y: 0.0
@@ -161,6 +177,51 @@ controller_server:
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
+      # KEEP AT 1.7. Lowering this to shorten the swept footprint was tried and measured
+      # WORSE, so do not retry it without new evidence.
+      #
+      # The reasoning that motivated the attempt: ObstacleFootprintCritic tests the full
+      # footprint polygon at every pose along a trajectory and rejects outright on a
+      # lethal or unknown cell (pass/fail on those — inflated values 1-252 only add score
+      # and never veto, so inflation_radius is not a lever here either). At 1.7 s and
+      # max_vel_x 0.2 that projects 0.34 m ahead of a footprint already reaching 0.36 m,
+      # so the swept polygon runs ~0.70 m forward and near a wall every candidate clips
+      # something — "No valid trajectories out of 440!".
+      #
+      # Measured A/B on hardware, cleared arena, NoMachine killed, single variable:
+      #   1.7  (run_logs/20260906-191025): 0.82 stalls/min, 30 no-valid-trajectory bursts
+      #   1.0  (run_logs/20260906-191922): 0.95 stalls/min, 98 no-valid-trajectory bursts
+      # Vetoes more than TRIPLED. A shorter horizon gives DWB less room to curve around an
+      # obstacle, so more of the sample set is pruned, not less — the opposite of the
+      # predicted effect.
+      #
+      # The stalls that motivated this are not a navigation problem at all, so do not look
+      # for them here. Sampled live during one (run_logs/20260906-193047): controller
+      # commanded th=+0.400 rad/s, collision monitor passed +0.400, velocity_smoother
+      # passed +0.400, and the base achieved +0.092. The whole software chain is faithful;
+      # the base does not deliver the commanded rotation.
+      #
+      # Everything plausible was tested and rejected, each on hardware, single-variable:
+      #   CPU starvation      killing NoMachine lifted the planner loop 2.56 -> 11.93 Hz
+      #                       and the control loop to 20 Hz; stall rate unchanged.
+      #   sim_time            see the A/B above; measurably worse.
+      #   lidar seeing arms   /scan sampled by sector: nothing returns inside the
+      #                       footprint (range_min is 0.05 m, so it would show).
+      #   physical contact    ruled out by direct observation of the robot.
+      #   collision monitor   run_logs/20260906-193047: stalls 0.82 -> 1.41/min and
+      #                       distance 3.1 -> 1.6 m/min. Its "approach" action scales
+      #                       commands DOWN near obstacles, pushing yaw further below the
+      #                       base's rotation deadband. Left off by default.
+      #
+      # What is left: kobuki_base_node's yaw feed-forward models this base's mechanical
+      # deadband as actual = 0.891 * (cmd - 0.121), fitted at R^2 = 0.997, and its runtime
+      # parameters were confirmed set to those values. Under that model 0.400 should come
+      # out as ~0.400, not 0.092 — so the fitted curve no longer describes the hardware.
+      # The untested candidate is battery state: motor torque falls as the pack drains,
+      # which raises effective stiction and would degrade over a day of running exactly as
+      # observed. Kobuki.py already parses Batteryvolt (basic sensor byte 13) but
+      # kobuki_base_node never publishes it, so this cannot currently be correlated.
+      # Next step is a bench measurement, not another mission run.
       sim_time: 1.7
       linear_granularity: 0.05
       angular_granularity: 0.025
@@ -199,13 +260,54 @@ controller_server:
       # is silently ignored, which would have quietly dropped obstacle avoidance from the
       # scoring altogether.
       #
-      # Raised 0.02 -> 0.10 originally so DWB meaningfully prefers routing *around*
-      # residual non-lethal cost rather than scoring near-obstacle trajectories almost the
-      # same as clear ones. That still applies, and matters more now: with
-      # inflation_radius at 0.45 there is a much wider cost gradient for this scale to act
-      # on, which is what steers the robot down the middle of a passage instead of along
-      # one wall.
-      ObstacleFootprint.scale: 0.10
+      # 0.10 -> 0.4. The intent all along was "prefer routing around residual non-lethal
+      # cost", and with inflation_radius at 0.45 there is a wide gradient to steer on — but
+      # at 0.10 the robot demonstrably ignored it, driving into inflated regions and
+      # clipping things. The cause is a units trap, and it made the earlier 0.02 -> 0.10
+      # "increase" a 4x DECREASE:
+      #
+      #   critic              getScale()                        effective weight
+      #   BaseObstacle        scale_                   (none)   0.02   <- the old value
+      #   ObstacleFootprint   costmap_resolution * scale_       0.05 * 0.10 = 0.005
+      #   PathDist/GoalDist   costmap_resolution * 0.5 * scale_ 0.80 / 0.60 per CELL
+      #
+      # ObstacleFootprintCritic overrides getScale() to multiply by resolution;
+      # BaseObstacleCritic does not (see /opt/ros/jazzy/include/dwb_critics/*.hpp). So
+      # swapping the critic silently divided the obstacle term by 20. At 0.005 the entire
+      # gradient was worth less than a rounding error next to the path critics: the largest
+      # penalty ANY trajectory could receive was 253 * 0.005 = 1.27, while ending merely
+      # 2 cells (0.10 m) off the global path already cost 1.60. Hugging a wall was
+      # literally cheaper than deviating 10 cm to avoid it, which is exactly what happened.
+      #
+      # 0.4 restores nav2's own default effective weighting (0.02 / 0.05 = 0.4). Worked
+      # through on the real numbers, in a 1.0 m passage where centring costs 4 cells of
+      # path deviation:
+      #
+      #   hug wall at 0.25 m clearance -> cost 195  ->  penalty 195 * 0.05 * 0.4 = 3.91
+      #   deviating 4 cells to centre  ->            PathDist  4 * 0.80          = 3.20
+      #   one sim window of progress   ->            GoalDist  6.8 * 0.60        = 4.08
+      #
+      # 3.91 > 3.20 so it centres, and 3.91 < 4.08 so avoidance did not outweigh making
+      # forward progress.
+      #
+      # 0.4 -> 0.8 after the robot was still observed clipping obstacles at 0.4. The
+      # progress-reward bound above (4.08) was the stated reason not to exceed ~0.5, and
+      # 0.8 knowingly crosses it: the wall penalty at 0.25 m clearance becomes 7.80, so a
+      # trajectory CAN now score worse than standing still. That trade is acceptable only
+      # because min_vel_x is no longer 0.0 — a robot that talks itself into a stall can
+      # reverse out of it, which was impossible when this bound was first derived. Do not
+      # raise this further without re-checking that reverse escape still works.
+      #
+      # Note this cannot push the robot away from obstacles it cannot see. The critic scores
+      # the local costmap, which is /scan-only with the lidar at z=0.24 m, so objects
+      # shorter than that contribute nothing at any scale — see the NOTE at the end.
+      #
+      # NOTE this critic scores the max cost over the footprint OUTLINE only (sum_scores
+      # defaults false), and it cannot help at all against obstacles that never reach the
+      # costmap — the local costmap is /scan-only and the lidar sits at z=0.24 m, so
+      # anything shorter than that is invisible to it and the ground-level grabber arms
+      # will still hit it. That needs pointcloud_to_laserscan, not a critic weight.
+      ObstacleFootprint.scale: 0.8
       # 0.1 -> 0.325 (nav2's own default) on BOTH align critics. This was the bug that
       # made the robot drive backwards to its goals.
       #
@@ -240,7 +342,61 @@ planner_server:
   ros__parameters:
     use_sim_time: False
     expected_planner_frequency: 20.0
-    planner_plugins: ["GridBased"]
+    # SweepStraight is selected only for camera-coverage sweep legs (see
+    # frontier_explorer_node's planner_selector publish) — see
+    # botzilla_straightline_planner for why: GridBased/NavFn curves off pre-validated
+    # straight rows toward locally-cheaper cells, which reads as the robot wandering
+    # during the boustrophedon sweep instead of tracing it.
+    planner_plugins: ["GridBased", "SweepStraight", "SmacGrid"]
+    # SmacGrid is the cost-aware alternative to GridBased/NavFn, selectable per run
+    # with run_full_mission.sh --planner SmacGrid. NOT the default: a bare run still
+    # uses GridBased, so the shipped behaviour is unchanged.
+    #
+    # Why it exists. NavFn weights costmap cost only weakly, so it produces paths that
+    # graze corners and hug walls, and DWB follows them there. Measured in run 18
+    # (2026-09-06) at a deadlock: the footprint sat on cost 253 (INSCRIBED) in 54 of 64
+    # consecutive costmap_raw samples — i.e. the robot travelled essentially always
+    # inside the inscribed band, with the real lethal cells just beyond. From there
+    # DWB's ObstacleFootprint vetoed every trajectory heading into the obstacle
+    # (60 cycles at 1.00 ObstacleFootprint, vetoing all 440 by itself) while the
+    # Oscillation critic banned the reversal that would have turned away. That is the
+    # obstacle-hugging deadlock, and it is a PLANNING problem: the controller was
+    # asked to follow a path that ran through the band.
+    #
+    # SmacPlanner2D scores cost explicitly via cost_travel_multiplier, so it routes
+    # down the middle of free space instead. This addresses the cause; the recovery
+    # and watchdog work done before it only changed how long the robot waited before
+    # giving up (run 20 measured that trade as a net loss: stalls 1.02 -> 0.23/min but
+    # coverage ~2.5x slower).
+    SmacGrid:
+      plugin: "nav2_smac_planner::SmacPlanner2D"
+      # Both matched to GridBased so the arms differ ONLY in the search, not in what
+      # counts as a legal goal. See GridBased below for why each value is what it is —
+      # especially tolerance, where 0.5 let unreachable goals "succeed" without moving.
+      tolerance: 0.1
+      allow_unknown: false
+      # The knob this whole plugin is here for: higher steers harder away from
+      # high-cost cells. 2.0 is the library default; 3.0 leans into clearance
+      # deliberately, since hugging is the failure being targeted. If it proves too
+      # conservative (goals rejected that GridBased could reach), lower it toward 2.0
+      # before concluding the planner does not help.
+      cost_travel_multiplier: 3.0
+      # Arena is small and the global costmap is already 0.05 m, so downsampling would
+      # trade the resolution the asymmetric footprint depends on for speed we do not
+      # need.
+      downsample_costmap: false
+      downsampling_factor: 1
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      # Smac2D searches more than NavFn. The explorer pre-checks every target with
+      # ComputePathToPose and gives up on it after PATH_CHECK_TIMEOUT_S, so this must
+      # stay well under that or reachability checks would time out rather than answer.
+      max_planning_time: 2.0
+      use_final_approach_orientation: false
+    SweepStraight:
+      plugin: "botzilla_straightline_planner::StraightLinePlanner"
+      interpolation_resolution: 0.05
+      allow_unknown: false
     GridBased:
       plugin: "nav2_navfn_planner::NavfnPlanner"
       # 0.5 -> 0.1. With tolerance 0.5, an unreachable goal did not fail: NavFn
@@ -341,7 +497,13 @@ local_costmap:
       # avoids that trap without giving up correctness: it is only the ROTATION that
       # needs 2*circumscribed = 0.702 m, and ObstacleFootprint (see FollowPath critics)
       # evaluates that per-trajectory rather than baking it into every cell.
-      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
+      # +0.05 m padding on all four sides (2026-08-09): the arms clipped a wall the
+      # unpadded polygon scored as clear. Padding forces the planner to treat gaps
+      # narrower than 2*0.215=0.43 m (e.g. between chair legs) as non-navigable rather
+      # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
+      # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
+      # margin; not rederived here since only the values below are load-bearing.
+      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -390,7 +552,22 @@ local_costmap:
         # obstacles (desk edges, sills) are invisible to DWB again. That gap must be
         # closed before cube collection, but a costmap that boxes the robot in is worse
         # than one that misses low obstacles.
-        observation_sources: scan
+        # scan_camera (2026-08-09): a virtual 2D scan from pointcloud_to_laserscan,
+        # height-filtered to 0.05m-0.30m of the Kinect's depth data — catches low
+        # obstacles (chair/wheelchair bases) the LiDAR's single scan plane misses
+        # entirely. Deliberately LOCAL COSTMAP ONLY, not global: the "pointcloud"
+        # source below was disabled after a confirmed live failure where camera
+        # marks it couldn't re-observe (robot turned away, narrow ~57 deg FOV)
+        # never cleared and boxed the robot in with phantom lethal cells ("Collision
+        # Ahead" on Spin, DWB could only orbit). scan_camera goes through
+        # ObstacleLayer's per-update raytrace-clear (not VoxelLayer's persistent 3D
+        # grid) which is a real improvement, but the underlying limitation is
+        # identical: the camera still can't clear what it can't currently see. The
+        # local costmap's rolling window at least ages out stale marks as the robot
+        # translates away, which a global costmap mark never would. Watch for the
+        # same "orbit forever in open floor" signature on hardware before ever
+        # considering this for global_costmap.
+        observation_sources: scan scan_camera
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -401,6 +578,16 @@ local_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+        scan_camera:
+          topic: /scan_camera
+          max_obstacle_height: 0.30
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.55
         pointcloud:
           # Sim: bridged from Gazebo's rgbd_camera (simulation.launch.py).
           # Hardware: needs a depth_image_proc point-cloud node — kinect_bridge
@@ -440,10 +627,22 @@ global_costmap:
       # what fits, and the planner promises routes DWB then refuses to execute.
       # Measured polygon — see the local_costmap note for the derivation and for why
       # this replaced robot_radius: 0.20.
-      footprint: "[[0.31, 0.165], [0.31, -0.165], [-0.17, -0.165], [-0.17, 0.165]]"
+      # +0.05 m padding on all four sides (2026-08-09): the arms clipped a wall the
+      # unpadded polygon scored as clear. Padding forces the planner to treat gaps
+      # narrower than 2*0.215=0.43 m (e.g. between chair legs) as non-navigable rather
+      # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
+      # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
+      # margin; not rederived here since only the values below are load-bearing.
+      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # coverage_layer = soft penalty on floor the camera has already inspected, so
+      # SmacGrid routes through un-inspected floor (botzilla_coverage_layer; the cost
+      # grid comes from frontier_explorer_node's /coverage_cost_map). GLOBAL costmap
+      # only — in the local costmap DWB would start steering around inspected floor.
+      # A no-op unless the explorer runs with coverage_cost > 0 (--coverage-cost), and
+      # max-combined below inscribed cost, so no threshold anywhere else moves.
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "coverage_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
@@ -468,4 +667,8 @@ global_costmap:
         # planner and controller costmaps consistent so DWB doesn't reject the
         # global planner's route as infeasible.
         inflation_radius: 0.45
+      coverage_layer:
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /coverage_cost_map
       always_send_full_costmap: True

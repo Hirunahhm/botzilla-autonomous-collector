@@ -33,6 +33,7 @@ from botzilla_perception.rplidar_driver import (
     RPLidarError,
 )
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
@@ -137,7 +138,8 @@ class RPLidarNode(Node):
                 now = time.monotonic()
                 now_ros = self.get_clock().now()
                 scan_time = now - revolution_start
-                stamp = revolution_start_ros
+                # Midpoint of the revolution, not its first ray — see _publish_latest().
+                stamp = revolution_start_ros + Duration(seconds=scan_time / 2.0)
                 revolution_start = now
                 revolution_start_ros = now_ros
 
@@ -177,14 +179,29 @@ class RPLidarNode(Node):
         ranges, intensities, scan_time, stamp = latest
 
         msg = LaserScan()
-        # Stamp with when the revolution's FIRST ray was captured (sensor_msgs/LaserScan
-        # convention), not with "now". Stamping at publish time put the scan ~100-150ms
-        # in the future relative to its own data — a full revolution (~100ms) elapses
-        # before the serial thread hands the scan off, plus up to 50ms waiting for this
-        # timer. Consumers then resolved TF at that later time, so during a turn every
-        # scan got rotated by however far the robot travelled in the interim: at Nav2's
-        # max_vel_theta of 0.4 rad/s that is ~2.9 deg, i.e. ~26cm of wall displacement
-        # at 5m — several map cells, drawn as a second copy of the wall.
+        # Stamp with when the data was CAPTURED, not with "now". Stamping at publish time
+        # put the scan ~100-150ms in the future relative to its own data — a full
+        # revolution (~100ms) elapses before the serial thread hands the scan off, plus up
+        # to 50ms waiting for this timer. Consumers then resolved TF at that later time, so
+        # during a turn every scan got rotated by however far the robot travelled in the
+        # interim: at Nav2's max_vel_theta of 0.4 rad/s that is ~2.9 deg, i.e. ~26cm of
+        # wall displacement at 5m — several map cells, drawn as a second copy of the wall.
+        #
+        # The capture instant used is the revolution's MIDPOINT, which is a deliberate
+        # departure from the strict sensor_msgs/LaserScan convention of stamping the first
+        # ray. The rays of one revolution are spread over scan_time (~100ms measured), and
+        # every consumer in this stack — RTAB-Map's occupancy grid and Nav2's obstacle
+        # layer — collapses them to the single instant in header.stamp rather than
+        # deskewing with time_increment. Against a non-deskewing consumer the first-ray
+        # convention is not neutral: it biases the whole scan late by half a revolution,
+        # every scan, in the same direction. Hardware measurement (rotate in place, then
+        # search for the time offset best aligning each scan to a stationary reference)
+        # showed exactly such a systematic offset. Stamping the midpoint removes the bias
+        # and halves the worst-case skew to +/- scan_time/2.
+        #
+        # time_increment below is still reported honestly, so this only helps: a consumer
+        # that DID deskew would need to account for stamp being the midpoint. None does
+        # here (rtabmap_util's lidar_deskewing node takes PointCloud2, not LaserScan).
         msg.header.stamp = stamp.to_msg()
         msg.header.frame_id = self._frame_id
         msg.angle_min = 0.0

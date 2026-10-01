@@ -193,7 +193,15 @@
     <parent link="base_link"/>
     <child link="arm_left_link"/>
     <!-- Positioned straight forward with 0 rotation -->
-    <origin xyz="0.18 0.08 -0.01" rpy="0 0 0"/> 
+    <!-- x=0.235 puts the arm tip at 0.235 + 0.15/2 = 0.310, which is the MEASURED front
+         of the grabber arms on the physical robot (nav2_params.yaml's local_costmap
+         footprint comment: "front x = +0.310, rear x = -0.170, half-width 0.165", from
+         0.48 m arms-to-chassis-back and 0.33 m across). Was 0.18, which reached only
+         0.255 and modelled the simulated robot 55 mm SHORTER than the real one — so
+         Gazebo showed clearance the hardware would not have had, and any sim result
+         about squeezing past obstacles would not transfer. The Nav2 footprint is
+         correct and stays as measured; this is the model catching up to it. -->
+    <origin xyz="0.235 0.08 -0.01" rpy="0 0 0"/>
   </joint>
 
   <!-- Right Arm -->
@@ -219,7 +227,8 @@
     <parent link="base_link"/>
     <child link="arm_right_link"/>
     <!-- Positioned straight forward with 0 rotation -->
-    <origin xyz="0.18 -0.08 -0.01" rpy="0 0 0"/>
+    <!-- Mirror of arm_left_joint — see its comment for the 0.18 -> 0.235 measurement. -->
+    <origin xyz="0.235 -0.08 -0.01" rpy="0 0 0"/>
   </joint>
 
   <!-- =============== 2D LiDAR (Laser Frame) =============== -->
@@ -284,9 +293,22 @@
     <sensor name="rgbd_camera" type="rgbd_camera">
       <camera>
         <horizontal_fov>1.047</horizontal_fov>
+        <!-- 640x480 -> 320x240. At 640x480 each /camera/points cloud carries 307,200
+             points (~5-10 MB); bridging that through ros_gz_bridge at 30 Hz is ~300 MB/s,
+             which this Jetson cannot do. Measured effect: /camera/points collapsed to
+             0.1 Hz — ONE cloud every 12 s — and /scan_camera with it, since it can only
+             be as fast as its input. That is the depth-as-laserscan stream the costmap
+             relies on for LOW obstacles: the 2D lidar sits at laser_frame z=0.24 and
+             sweeps clean over a 0.1 m cube, so with this throttled there was nothing
+             watching the floor and the robot drove into cubes. At 0.2 m/s it covered 2 m
+             between obstacle updates.
+             320x240 is 4x fewer points; combined with the update_rate change below that
+             is ~8x less bridge traffic. Ample to see a 0.1 m cube at 0.5-3.0 m (the
+             pointcloud_to_laserscan range band), and YOLO letterboxes its input anyway,
+             so cube DETECTION is unaffected. Sim only — hardware uses the real Kinect. -->
         <image>
-          <width>640</width>
-          <height>480</height>
+          <width>320</width>
+          <height>240</height>
           <format>RGB_INT8</format>
         </image>
         <clip>
@@ -296,7 +318,11 @@
         <optical_frame_id>camera_link_optical</optical_frame_id>
       </camera>
       <always_on>1</always_on>
-      <update_rate>30</update_rate>
+      <!-- 30 -> 15 Hz. See the <image> comment above: this halves bridge traffic again.
+           15 Hz still gives the costmap an obstacle update every 0.067 s (13 mm of travel
+           at 0.2 m/s) versus the 2 m it was managing at the measured 0.1 Hz. The lidar
+           runs at 15 Hz too, so the two obstacle sources now update in step. -->
+      <update_rate>15</update_rate>
       <visualize>true</visualize>
       <topic>camera</topic>
     </sensor>

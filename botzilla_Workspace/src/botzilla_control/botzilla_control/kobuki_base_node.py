@@ -1,9 +1,12 @@
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import BatteryState, Imu
+from std_msgs.msg import Int16MultiArray
 import math
+import time
 
 from .KobukiDriver import Kobuki
 
@@ -187,6 +190,28 @@ MEAS_FILTER_ALPHA = 0.25
 # is not a measurement of anything — it is an artifact of the polling mismatch.
 MIN_ODOM_DT_S = 0.005
 
+# Sanity bound on how stale a serial packet may be before _capture_stamp stops trusting
+# the age and falls back to "now". Generous next to the ~20ms packet period and the ~20ms
+# blocking read, so it only trips on a genuinely wedged reader or a monotonic-clock
+# surprise, never in normal operation.
+MAX_CAPTURE_AGE_S = 0.5
+
+# Guard against a corrupted encoder tick. _tick_diff correctly unwraps a genuine 16-bit
+# rollover, but has no way to tell a real reading from a garbage one (serial noise
+# desyncing the Kobuki's binary protocol is the leading suspect) — it will happily
+# report ~18 m/s from a single bad sample, five orders of magnitude past anything the
+# robot can actually do (max_vel_x is 0.2). Measured live: one such spike reached
+# meas=18.114 and drove the PI controller to command L=-3541/R=-3562 mm/s against a
+# normal range of ~100-300 — a real, physical "sudden speed then drop" at the wheels,
+# invisible to anything watching /cmd_vel because it originates inside this control
+# loop, after the smoother. The same bad sample was also being integrated permanently
+# into _ox/_oy/_ot (dead-reckoning never self-corrects) and published on /odom, which
+# is exactly the mechanism behind RTAB-Map occasionally registering an offset/ghosted
+# duplicate of an already-mapped room — its pose input just jumped 0.36 m in one 20 ms
+# tick. Sized well above any real transient (5x max_vel_x) so it only catches readings
+# that are unambiguously impossible, not aggressive-but-real motion.
+MAX_PLAUSIBLE_SPEED_MPS = 1.0
+
 # Safety watchdog. The old passthrough had none: the last command was latched into the
 # motors forever, so if whatever was publishing cmd_vel died mid-drive the robot kept
 # going. Stop if no cmd_vel arrives within this window.
@@ -223,6 +248,26 @@ class KobukiBaseNode(Node):
         self._gyro_calibrated = False
         self.create_timer(0.02, self._imu_update)     # 50 Hz
 
+        # ── Drivetrain health ────────────────────────────────────────────────
+        # The base already reports both of these on every basic-sensor packet and
+        # nothing was surfacing them, which left a real failure mode invisible: the
+        # yaw feed-forward below models this unit's mechanical deadband as
+        # actual = YAW_FF_GAIN * (cmd - YAW_FF_DEADBAND), fitted at R^2 = 0.997, but
+        # that fit is only valid for the battery state it was measured at. Motor
+        # torque falls as the pack drains, which raises effective stiction, so the
+        # curve silently stops describing the hardware and commanded rotation is
+        # under-delivered. Measured live on 2026-09-06: a commanded 0.400 rad/s came
+        # out of the base at 0.092 rad/s with the whole software chain verified
+        # faithful end to end, and there was no way to correlate it against voltage.
+        #
+        # PWM matters as much as voltage here, because together they separate the two
+        # explanations: high PWM with little motion means the wheels are loaded or
+        # stuck, while low PWM means the driver never asked for enough in the first
+        # place. 5 Hz is plenty for both — they are trend signals, not control inputs.
+        self._battery_pub = self.create_publisher(BatteryState, 'battery', 10)
+        self._pwm_pub = self.create_publisher(Int16MultiArray, 'wheel_pwm', 10)
+        self.create_timer(0.2, self._diagnostics_update)   # 5 Hz
+
         # ── Closed-loop velocity control (see CONTROL_PERIOD_S comment block) ──
         # Declared as parameters so the deadband curve can be re-measured and tuned without
         # a rebuild — set feedforward gains to 0 and kp/ki to 0 to characterise open loop.
@@ -234,6 +279,15 @@ class KobukiBaseNode(Node):
         self.declare_parameter('yaw_ki', YAW_RATE_KI_DEFAULT)
         self.declare_parameter('lin_kp', LIN_VEL_KP_DEFAULT)
         self.declare_parameter('lin_ki', LIN_VEL_KI_DEFAULT)
+
+        # Turn radius below which the driver pivots instead of arcing — see the
+        # rotate_flag block in _control_update for why the distinction matters.
+        # Exposed as a parameter so the threshold can be A/B'd against the old
+        # behaviour on the same battery state without a rebuild: setting it to a
+        # near-zero epsilon reproduces the original `linear == 0.0` test exactly,
+        # because a pure-rotation command has a turn radius of 0 and everything
+        # else has a radius comfortably above any epsilon.
+        self.declare_parameter('pivot_radius_m', WHEEL_BASE_M / 2.0)
 
         self._cmd_lin = 0.0          # setpoint from cmd_vel
         self._cmd_ang = 0.0
@@ -265,7 +319,18 @@ class KobukiBaseNode(Node):
 
         L = enc['Left_encoder']
         R = enc['Right_encoder']
-        now = self.get_clock().now()
+        # Capture time, not poll time — and here it sets dt as well as the stamp, so it
+        # decides what velocity this node reports. The encoder delta spans the interval
+        # between the PACKETS the two readings came from; dividing it by the interval
+        # between TIMER FIRINGS is only the same number while the two rates agree. When
+        # they do not, this timer polls the same packet twice: the first poll sees delta=0
+        # and the next sees two packets' worth of ticks, still divided by one timer period
+        # — i.e. an apparent doubling. That is exactly the signature that trips
+        # MAX_PLAUSIBLE_SPEED_MPS below, so the "Rejecting implausible encoder tick"
+        # warnings were partly an artifact of this mismatch rather than corrupted reads.
+        # Timing off capture makes it self-correcting: re-reading one packet yields dt<=0
+        # and is skipped outright instead of inventing a velocity.
+        now = self._capture_stamp(self.robot.packet_monotonic)
 
         if self._prev_L is None:
             self._prev_L, self._prev_R = L, R
@@ -274,15 +339,29 @@ class KobukiBaseNode(Node):
 
         dl = self._tick_diff(L, self._prev_L) / TICKS_PER_M
         dr = self._tick_diff(R, self._prev_R) / TICKS_PER_M
-        self._prev_L, self._prev_R = L, R
 
         dt = (now - self._prev_odom_time).nanoseconds / 1e9
-        self._prev_odom_time = now
         if dt <= 0.0:
+            self._prev_L, self._prev_R = L, R
+            self._prev_odom_time = now
             return   # clock didn't advance (or went backwards) — skip this tick
 
         d      = (dl + dr) / 2.0
         dtheta = (dr - dl) / WHEEL_BASE_M
+
+        if abs(d / dt) > MAX_PLAUSIBLE_SPEED_MPS:
+            # Deliberately do NOT advance _prev_L/_prev_R/_prev_odom_time — see
+            # MAX_PLAUSIBLE_SPEED_MPS. The next good reading then diffs against the last
+            # known-good baseline, correctly folding in whatever real motion happened
+            # during the dropped tick instead of losing it or baking in the glitch.
+            self.get_logger().warn(
+                f'Rejecting implausible encoder tick: {d / dt:.2f} m/s over '
+                f'{dt * 1000:.1f} ms (L={L} R={R} prev_L={self._prev_L} '
+                f'prev_R={self._prev_R}) — corrupted read, not real motion.')
+            return
+
+        self._prev_L, self._prev_R = L, R
+        self._prev_odom_time = now
         self._stationary = abs(d) < STATIONARY_D_THRESHOLD_M and abs(dtheta) < STATIONARY_DTHETA_THRESHOLD_RAD
         self._ox += d * math.cos(self._ot + dtheta / 2.0)
         self._oy += d * math.sin(self._ot + dtheta / 2.0)
@@ -315,6 +394,26 @@ class KobukiBaseNode(Node):
         if dt >= MIN_ODOM_DT_S:
             self._meas_lin += MEAS_FILTER_ALPHA * ((d / dt) - self._meas_lin)
 
+    def _capture_stamp(self, capture_monotonic):
+        """ROS time at which `capture_monotonic` (a time.monotonic() value) happened.
+
+        The driver records packet arrival on the monotonic clock because it is plain
+        Python with no node handle; ROS time lives here. Rather than mix the two, measure
+        the data's AGE on the monotonic clock and subtract that from ROS "now", which is
+        correct regardless of any offset between the clocks.
+
+        Falls back to now() if the driver has not recorded an arrival yet, or if the age
+        comes out negative or implausibly large — a bad stamp is worse than a slightly
+        stale one, since TF lookups at a wrong time silently return a wrong pose.
+        """
+        now = self.get_clock().now()
+        if capture_monotonic is None:
+            return now
+        age = time.monotonic() - capture_monotonic
+        if not (0.0 <= age < MAX_CAPTURE_AGE_S):
+            return now
+        return now - Duration(seconds=age)
+
     # ── IMU (rate gyro only — see YAW_RATE_VARIANCE comment above) ───────────
 
     def _imu_update(self):
@@ -323,7 +422,15 @@ class KobukiBaseNode(Node):
             z_samples = gyro['angular velocity of z: ']
             if not z_samples:
                 return
-            yaw_rate_dps = z_samples[-1]
+            # MEAN of the packet's samples, not z_samples[-1]. The Kobuki reports the gyro
+            # faster than the 50 Hz feedback packet rate, so each packet carries several
+            # z-axis samples; taking only the last threw the rest away. What the EKF does
+            # with this value is integrate it over the interval to get heading
+            # (ekf_hardware.yaml fuses the yaw RATE and nothing else), and the integral of
+            # the interval is exactly the mean — a trailing point-sample is both noisier
+            # and, whenever the rate is changing across the packet, biased.
+            yaw_rate_dps = sum(z_samples) / len(z_samples)
+            capture_monotonic = self.robot.packet_monotonic
         except Exception:
             return   # __gyro not populated yet
 
@@ -342,7 +449,15 @@ class KobukiBaseNode(Node):
         yaw_rate_dps -= self._gyro_bias_dps
 
         msg = Imu()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        # Stamp when this gyro sample was CAPTURED, not when this timer got round to
+        # publishing it. This 50 Hz timer runs independently of the serial reader, so
+        # "now" overstates the data's freshness by however long the packet has been
+        # sitting there — and the EKF has no absolute yaw reference to correct against,
+        # so a rate attributed to the wrong instant integrates straight into a heading
+        # error that never washes out. Same defect, and same fix, as rplidar_node and
+        # kinect_bridge (see docs/ghost_map_investigation.md); the IMU was simply missed
+        # at the time, which mattered more than either, this being the only heading source.
+        msg.header.stamp = self._capture_stamp(capture_monotonic).to_msg()
         msg.header.frame_id = 'imu_link'
 
         # No absolute orientation available from this sensor: element 0 of the
@@ -369,6 +484,40 @@ class KobukiBaseNode(Node):
         self._imu_pub.publish(msg)
 
     # ── Velocity command ─────────────────────────────────────────────────────
+
+    def _diagnostics_update(self):
+        """Publish battery voltage and per-wheel PWM — see the publisher setup comment."""
+        try:
+            sensor = self.robot.basic_sensor_data()
+        except Exception:
+            return   # __basic_sensor not populated yet, same guard as _odom_update
+
+        raw_v = sensor.get('Batteryvolt')
+        if raw_v is not None:
+            msg = BatteryState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            # Kobuki reports battery in 0.1 V units in a single byte.
+            msg.voltage = float(raw_v) * 0.1
+            # 4S Li-ion: ~16.5 V charged, ~13.2 V is the documented low-battery point.
+            # Reported as a rough fraction only, for trend watching, not for gating.
+            msg.percentage = max(0.0, min(1.0, (msg.voltage - 13.2) / (16.5 - 13.2)))
+            msg.present = True
+            msg.power_supply_status = (
+                BatteryState.POWER_SUPPLY_STATUS_CHARGING
+                if str(sensor.get('Charger', '')).endswith('CHARGING')
+                else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+            )
+            self._battery_pub.publish(msg)
+
+        left, right = sensor.get('LeftPWM'), sensor.get('RightPWM')
+        if left is not None and right is not None:
+            # Signed 8-bit: the base reports these as raw bytes.
+            pwm = Int16MultiArray()
+            pwm.data = [
+                left - 256 if left > 127 else left,
+                right - 256 if right > 127 else right,
+            ]
+            self._pwm_pub.publish(pwm)
 
     def cmd_vel_callback(self, msg):
         """Store the velocity setpoint; _control_update does the hardware write."""
@@ -480,7 +629,48 @@ class KobukiBaseNode(Node):
         # velocity, not the post-correction output: out_lin can pick up a small nonzero
         # value from the controller during an in-place turn, and that must not silently
         # switch the driver out of rotation mode.
-        rotate_flag = 1 if self._cmd_lin == 0.0 and angular_z != 0.0 else 0
+        #
+        # The test is the turn RADIUS, not "linear is exactly zero". This used to read
+        # `self._cmd_lin == 0.0`, which meant any linear component at all — however
+        # tiny — dropped the base into arc mode, and the two branches of Kobuki.move()
+        # scale their speed argument completely differently:
+        #   rotation: botspeed = |R - L| / 2      the TANGENTIAL WHEEL speed  (~66 mm/s)
+        #   arc:      botspeed = (L + R) / 2      the ROBOT CENTRE speed      (~20 mm/s)
+        # For a near-pivot those describe near-identical motion, but the arc form asks
+        # for a fraction of the magnitude, and the base's own low-speed threshold then
+        # swallows it. At lin 0.0105 / ang 0.400 the rotation branch asks for 46 mm/s
+        # and the arc branch for 10.5 mm/s — same intended motion, 4.4x less command.
+        #
+        # A/B measured on the bench 2026-09-06, both arms back to back at 15.9 V, yaw
+        # read from the gyro (independent of the wheel model under test), achieved
+        # rad/s as a fraction of commanded:
+        #     lin      ang     radius   old test   radius test
+        #   0.0000    0.400     0.000     1.01        1.04
+        #   0.0105   -0.400     0.026     0.16        1.03
+        #   0.0300    0.400     0.075     0.36        1.01
+        #   0.0600   -0.400     0.150     0.79        0.78   <- true arc, unchanged
+        #   0.0105    0.800     0.013     0.09        1.01
+        # The 0.150 m row is the control: it is a genuine arc under both tests, and it
+        # comes out identical, so the change is confined to the near-pivot regime.
+        # Note the loss worsens as commanded yaw rises (0.09 at 0.800 rad/s) — that is
+        # precisely DWB's turn-hard regime.
+        #
+        # Nav2 emits exactly that combination constantly — DWB rarely outputs a linear
+        # velocity of precisely 0.0 while turning — so in a mission almost every turn was
+        # taking the degraded path. That is what produced the repeated "no progress for
+        # 31s" stalls: the robot was commanded to turn, reported as turning by the
+        # controller, and physically barely moved. Reproducing at 15.9 V also rules out
+        # the battery-droop explanation that was chased first.
+        #
+        # Radius below half the wheelbase means the turn centre lies inside the robot's
+        # own footprint, i.e. it is a pivot in all but name, so the linear term being
+        # discarded by the rotation branch is negligible — and far cheaper than losing
+        # most of the commanded yaw.
+        turn_radius = (
+            abs(self._cmd_lin / self._cmd_ang) if self._cmd_ang != 0.0 else float('inf')
+        )
+        pivot_radius = self.get_parameter('pivot_radius_m').value
+        rotate_flag = 1 if angular_z != 0.0 and turn_radius < pivot_radius else 0
 
         self.robot.move(int(left_wheel_speed), int(right_wheel_speed), rotate_flag)
         self.get_logger().debug(
@@ -500,7 +690,10 @@ def main(args=None):
         node.robot.move(0, 0, 0) 
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # rclpy may already have shut the context down on Ctrl-C; calling shutdown()
+        # again raises RCLError and turns a clean stop into a -9/exit-1 in the logs.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
