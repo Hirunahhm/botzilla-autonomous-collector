@@ -71,6 +71,17 @@ def generate_launch_description():
     # ------------------------------------------------------------------ #
     # Launch arguments
     # ------------------------------------------------------------------ #
+    # Topic names in this file are relative, so the whole stack can be pushed under a
+    # namespace (the collector robot runs it as /bz2/...). Without a namespace they
+    # resolve to exactly the absolute names they used to be.
+    noreset_arg = DeclareLaunchArgument(
+        'noreset_path', default_value=_NORESET,
+        description='LD_PRELOAD shim for the Kinect (see repo-root noreset.so)',
+    )
+    ekf_params_arg = DeclareLaunchArgument(
+        'ekf_params_file', default_value=ekf_config_file,
+        description='robot_localization params; the collector passes a namespaced copy',
+    )
     serial_port_arg = DeclareLaunchArgument(
         'serial_port',
         default_value=(
@@ -115,7 +126,7 @@ def generate_launch_description():
         name='kinect_bridge',
         output='screen',
         parameters=[{'use_sim_time': False}],
-        additional_env={'LD_PRELOAD': _NORESET},
+        additional_env={'LD_PRELOAD': LaunchConfiguration('noreset_path')},
     )
 
     # ------------------------------------------------------------------ #
@@ -167,7 +178,7 @@ def generate_launch_description():
         executable='ekf_node',
         name='ekf_filter_node',
         output='screen',
-        parameters=[ekf_config_file, {'use_sim_time': False}],
+        parameters=[LaunchConfiguration('ekf_params_file'), {'use_sim_time': False}],
     )
 
     # ------------------------------------------------------------------ #
@@ -186,7 +197,7 @@ def generate_launch_description():
                 plugin='depth_image_proc::PointCloudXyzNode',
                 name='point_cloud_xyz_node',
                 remappings=[
-                    ('image_rect', '/camera/depth/image_meters'),
+                    ('image_rect', 'camera/depth/image_meters'),
                     # image_transport::CameraSubscriber derives the info topic from the
                     # image topic's own namespace (here: /camera/depth/camera_info), NOT
                     # from a remap targeting the generic 'camera_info' name — confirmed
@@ -195,8 +206,8 @@ def generate_launch_description():
                     # kinect_bridge only publishes /camera/camera_info) and silently
                     # produced zero synchronized pairs. Must remap the actual resolved
                     # topic name.
-                    ('/camera/depth/camera_info', '/camera/camera_info'),
-                    ('points', '/camera/points'),
+                    ('camera/depth/camera_info', 'camera/camera_info'),
+                    ('points', 'camera/points'),
                 ],
                 parameters=[{'use_sim_time': False}],
             )
@@ -218,8 +229,8 @@ def generate_launch_description():
         name='pointcloud_to_laserscan',
         output='screen',
         remappings=[
-            ('cloud_in', '/camera/points'),
-            ('scan', '/scan_camera'),
+            ('cloud_in', 'camera/points'),
+            ('scan', 'scan_camera'),
         ],
         parameters=[{
             'use_sim_time': False,
@@ -237,6 +248,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        noreset_arg,
+        ekf_params_arg,
         serial_port_arg,
         lidar_port_arg,
         robot_state_publisher,

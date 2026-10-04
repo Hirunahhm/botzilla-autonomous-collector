@@ -69,17 +69,17 @@ class KinectBridge(Node):
     def __init__(self):
         super().__init__('kinect_bridge')
 
-        self.publisher_rgb = self.create_publisher(Image, '/camera/rgb/image_raw', qos_profile_sensor_data)
+        self.publisher_rgb = self.create_publisher(Image, 'camera/rgb/image_raw', qos_profile_sensor_data)
         # mono8, 0-255 rescaled from the raw 11-bit disparity — kept exactly as-is for
         # yolo_node.py's get_depth_at(), which reverses this specific scaling.
-        self.publisher_depth = self.create_publisher(Image, '/camera/depth/image_raw', qos_profile_sensor_data)
+        self.publisher_depth = self.create_publisher(Image, 'camera/depth/image_raw', qos_profile_sensor_data)
         # 32FC1, real metric depth — for RTAB-Map/SLAM consumers, which need actual
         # depth values, not a compact rescaled preview image.
         self.publisher_depth_meters = self.create_publisher(
-            Image, '/camera/depth/image_meters', qos_profile_sensor_data
+            Image, 'camera/depth/image_meters', qos_profile_sensor_data
         )
         self.publisher_camera_info = self.create_publisher(
-            CameraInfo, '/camera/camera_info', qos_profile_sensor_data
+            CameraInfo, 'camera/camera_info', qos_profile_sensor_data
         )
         self._camera_info_msg = _build_camera_info()
 

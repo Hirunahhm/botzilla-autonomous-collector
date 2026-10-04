@@ -14,6 +14,11 @@ from ament_index_python.packages import get_package_share_directory
 import os
 
 def resolve_model_path():
+    # 0. Explicit override, for a machine whose checkout lives somewhere else (the
+    #    collector robot's Pi).
+    override = os.environ.get('BOTZILLA_YOLO_MODEL')
+    if override and os.path.exists(override):
+        return override
     # 1. Check current workspace runs/best-fit/best.pt
     candidates = [
         os.path.join(os.getcwd(), "runs/best-fit/best.pt"),
@@ -44,7 +49,7 @@ class YoloDetector(Node):
         # Subscribe to the Kinect RGB stream
         self.subscription = self.create_subscription(
             Image,
-            '/camera/rgb/image_raw',
+            'camera/rgb/image_raw',
             self.image_callback,
             qos_profile_sensor_data
         )
@@ -52,13 +57,13 @@ class YoloDetector(Node):
         # Subscribe to the Kinect Depth stream
         self.subscription_depth = self.create_subscription(
             Image,
-            '/camera/depth/image_raw',
+            'camera/depth/image_raw',
             self.depth_callback,
             qos_profile_sensor_data
         )
 
         # Publish annotated image for debugging in rqt_image_view
-        self.publisher_annotated = self.create_publisher(Image, '/perception/yolo_image', 10)
+        self.publisher_annotated = self.create_publisher(Image, 'perception/yolo_image', 10)
 
         # Publish cube position to brain_node: x=normalized horizontal, z=distance in meters
         self.cube_pub = self.create_publisher(Point, 'detected_cube', 10)

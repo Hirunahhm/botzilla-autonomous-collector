@@ -228,8 +228,9 @@ class State:
 
 
 class ExecutorNode(Node):
-    def __init__(self):
-        super().__init__('executor_node')
+    def __init__(self, node_name='executor_node'):
+        # node_name: botzilla_fleet's collector_node subclasses this FSM.
+        super().__init__(node_name)
 
         # ── Tunables exposed as ROS parameters ──────────────────────────────
         # Defaults are exactly the module constants they shadow, so an unparameterised
@@ -286,6 +287,10 @@ class ExecutorNode(Node):
         self._nav_goal_handle = None
         self._nav_result = None      # None while in flight; GoalStatus once finished
         self._nav_sent_time = None
+        # Bumped on every goal sent or cancelled. Callbacks carry the value they were
+        # made with and are dropped if it has moved on, so the late CANCELED result of
+        # an abandoned goal can never be read as the result of the next one.
+        self._nav_token = 0
         # Delivery progress watchdog — see DELIVERY_NO_PROGRESS_S.
         self._home_best_dist = None
         self._home_progress_time = None
@@ -295,20 +300,22 @@ class ExecutorNode(Node):
 
         self._cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
+        # Topic names are relative so the node can run under a namespace (the collector
+        # robot, /bz2/...). Un-namespaced they resolve to the same absolute names.
         # Latched: frontier_explorer_node must see the current value even if it
         # starts after us, otherwise it would happily explore while we chase a cube.
         enable_qos = QoSProfile(depth=1)
         enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self._explore_pub = self.create_publisher(
-            Bool, '/exploration_enabled', enable_qos
+            Bool, 'exploration_enabled', enable_qos
         )
         # See "Who owns cmd_vel" above — mutes velocity_smoother whenever this node
         # is the one driving the base, so the two never race on the same topic.
         self._smoother_enable_pub = self.create_publisher(
             Bool, 'velocity_smoother_enabled', enable_qos
         )
-        self._status_pub = self.create_publisher(String, '/mission/status', 10)
-        self._abandoned_pub = self.create_publisher(PointStamped, '/cube_abandoned', 10)
+        self._status_pub = self.create_publisher(String, 'mission/status', 10)
+        self._abandoned_pub = self.create_publisher(PointStamped, 'cube_abandoned', 10)
 
         self.create_subscription(Point, 'detected_cube', self._cube_cb, 10)
 
@@ -446,15 +453,18 @@ class ExecutorNode(Node):
         elif self._state == State.DETACHING:
             self._do_detaching(cmd, now)
 
+        self._drive(cmd)
+        self._publish_status()
+
+    def _drive(self, cmd):
+        """Slew-limit and publish a command from this node — see MAX_LINEAR_ACCEL."""
         max_dv = MAX_LINEAR_ACCEL * CONTROL_PERIOD_S
         max_dw = MAX_ANGULAR_ACCEL * CONTROL_PERIOD_S
         cmd.linear.x = self._slew_limit(cmd.linear.x, self._last_cmd_linear, max_dv)
         cmd.angular.z = self._slew_limit(cmd.angular.z, self._last_cmd_angular, max_dw)
         self._last_cmd_linear = cmd.linear.x
         self._last_cmd_angular = cmd.angular.z
-
         self._cmd_pub.publish(cmd)
-        self._publish_status()
 
     # ------------------------------------------------------------------ #
     # States
@@ -598,10 +608,7 @@ class ExecutorNode(Node):
                 f'cancelling the delivery and releasing the cube here rather than '
                 f'waiting on Nav2.'
             )
-            if self._nav_goal_handle is not None:
-                self._nav_goal_handle.cancel_goal_async()
-                self._nav_goal_handle = None
-            self._nav_sent_time = None
+            self._cancel_nav_goal()
             self._transition(State.DETACHING, 'Delivery made no progress; releasing.')
             return
 
@@ -610,10 +617,7 @@ class ExecutorNode(Node):
                 f'Delivery exceeded {DELIVERY_TIMEOUT_S:.0f}s; giving up on the route '
                 f'and releasing the cube here.'
             )
-            if self._nav_goal_handle is not None:
-                self._nav_goal_handle.cancel_goal_async()
-                self._nav_goal_handle = None
-            self._nav_sent_time = None
+            self._cancel_nav_goal()
             self._transition(State.DETACHING, 'Delivery timed out.')
         else:
             self.get_logger().info(
@@ -671,12 +675,31 @@ class ExecutorNode(Node):
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
-        self._nav_sent_time = self.get_clock().now()
         self._delivery_arrived = False
         self._home_best_dist = None
-        self._home_progress_time = self._nav_sent_time
         self.get_logger().info(f'Sending NavigateToPose to HOME ({x:.2f}, {y:.2f}).')
-        self._nav_client.send_goal_async(goal).add_done_callback(self._goal_response_cb)
+        self._send_nav_goal(goal)
+        self._home_progress_time = self._nav_sent_time
+
+    def _send_nav_goal(self, goal):
+        """Send a NavigateToPose goal; its result lands in self._nav_result."""
+        self._nav_token += 1
+        token = self._nav_token
+        self._nav_result = None
+        self._nav_goal_handle = None
+        self._nav_sent_time = self.get_clock().now()
+        self._nav_client.send_goal_async(goal).add_done_callback(
+            lambda future: self._goal_response_cb(future, token)
+        )
+
+    def _cancel_nav_goal(self):
+        """Cancel the goal in flight (if any) and forget it, including its late result."""
+        self._nav_token += 1
+        if self._nav_goal_handle is not None:
+            self._nav_goal_handle.cancel_goal_async()
+        self._nav_goal_handle = None
+        self._nav_sent_time = None
+        self._nav_result = None
 
     def _set_nav2_reverse_allowed(self, allowed: bool):
         """Push FollowPath.min_vel_x to 0.0 (or restore it) — see NAV2_MIN_VEL_X_DEFAULT."""
@@ -685,18 +708,27 @@ class ExecutorNode(Node):
             [Parameter('FollowPath.min_vel_x', Parameter.Type.DOUBLE, value)]
         )
 
-    def _goal_response_cb(self, future):
+    def _goal_response_cb(self, future, token):
+        if token != self._nav_token:
+            handle = future.result()
+            if handle.accepted:
+                handle.cancel_goal_async()   # superseded before Nav2 even accepted it
+            return
         handle = future.result()
         if not handle.accepted:
-            self.get_logger().warn('Nav2 rejected the HOME goal.')
+            self.get_logger().warn('Nav2 rejected the goal.')
             self._nav_result = GoalStatus.STATUS_ABORTED
             return
         self._nav_goal_handle = handle
-        handle.get_result_async().add_done_callback(self._result_cb)
+        handle.get_result_async().add_done_callback(
+            lambda result_future: self._result_cb(result_future, token)
+        )
 
-    def _result_cb(self, future):
+    def _result_cb(self, future, token):
         # Recorded rather than acted on directly: the state machine owns transitions,
         # and this fires on an executor thread.
+        if token != self._nav_token:
+            return
         self._nav_result = future.result().status
 
     # ------------------------------------------------------------------ #

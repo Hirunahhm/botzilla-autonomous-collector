@@ -1,0 +1,51 @@
+# AMCL for the collector robot: localise in the LEADER's live /map with the collector's
+# own RPLIDAR. Merged into the collector's Nav2 params by botzilla_fleet's
+# collector.launch.py (see params_rewrite.py), which also sets the initial pose from the
+# launch arguments, so these keys are un-namespaced here.
+#
+# The initial pose is the collector's start pose in the leader's map frame. RTAB-Map puts
+# that frame's origin at the LEADER's start pose, so it is the offset between the two
+# taped start spots, and it must be measured, not guessed: AMCL recovers from a few
+# decimetres, not from a wrong side of the room.
+amcl:
+  ros__parameters:
+    use_sim_time: False
+    map_topic: /map
+    scan_topic: scan
+    global_frame_id: map
+    odom_frame_id: odom
+    base_frame_id: base_footprint
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    # The leader's map grows while the collector works. Every update is taken; AMCL
+    # keeps its particle filter across map updates and only rebuilds the map lookup.
+    first_map_only: false
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    robot_model_type: nav2_amcl::DifferentialMotionModel
+    laser_model_type: likelihood_field
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 12.0
+    laser_min_range: 0.15
+    max_beams: 60
+    min_particles: 300
+    max_particles: 1500
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    z_hit: 0.5
+    z_rand: 0.5
+    z_max: 0.05
+    z_short: 0.05
+    sigma_hit: 0.2
+    lambda_short: 0.1
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    resample_interval: 1
+    save_pose_rate: 0.5
+    update_min_a: 0.2
+    update_min_d: 0.15
