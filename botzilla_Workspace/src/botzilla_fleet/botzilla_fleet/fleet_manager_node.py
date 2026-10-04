@@ -70,7 +70,11 @@ class FleetManagerNode(Node):
         self._leader_home = None
         self._status = None          # latest CollectorStatus
         self._status_time = None
-        self._current = None         # task id assigned and not yet reported
+        # Task ids are per ASSIGNMENT, not per cube: a cube that failed once is assigned
+        # again later, and reusing its id would let the collector's report of the first
+        # attempt (still in its status as last_task_id) close the second one at once.
+        self._task_seq = 0
+        self._current = None         # (task_id, cube_id) assigned and not yet reported
         self._assigned_time = None
         self._home_zone_applied = False
 
@@ -152,18 +156,21 @@ class FleetManagerNode(Node):
         self._status_time = self._now_s()
         if first:
             self._event('collector_up', robot=msg.robot, state=msg.state)
+        # A restarted manager must not reuse ids the collector has already seen.
+        self._task_seq = max(self._task_seq, msg.task_id, msg.last_task_id)
         if msg.home_set and not self._home_zone_applied:
             self._home_zone_applied = True
             gone = self._registry.drop_inside([(msg.home_x, msg.home_y, self._home_excl)])
             self._event('collector_home', x=round(msg.home_x, 2), y=round(msg.home_y, 2),
                         dropped=gone)
-        if (self._current is not None and msg.last_task_id == self._current
-                and msg.task_id != self._current
+        if (self._current is not None and msg.last_task_id == self._current[0]
+                and msg.task_id != self._current[0]
                 and msg.last_result != CollectorStatus.RESULT_NONE):
             collected = msg.last_result == CollectorStatus.RESULT_COLLECTED
-            cube = self._registry.report(self._current, collected, self._now_s(),
+            task_id, cube_id = self._current
+            cube = self._registry.report(cube_id, collected, self._now_s(),
                                          msg.last_detail)
-            self._event('result', id=self._current,
+            self._event('result', id=cube_id, task=task_id,
                         result='collected' if collected else 'failed',
                         detail=msg.last_detail, delivered=msg.delivered,
                         status=cube.status if cube else None,
@@ -177,8 +184,8 @@ class FleetManagerNode(Node):
             return
         if not self._status_fresh():
             if self._current is not None:
-                self._event('collector_silent', id=self._current)
-                self._registry.unassign(self._current)
+                self._event('collector_silent', id=self._current[1], task=self._current[0])
+                self._registry.unassign(self._current[1])
                 self._current = None
             return
         if self._current is not None or s.state != 'IDLE' or not s.localised:
@@ -187,13 +194,14 @@ class FleetManagerNode(Node):
         if cube is None:
             return
         self._registry.assign(cube.id)
-        self._current = cube.id
+        self._task_seq += 1
+        self._current = (self._task_seq, cube.id)
         self._assigned_time = self._now_s()
-        task = CubeTask(task_id=cube.id, sightings=cube.sightings)
+        task = CubeTask(task_id=self._task_seq, cube_id=cube.id, sightings=cube.sightings)
         task.target.x, task.target.y = cube.x, cube.y
         self._task_pub.publish(task)
-        self._event('assign', id=cube.id, x=round(cube.x, 2), y=round(cube.y, 2),
-                    sightings=cube.sightings,
+        self._event('assign', id=cube.id, task=self._task_seq,
+                    x=round(cube.x, 2), y=round(cube.y, 2), sightings=cube.sightings,
                     dist=round(math.hypot(cube.x - s.x, cube.y - s.y), 2))
 
     def _summary(self):

@@ -6,11 +6,9 @@ feeds it projected detections and collector reports.
 
 A cube estimate goes through
     pending (unconfirmed) -> pending (confirmed) -> assigned -> collected
-                                                         \\-> pending again (a failure)
-                                                          \\-> failed (FAILURE_LIMIT
-                                                               failures; parked for
-                                                               RETRY_AFTER_S, then
-                                                               pending again)
+    assigned -> pending again, after a failure
+    assigned -> failed, after FAILURE_LIMIT failures; parked for RETRY_AFTER_S, then
+                pending again
 
 Why each rule exists:
 - CONFIRM_SIGHTINGS: one YOLO frame is not evidence. The executor's spot limit exists
@@ -119,14 +117,18 @@ class CubeRegistry:
         return cube.sightings >= self.confirm_sightings
 
     def next_task(self, robot_xy, t):
-        """The nearest confirmed pending cube to robot_xy, or None."""
+        """Return the next cube for a collector at robot_xy, or None.
+
+        Fewest failures first, then nearest: a cube that has just failed is retried only
+        once nothing untried is left, so one bad spot cannot hold up the others.
+        """
         self._refresh(t)
         ready = [c for c in self.cubes.values()
                  if c.status == 'pending' and self.confirmed(c)]
         if not ready:
             return None
         rx, ry = robot_xy
-        return min(ready, key=lambda c: (math.hypot(c.x - rx, c.y - ry), c.id))
+        return min(ready, key=lambda c: (c.failures, math.hypot(c.x - rx, c.y - ry), c.id))
 
     def assign(self, cube_id):
         self.cubes[cube_id].status = 'assigned'
