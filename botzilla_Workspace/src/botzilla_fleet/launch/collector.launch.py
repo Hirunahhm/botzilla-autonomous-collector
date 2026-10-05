@@ -108,6 +108,9 @@ def _launch(context, *_args, **_kwargs):
             'lidar_port': lidar,
             'ekf_params_file': ekf_file,
             'noreset_path': arg('noreset_path'),
+            # Depth aligned to RGB: unregistered, this Kinect's depth for a cube 0.9 m
+            # away fell ~30 px beside the cube's RGB box (see kinect_bridge).
+            'depth_registered': 'true',
         }.items(),
     )
 

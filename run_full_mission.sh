@@ -615,6 +615,11 @@ if [ -n "$FLEET_NS" ]; then
     # (botzilla_fleet remote_detection_node). A second container, not a second node in
     # the first, so either can be restarted without the other.
     FLEET_YOLO_NAME="botzilla_yolo_${FLEET_NS}"
+    # 0.6, not the leader's 0.8: from the collector's camera the cube scored a steady
+    # 0.79-0.81 (detected in 105/105 frames at 0.3, but only 34 cleared 0.8), while
+    # background noise has measured at most 0.14 (executor_node CUBE_MAX_RANGE_M
+    # notes). The collector also only acts on boxes within 0.7 m of its task.
+    FLEET_YOLO_CONFIDENCE=0.6
     docker rm -f "$FLEET_YOLO_NAME" >/dev/null 2>&1 || true
     ( cd "$REPO_ROOT"
       export ROS_DISCOVERY_SERVER="127.0.0.1:${DISCOVERY_PORT}"
@@ -622,7 +627,8 @@ if [ -n "$FLEET_NS" ]; then
       export CONTAINER_NAME="$FLEET_YOLO_NAME"
       exec ./docker/yolo/run_yolo_container.sh \
           ros2 run botzilla_perception yolo_node --ros-args \
-              -r "__ns:=/$FLEET_NS" -p mode:=boxes ) > "$LOG_DIR/fleet_yolo.log" 2>&1 &
+              -r "__ns:=/$FLEET_NS" -p mode:=boxes -p confidence:=$FLEET_YOLO_CONFIDENCE ) \
+        > "$LOG_DIR/fleet_yolo.log" 2>&1 &
     PIDS+=("$!")
     wait_for_log "$LOG_DIR/fleet_yolo.log" "mode=boxes" 120 "YOLO for the collector's camera (boxes mode)"
 fi

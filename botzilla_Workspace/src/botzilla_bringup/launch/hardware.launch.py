@@ -50,6 +50,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.descriptions import ComposableNode
 
 _NORESET = os.path.join(
@@ -77,6 +78,11 @@ def generate_launch_description():
     noreset_arg = DeclareLaunchArgument(
         'noreset_path', default_value=_NORESET,
         description='LD_PRELOAD shim for the Kinect (see repo-root noreset.so)',
+    )
+    depth_registered_arg = DeclareLaunchArgument(
+        'depth_registered', default_value='false',
+        description='Kinect depth aligned to RGB, 16UC1 mm (see kinect_bridge); the '
+                    'collector robot needs it, the leader keeps raw disparity',
     )
     ekf_params_arg = DeclareLaunchArgument(
         'ekf_params_file', default_value=ekf_config_file,
@@ -125,7 +131,11 @@ def generate_launch_description():
         executable='kinect_bridge',
         name='kinect_bridge',
         output='screen',
-        parameters=[{'use_sim_time': False}],
+        parameters=[{
+            'use_sim_time': False,
+            'depth_registered': ParameterValue(
+                LaunchConfiguration('depth_registered'), value_type=bool),
+        }],
         additional_env={'LD_PRELOAD': LaunchConfiguration('noreset_path')},
     )
 
@@ -249,6 +259,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         noreset_arg,
+        depth_registered_arg,
         ekf_params_arg,
         serial_port_arg,
         lidar_port_arg,
