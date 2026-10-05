@@ -36,17 +36,30 @@ from launch_ros.actions import Node, PushRosNamespace, SetRemap
 import yaml
 
 KOBUKI_GLOBS = ('/dev/serial/by-id/*Kobuki*', '/dev/serial/by-id/*Yujin*')
-LIDAR_GLOBS = ('/dev/serial/by-id/*CP2102N*', '/dev/serial/by-id/*Silicon_Labs*')
+# The collector's RPLIDAR C1 sits behind a CH340 USB adapter (1a86:7523), not the
+# CP2102N the leader's has; both are listed so either robot's LiDAR is found.
+LIDAR_GLOBS = ('/dev/serial/by-id/*CP2102N*', '/dev/serial/by-id/*Silicon_Labs*',
+               '/dev/serial/by-id/usb-1a86_USB_Serial*', '/dev/serial/by-id/*CH340*')
 
 
-def _find_port(given, patterns, fallback):
+def _find_port(given, patterns, what):
+    """Return the explicit port, else the first by-id match; never a guessed ttyUSBn.
+
+    The ttyUSB numbering depends on plug order: on the collector Pi ttyUSB0 is the LiDAR
+    and ttyUSB1 the Kobuki, the reverse of the old defaults, and a driver opened on the
+    wrong device fails in confusing ways.
+    """
     if given:
         return given
     for pattern in patterns:
         hits = sorted(glob.glob(pattern))
         if hits:
             return hits[0]
-    return fallback
+    present = sorted(glob.glob('/dev/serial/by-id/*'))
+    raise RuntimeError(
+        f'{what} not found by id (looked for {patterns}); serial devices present: '
+        f'{present or "none"}. Plug it in, or pass its port explicitly.'
+    )
 
 
 def _write_yaml(data, prefix):
@@ -74,13 +87,13 @@ def _launch(context, *_args, **_kwargs):
         'x': float(arg('start_x')), 'y': float(arg('start_y')), 'z': 0.0,
         'yaw': float(arg('start_yaw')),
     }
-    nav2_file = _write_yaml(namespaced(collector_nav2_params(nav2_base, amcl), ns),
+    nav2_file = _write_yaml(namespaced(collector_nav2_params(nav2_base, ns, amcl), ns),
                             f'{ns}_nav2_')
     with open(os.path.join(nav_share, 'config', 'ekf_hardware.yaml')) as f:
         ekf_file = _write_yaml(namespaced(yaml.safe_load(f), ns), f'{ns}_ekf_')
 
-    kobuki = _find_port(arg('serial_port'), KOBUKI_GLOBS, '/dev/ttyUSB0')
-    lidar = _find_port(arg('lidar_port'), LIDAR_GLOBS, '/dev/ttyUSB1')
+    kobuki = _find_port(arg('serial_port'), KOBUKI_GLOBS, 'Kobuki')
+    lidar = _find_port(arg('lidar_port'), LIDAR_GLOBS, 'RPLIDAR')
 
     hardware = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(

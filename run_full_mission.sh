@@ -41,6 +41,10 @@
 #                                  grid. 'interleaved' uses --sweep-area as trigger.
 #   --detect-only                  never chase a detected cube; keep searching. Every
 #                                  counted research run uses this.
+#   --fleet [NS]                   two-robot run: this robot only searches (implies
+#                                  --detect-only) and fleet_manager_node sends the cubes
+#                                  it finds to the collector robot /NS (default bz2),
+#                                  started on the Pi with ./run_collector.sh.
 #   --floor-area M2                measured arena floor area, the fixed coverage
 #                                  denominator (overrides floor_area_m2 in --layout).
 #   --row-planner SweepStraight|GridBased
@@ -118,6 +122,7 @@ SWEEP_AREA=""      # empty => launch default (3.0)
 DETECT_ONLY=0
 STRATEGY=""        # empty => launch default (sweep)
 INSPECTION=""      # empty => launch default (mixed)
+FLEET_NS=""        # empty => single robot; else the collector's namespace
 FLOOR_AREA=""      # empty => take floor_area_m2 from the layout, if any
 
 # Printed by --help: the contiguous comment block at the top of this file. Derived
@@ -145,6 +150,8 @@ while [ $# -gt 0 ]; do
         --sweep-area)  SWEEP_AREA="${2:-}"; shift ;;
         --sweep-area=*) SWEEP_AREA="${1#*=}" ;;
         --detect-only) DETECT_ONLY=1 ;;
+        --fleet)       FLEET_NS="bz2"
+                       if [ -n "${2:-}" ] && [[ "${2}" != --* ]]; then FLEET_NS="$2"; shift; fi ;;
         --strategy)    STRATEGY="${2:-}"; shift ;;
         --strategy=*)  STRATEGY="${1#*=}" ;;
         --inspection)  INSPECTION="${2:-}"; shift ;;
@@ -184,6 +191,11 @@ if [ -n "$INSPECTION" ] && [ "$STRATEGY" != "region" ] && [ "$STRATEGY" != "inte
 fi
 if [ -n "$POLICY" ] && [ -n "$STRATEGY" ] && [ "$STRATEGY" != "sweep" ]; then
     echo "WARNING: --policy only affects --strategy sweep; it is ignored here." >&2
+fi
+# In a two-robot run the leader only searches: a chase here would compete with the
+# collector for the same cube.
+if [ -n "$FLEET_NS" ]; then
+    DETECT_ONLY=1
 fi
 # Positive decimals only: rclpy would reject a non-number at launch, but only after
 # the whole stack is up.
@@ -332,7 +344,7 @@ cleanup() {
     echo "logs: $LOG_DIR"
 }
 # Everything this script starts, for pgrep-based checks and forced cleanup.
-LAUNCH_PATTERN="fast-discovery-server|fastdds discovery|ros2 launch botzilla|kobuki_base_node|kinect_bridge|rplidar_node|ekf_node|odom_covariance_relay|pointcloud_to_laserscan|robot_state_publisher|component_container|rtabmap|controller_server|planner_server|behavior_server|bt_navigator|velocity_smoother|lifecycle_manager|executor_node|frontier_explorer_node|mission_metrics_node"
+LAUNCH_PATTERN="fast-discovery-server|fastdds discovery|ros2 launch botzilla|kobuki_base_node|kinect_bridge|rplidar_node|ekf_node|odom_covariance_relay|pointcloud_to_laserscan|robot_state_publisher|component_container|rtabmap|controller_server|planner_server|behavior_server|bt_navigator|velocity_smoother|lifecycle_manager|executor_node|frontier_explorer_node|mission_metrics_node|fleet_manager_node"
 # Ctrl+C must exit outright. With a bare `trap cleanup INT` the shell resumes the
 # interrupted `sleep` afterwards, the watch loop then notices the processes cleanup
 # just stopped, and reports them as an unexpected crash — alarming and untrue.
@@ -374,7 +386,8 @@ start_bg() {   # <logfile> <cmd...>
 # The metrics node adds a stage, so the denominator is computed rather than written
 # into six separate strings that would disagree with each other the moment one moved.
 TOTAL_STEPS=6
-[ "$RUN_METRICS" = 1 ] && TOTAL_STEPS=7
+[ "$RUN_METRICS" = 1 ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ -n "$FLEET_NS" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 STEP_N=0
 next_step() { STEP_N=$((STEP_N + 1)); step "${STEP_N}/${TOTAL_STEPS}  $*"; }
 
@@ -459,6 +472,7 @@ fi
     echo "  \"inspection\": \"${INSPECTION:-mixed}\","
     echo "  \"floor_area_m2\": ${FLOOR_AREA:-null},"
     echo "  \"mission\": $([ "$RUN_MISSION" = 1 ] && echo true || echo false),"
+    echo "  \"fleet\": $([ -n "$FLEET_NS" ] && echo "\"$FLEET_NS\"" || echo null),"
     echo "  \"git_commit\": \"$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)\","
     echo "  \"git_dirty\": $(git -C "$REPO_ROOT" diff --quiet 2>/dev/null && echo false || echo true),"
     echo "  \"host\": \"$(hostname)\""
@@ -585,6 +599,15 @@ else
     next_step "mission executor SKIPPED (--no-mission)"
 fi
 
+# ── 8. fleet manager (optional) ──────────────────────────────────────────────
+if [ -n "$FLEET_NS" ]; then
+    next_step "fleet manager (cubes found here -> collector /$FLEET_NS)"
+    start_bg "$LOG_DIR/fleet.log" \
+        ros2 run botzilla_fleet fleet_manager_node --ros-args \
+            -p use_sim_time:=false -p "collector_ns:=$FLEET_NS"
+    wait_for_log "$LOG_DIR/fleet.log" "fleet_manager_node: leader searches" 30 "fleet manager up"
+fi
+
 # ── ready ────────────────────────────────────────────────────────────────────
 cat <<EOF
 
@@ -624,6 +647,17 @@ ${C_OK}================ STACK IS UP ================${C_0}
   Watch from here:
     tail -f $LOG_DIR/executor.log
     ros2 topic echo /mission/status
+$( [ -n "$FLEET_NS" ] && cat <<FLEET
+
+  ${C_INF}Two-robot run${C_0}: start the collector on the Pi now (same hotspot):
+    ssh groot@groot.local
+    cd ~/hiruna/botzilla-autonomous-collector
+    ./run_collector.sh --leader $(hostname).local --ns $FLEET_NS --start X Y YAW
+  (X Y YAW = the collector's start spot relative to this robot's start, metres/rad)
+    tail -f $LOG_DIR/fleet.log | grep FLEET
+    RViz: add MarkerArray /fleet/cubes
+FLEET
+)
 $( [ "$RUN_METRICS" = 1 ] && cat <<METRICS
 
   ${C_INF}Recording${C_0} to $LOG_DIR/metrics.jsonl

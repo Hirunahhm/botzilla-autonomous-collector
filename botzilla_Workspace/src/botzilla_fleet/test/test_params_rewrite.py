@@ -23,15 +23,21 @@ def walk(node, path=()):
         yield path, node
 
 
-def test_no_absolute_topics_except_map():
-    p = collector_nav2_params(load())
+def test_absolute_topics_moved_into_namespace():
+    p = collector_nav2_params(load(), 'bz2')
     for path, val in walk(p):
         if path and path[-1].endswith('topic') and isinstance(val, str):
-            assert not val.startswith('/') or val == '/map', (path, val)
+            assert not val.startswith('/') or val == '/map' or val.startswith('/bz2/'), \
+                (path, val)
+    # Costmap layers must name the robot's topic absolutely: a relative 'scan' in a
+    # costmap resolves to /bz2/local_costmap/scan (see params_rewrite docstring).
+    lc = p['local_costmap']['local_costmap']['ros__parameters']
+    assert lc['voxel_layer']['scan']['topic'] == '/bz2/scan'
+    assert p['bt_navigator']['ros__parameters']['odom_topic'] == '/bz2/odom'
 
 
 def test_leader_only_plugins_removed():
-    p = collector_nav2_params(load())
+    p = collector_nav2_params(load(), 'bz2')
     planner = p['planner_server']['ros__parameters']
     assert 'SweepStraight' not in planner['planner_plugins']
     assert 'SweepStraight' not in planner
@@ -43,7 +49,7 @@ def test_leader_only_plugins_removed():
 def test_leader_params_untouched_and_amcl_merged():
     base = load()
     before = yaml.safe_dump(base)
-    p = collector_nav2_params(base, {'amcl': {'ros__parameters': {'x': 1}}})
+    p = collector_nav2_params(base, 'bz2', {'amcl': {'ros__parameters': {'x': 1}}})
     assert yaml.safe_dump(base) == before
     assert p['amcl']['ros__parameters']['x'] == 1
 
