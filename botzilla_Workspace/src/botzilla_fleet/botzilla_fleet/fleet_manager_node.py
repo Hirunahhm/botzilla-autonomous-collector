@@ -15,7 +15,8 @@ Discrete goals only, never velocities (PROJECT.md §6): if the network drops the
 collector finishes or fails its current task on its own, and a collector that goes
 silent for STATUS_TIMEOUT_S has its task returned to the pool.
 
-Also publishes /fleet/cubes (MarkerArray) for RViz and logs a one-line summary every
+Also publishes /fleet/cube_obstacles (PointCloud2) so the leader's own Nav2 stops driving
+into cubes it has already seen — see CUBE_OBSTACLE_Z — and /fleet/cubes (MarkerArray) for RViz and logs a one-line summary every
 SUMMARY_PERIOD_S, plus one JSON line per event to the run log for analysis.
 """
 import json
@@ -25,10 +26,14 @@ from botzilla_fleet.cube_registry import CubeRegistry
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 import tf2_ros
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Header
 from tf2_ros import TransformException
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -44,6 +49,18 @@ ALLOCATE_PERIOD_S = 1.0
 SUMMARY_PERIOD_S = 30.0
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
+
+# Known cubes as obstacles for the leader's costmaps (nav2_params.yaml source
+# 'fleet_cubes'). Needed because the leader drives into cubes it has detected: the
+# RPLIDAR scans at 0.24 m (URDF laser_joint), above a cube, so it never marks one and
+# its rays clear the cells under them; the depth camera's low scan only sees from
+# 0.55 m out; and in detect-only mode the executor deliberately ignores detections.
+# Points are placed AT the LiDAR's height on purpose: re-published at CUBE_OBSTACLE_HZ
+# a cube stays marked (each costmap update marks after it clears), and once a cube is
+# no longer published (collected) the LiDAR's own clearing rays erase it.
+CUBE_OBSTACLE_Z = 0.24
+CUBE_OBSTACLE_HALF_M = 0.05      # 3 x 3 points 5 cm apart: a ~0.15 m square per cube
+CUBE_OBSTACLE_HZ = 5.0
 
 COLOURS = {
     'unconfirmed': (0.6, 0.6, 0.6),
@@ -90,6 +107,8 @@ class FleetManagerNode(Node):
         latched.reliability = QoSReliabilityPolicy.RELIABLE
         self._task_pub = self.create_publisher(CubeTask, f'/{self._ns}/fleet/task', latched)
         self._marker_pub = self.create_publisher(MarkerArray, '/fleet/cubes', 10)
+        self._obstacle_pub = self.create_publisher(PointCloud2, '/fleet/cube_obstacles', 10)
+        self.create_timer(1.0 / CUBE_OBSTACLE_HZ, self._publish_obstacles)
         self.create_subscription(Point, '/detected_cube', self._cube_cb, 10)
         self.create_subscription(
             CollectorStatus, f'/{self._ns}/fleet/status', self._status_cb, 10
@@ -227,6 +246,21 @@ class FleetManagerNode(Node):
             f'{c["assigned"]} assigned, {c["collected"]} collected, {c["failed"]} failed '
             f'| {coll}'
         )
+
+    def _publish_obstacles(self):
+        """Every confirmed, not-yet-collected cube as a small square of points."""
+        offs = np.arange(-1, 2) * CUBE_OBSTACLE_HALF_M
+        pts = []
+        for cube in self._registry.cubes.values():
+            if cube.status == 'collected' or not self._registry.confirmed(cube):
+                continue
+            for dx in offs:
+                for dy in offs:
+                    pts.append((cube.x + dx, cube.y + dy, CUBE_OBSTACLE_Z))
+        # Published even when empty, so the costmap's buffer holds "no cubes" rather
+        # than the last non-empty cloud.
+        header = Header(frame_id=MAP_FRAME, stamp=self.get_clock().now().to_msg())
+        self._obstacle_pub.publish(point_cloud2.create_cloud_xyz32(header, pts))
 
     def _publish_markers(self):
         arr = MarkerArray()
