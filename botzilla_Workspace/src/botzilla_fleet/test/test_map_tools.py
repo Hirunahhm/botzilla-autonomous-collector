@@ -34,3 +34,15 @@ def test_rotated_footprint_has_no_holes():
 def test_no_points_is_none():
     from botzilla_fleet.map_tools import points_to_grid
     assert points_to_grid([], 0.05) is None
+
+
+def test_halo_grid_core_and_halo():
+    from botzilla_fleet.map_tools import halo_grid
+    data, ox, oy, w, h = halo_grid([(1.0, 1.0)], 0.05, 0.05, 0.2, 30)
+
+    def at(x, y):
+        return data[int((y - oy) / 0.05), int((x - ox) / 0.05)]
+    assert at(1.0, 1.0) == 100 and at(1.04, 0.96) == 100      # core
+    assert at(1.15, 1.0) == 30                                # halo
+    assert at(1.3, 1.0) == 0                                  # outside
+    assert halo_grid([], 0.05, 0.05, 0.2, 30) is None

@@ -24,7 +24,9 @@ import json
 import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
-from botzilla_fleet.map_tools import clear_discs, place, points_to_grid, rect_points
+from botzilla_fleet.map_tools import (
+    clear_discs, halo_grid, place, points_to_grid, rect_points,
+)
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point
@@ -74,6 +76,12 @@ OBSTACLE_SAMPLE_M = 0.025          # half a cell, so a rotated footprint has no 
 # 0.45 m anyway, and with a margin on top the robots showed as oversized blocks that
 # took up corridors (2026-10-06).
 CUBE_OBSTACLE_HALF_M = 0.05        # a 0.10 m square per cube
+# Cubes are published on their own grid, drawn by 'cube_layer' AFTER the inflation layer:
+# lethal, so no footprint can pass over one, but without the 0.45 m inflated disc that
+# made a cube in a corridor a wall the leader could not get past (2026-10-06). Instead a
+# soft halo makes the planner keep a little clear while still allowing a close pass.
+CUBE_HALO_RADIUS_M = 0.20
+CUBE_HALO_VALUE = 30               # -> costmap cost ~76: a preference, not a barrier
 # Footprint from nav2_params.yaml (both robots share the URDF): base and grabber arms.
 ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
 ROBOT_OBSTACLE_MARGIN_M = 0.0
@@ -141,14 +149,16 @@ class FleetManagerNode(Node):
             OccupancyGrid, '/fleet/obstacle_grid', latched)                 # for the leader
         self._collector_grid_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/obstacle_grid', latched)     # for the collector
+        self._leader_cube_pub = self.create_publisher(
+            OccupancyGrid, '/fleet/cube_grid', latched)
+        self._collector_cube_pub = self.create_publisher(
+            OccupancyGrid, f'/{self._ns}/fleet/cube_grid', latched)
         self._collector_map_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/map', latched)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
         m = ROBOT_OBSTACLE_MARGIN_M
         (x0, x1), (y0, y1) = ROBOT_FOOTPRINT
         self._footprint_pts = rect_points((x0 - m, x1 + m), (y0 - m, y1 + m), OBSTACLE_SAMPLE_M)
-        h = CUBE_OBSTACLE_HALF_M
-        self._cube_pts = rect_points((-h, h), (-h, h), OBSTACLE_SAMPLE_M)
         self.create_timer(1.0 / OBSTACLE_GRID_HZ, self._publish_obstacles)
         self.create_subscription(Point, '/detected_cube', self._cube_cb, 10)
         self.create_subscription(
@@ -289,16 +299,15 @@ class FleetManagerNode(Node):
         )
 
     def _publish_obstacles(self):
-        """Publish each robot's obstacle grid (see OBSTACLE_GRID_HZ)."""
+        """Publish each robot's robot grid and cube grid (see OBSTACLE_GRID_HZ)."""
         assigned = self._current[1] if self._current is not None else None
         cubes, cubes_but_target = [], []
         for cube in self._registry.cubes.values():
             if cube.status == 'collected' or not self._registry.confirmed(cube):
                 continue
-            pts = self._cube_pts + (cube.x, cube.y)
-            cubes.append(pts)
+            cubes.append((cube.x, cube.y))
             if cube.id != assigned:
-                cubes_but_target.append(pts)
+                cubes_but_target.append((cube.x, cube.y))
         s = self._status
         collector = None
         if (s is not None and s.localised and self._status_time is not None
@@ -306,9 +315,16 @@ class FleetManagerNode(Node):
             collector = (s.x, s.y, s.yaw)
         leader = self._leader_pose()
         self._leader_grid_pub.publish(self._grid(
-            cubes + ([place(self._footprint_pts, collector)] if collector else [])))
+            [place(self._footprint_pts, collector)] if collector else []))
         self._collector_grid_pub.publish(self._grid(
-            cubes_but_target + ([place(self._footprint_pts, leader)] if leader else [])))
+            [place(self._footprint_pts, leader)] if leader else []))
+        self._leader_cube_pub.publish(self._cube_grid(cubes))
+        self._collector_cube_pub.publish(self._cube_grid(cubes_but_target))
+
+    def _cube_grid(self, centres):
+        """Cubes as lethal cores with a soft halo (see CUBE_HALO_RADIUS_M)."""
+        return self._to_msg(halo_grid(centres, OBSTACLE_GRID_RES, CUBE_OBSTACLE_HALF_M,
+                                      CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE))
 
     def _grid(self, chunks):
         """Build an OccupancyGrid of the given point arrays (empty when there are none).
@@ -316,12 +332,16 @@ class FleetManagerNode(Node):
         Empty grids are published too: the layer then repaints, and so clears, wherever
         the previous grid was.
         """
+        return self._to_msg(
+            points_to_grid(np.concatenate(chunks) if chunks else None, OBSTACLE_GRID_RES))
+
+    def _to_msg(self, raster):
+        """Wrap a (data, ox, oy, w, h) raster, or None, as an OccupancyGrid in the map."""
         msg = OccupancyGrid()
         msg.header.frame_id = MAP_FRAME
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.info.resolution = OBSTACLE_GRID_RES
         msg.info.origin.orientation.w = 1.0
-        raster = points_to_grid(np.concatenate(chunks) if chunks else None, OBSTACLE_GRID_RES)
         if raster is not None:
             data, ox, oy, w, h = raster
             msg.info.origin.position.x, msg.info.origin.position.y = ox, oy

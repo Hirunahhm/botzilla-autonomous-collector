@@ -21,7 +21,7 @@ void CoverageCostLayer::onInitialize()
   declareParameter("enabled", rclcpp::ParameterValue(true));
   declareParameter("topic", rclcpp::ParameterValue(std::string("/coverage_cost_map")));
   // lethal: the grid holds obstacles, not preferences. Cells >= 50 become LETHAL and
-  // nothing is capped or skipped. botzilla_fleet uses a second instance of this layer
+  // nothing is capped or skipped; cells 1..49 are a soft cost halo. botzilla_fleet uses a second instance of this layer
   // ('fleet_layer') for the other robot's footprint and the known cubes: they move or
   // disappear, and this layer repaints its whole previous extent on every message, so
   // an old footprint is gone at the next update. As marking points in an obstacle
@@ -248,8 +248,19 @@ void CoverageCostLayer::updateCosts(
         if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
           continue;
         }
-        if (grid->data[gy * gw + gx] >= 50) {
+        const int8_t value = grid->data[gy * gw + gx];
+        if (value >= 50) {
           master_grid.setCost(i, j, nav2_costmap_2d::LETHAL_OBSTACLE);
+        } else if (value > 0) {
+          // Soft halo (1..49 -> cost 2..123): a preference to keep clear, never a
+          // collision, and never lowering what other layers put there. Lets a cube be
+          // passed close by when this layer sits after the inflation layer (the cube
+          // itself still lethal, but no 0.45 m inflated disc around it).
+          const unsigned char current = master_grid.getCost(i, j);
+          const int cost = static_cast<int>(std::lround(value * 2.52));
+          if (current != nav2_costmap_2d::NO_INFORMATION && cost > current) {
+            master_grid.setCost(i, j, static_cast<unsigned char>(cost));
+          }
         }
       }
     }

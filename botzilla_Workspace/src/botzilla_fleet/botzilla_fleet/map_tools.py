@@ -60,3 +60,28 @@ def points_to_grid(points, resolution):
     data = np.zeros((h, w), dtype=np.int8)
     data[iy, ix] = 100
     return data, ox, oy, w, h
+
+
+def halo_grid(centres, resolution, core_half_m, halo_radius_m, halo_value):
+    """Grid of square lethal cores (100) with a round soft halo (halo_value) around each.
+
+    centres: [(x, y), ...] in the map frame. Returns (data, origin_x, origin_y, width,
+    height) like points_to_grid, or None when there are no centres.
+    """
+    if not centres:
+        return None
+    pts = np.asarray(centres, dtype=float)
+    reach = max(core_half_m, halo_radius_m)
+    ox = math.floor((pts[:, 0].min() - reach) / resolution) * resolution
+    oy = math.floor((pts[:, 1].min() - reach) / resolution) * resolution
+    w = int(math.ceil((pts[:, 0].max() + reach - ox) / resolution)) + 1
+    h = int(math.ceil((pts[:, 1].max() + reach - oy) / resolution)) + 1
+    xs = ox + (np.arange(w) + 0.5) * resolution          # cell centres
+    ys = oy + (np.arange(h) + 0.5) * resolution
+    gx, gy = np.meshgrid(xs, ys)
+    data = np.zeros((h, w), dtype=np.int8)
+    for cx, cy in pts:
+        dx, dy = np.abs(gx - cx), np.abs(gy - cy)
+        data[(dx * dx + dy * dy <= halo_radius_m ** 2) & (data < halo_value)] = halo_value
+        data[(dx <= core_half_m) & (dy <= core_half_m)] = 100
+    return data, ox, oy, w, h

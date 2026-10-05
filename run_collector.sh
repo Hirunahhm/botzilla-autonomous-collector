@@ -171,7 +171,12 @@ unset ROS_LOCALHOST_ONLY ROS_AUTOMATIC_DISCOVERY_RANGE
 step "waiting for /$NS/fleet/map from the leader's fleet manager (./run_full_mission.sh --fleet)"
 for i in $(seq 1 60); do
     if ( source_ros; export ROS_SUPER_CLIENT=True
-         timeout 15 ros2 topic list --no-daemon --spin-time 5 2>/dev/null ) | grep -qx "/$NS/fleet/map"; then
+         timeout 15 ros2 topic list --no-daemon --spin-time 5 2>/dev/null ) \
+            | grep -x "/$NS/fleet/map" > /dev/null; then
+        # Not grep -q: it exits at the first match, ros2 then dies of SIGPIPE while
+        # still printing, and under pipefail the whole test fails although the topic
+        # is there. /<ns>/fleet/map sorts near the top, so this never matched
+        # (2026-10-06); the old /map check only worked because /map sorts late.
         printf '\r%72s\r' ''; ok "leader graph reachable, /$NS/fleet/map is published"; break
     fi
     [ "$i" = 60 ] && die "no /$NS/fleet/map from the leader after ~10 min of tries"
