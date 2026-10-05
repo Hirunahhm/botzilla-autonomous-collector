@@ -58,6 +58,13 @@ def collector_nav2_params(base, ns, amcl=None):
     p = copy.deepcopy(base)
     _namespace_topics(p, ns)
 
+    # bt_navigator waits only 1 s (default) for each action server while loading its tree;
+    # on the loaded Pi, discovering compute_path_to_pose took longer, so activation
+    # failed and the lifecycle manager aborted the whole bring-up
+    # (run_logs/collector-20261005-212145 on the Pi).
+    p.setdefault('bt_navigator', {}).setdefault('ros__parameters', {})[
+        'wait_for_service_timeout'] = 10000
+
     planner = p.get('planner_server', {}).get('ros__parameters', {})
     _drop_plugins(planner, 'planner_plugins', COLLECTOR_PLANNERS_DROP)
 
