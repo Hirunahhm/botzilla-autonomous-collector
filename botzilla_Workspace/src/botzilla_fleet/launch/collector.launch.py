@@ -143,6 +143,8 @@ def _launch(context, *_args, **_kwargs):
         mission.insert(0, Node(
             package='botzilla_perception', executable='yolo_node', name='yolo_node',
             output='screen', parameters=[{'use_sim_time': False}],
+            # Headless Pi: a cv2 window would abort Qt (see yolo_node's imshow guard).
+            additional_env={'QT_QPA_PLATFORM': 'offscreen'},
         ))
 
     return [

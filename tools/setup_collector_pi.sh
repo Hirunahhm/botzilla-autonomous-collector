@@ -52,7 +52,7 @@ sudo apt-get install -y \
     python3-colcon-common-extensions \
     python3-serial python3-numpy python3-scipy python3-yaml python3-opencv \
     freenect libfreenect-dev \
-    cython3 python3-dev python3-setuptools git \
+    cython3 python3-dev python3-setuptools python3-pip git \
     avahi-daemon
 
 step "libfreenect Python wrapper"
@@ -62,7 +62,18 @@ if ! python3 -c 'import freenect' 2>/dev/null; then
     rm -rf /tmp/libfreenect
     git clone --depth 1 --branch v0.5.3 https://github.com/OpenKinect/libfreenect /tmp/libfreenect \
         || git clone --depth 1 https://github.com/OpenKinect/libfreenect /tmp/libfreenect
-    ( cd /tmp/libfreenect/wrappers/python && sudo python3 setup.py install )
+    # v0.5.3's wrapper predates Cython 3 (Ubuntu 24.04 ships 3.0): its setup.py reads the
+    # version from an attribute Cython 3 removed, and Cython 3 rejects its callbacks
+    # without 'noexcept'. Both patched here; legacy_implicit_noexcept is Cython 3's own
+    # compatibility switch for exactly that. Installed to the user's site-packages
+    # (no sudo; every collector node runs as this user).
+    ( cd /tmp/libfreenect/wrappers/python
+      sed -i 's/version = Cython.Compiler.Main.Version.version/import Cython; version = Cython.__version__/' setup.py
+      grep -q legacy_implicit_noexcept freenect.pyx \
+          || sed -i '1i # cython: legacy_implicit_noexcept=True, language_level=2' freenect.pyx
+      python3 setup.py build_ext --inplace
+      site=$(python3 -c 'import site; print(site.getusersitepackages())')
+      mkdir -p "$site" && cp freenect.cpython-*.so "$site/" )
 else
     echo "   already installed"
 fi
@@ -87,8 +98,11 @@ if ! python3 -c 'import ultralytics' 2>/dev/null; then
     # Ubuntu 24.04 marks the system Python as externally managed; yolo_node runs under
     # the system interpreter (ros2 run), so it has to go there. CPU-only torch keeps
     # the download small and avoids CUDA wheels the Pi cannot use.
-    pip3 install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch torchvision
-    pip3 install --break-system-packages ultralytics
+    # numpy<2: ROS Jazzy's cv_bridge is built against Ubuntu's numpy 1.26, and
+    # ultralytics would otherwise pull numpy 2, which breaks it. --user: no sudo needed.
+    pip3 install --user --break-system-packages --index-url https://download.pytorch.org/whl/cpu \
+        torch torchvision
+    pip3 install --user --break-system-packages 'numpy<2' ultralytics
 fi
 
 step "build the collector's packages"

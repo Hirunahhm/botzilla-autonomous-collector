@@ -19,9 +19,15 @@ def resolve_model_path():
     override = os.environ.get('BOTZILLA_YOLO_MODEL')
     if override and os.path.exists(override):
         return override
-    # 1. Check current workspace runs/best-fit/best.pt
+    # 1. The repo this node was built from, wherever it is checked out: with
+    #    --symlink-install the real path of this file is
+    #    <repo>/botzilla_Workspace/src/botzilla_perception/botzilla_perception/.
+    #    Then the working directory and its parent (launched from the workspace).
+    here = os.path.dirname(os.path.realpath(__file__))
     candidates = [
+        os.path.join(here, '..', '..', '..', '..', 'runs/best-fit/best.pt'),
         os.path.join(os.getcwd(), "runs/best-fit/best.pt"),
+        os.path.join(os.getcwd(), '..', 'runs/best-fit/best.pt'),
         os.path.join(os.path.expanduser('~'), "Desktop/Projects/sem5/final-project-botzilla/runs/best-fit/best.pt"),
         os.path.join(os.path.expanduser('~'), "Desktop/Bozilla-ws/final-project-botzilla/runs/best-fit/best.pt"),
     ]
@@ -229,8 +235,12 @@ class YoloDetector(Node):
             ros_annotated = self.bridge.cv2_to_imgmsg(annotated_image, encoding='bgr8')
             self.publisher_annotated.publish(ros_annotated)
 
-            cv2.imshow("YOLO Debug View", annotated_image)
-            cv2.waitKey(1)
+            # Only with a display: headless (the Jetson's container, the collector Pi over
+            # SSH) imshow aborts the process unless Qt is forced offscreen, and even then
+            # it renders a window nobody sees. /perception/yolo_image carries the same view.
+            if os.environ.get('DISPLAY') and os.environ.get('QT_QPA_PLATFORM') != 'offscreen':
+                cv2.imshow("YOLO Debug View", annotated_image)
+                cv2.waitKey(1)
 
         except cv_bridge.CvBridgeError as e:
             self.get_logger().error(f'CvBridge Error: {e}')

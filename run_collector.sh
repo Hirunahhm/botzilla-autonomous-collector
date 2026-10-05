@@ -152,6 +152,9 @@ fi
 
 export ROS_DISCOVERY_SERVER="$LEADER_ADDR:$DISCOVERY_PORT"
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export BOTZILLA_YOLO_MODEL="$REPO_ROOT/runs/best-fit/best.pt"
+# Ultralytics writes its settings under ~/.config; keep it out of anything root-owned.
+export YOLO_CONFIG_DIR="${YOLO_CONFIG_DIR:-$HOME/.cache/ultralytics}"
 unset ROS_LOCALHOST_ONLY ROS_AUTOMATIC_DISCOVERY_RANGE
 
 step "waiting for the leader's /map (run ./run_full_mission.sh --fleet on the leader)"
