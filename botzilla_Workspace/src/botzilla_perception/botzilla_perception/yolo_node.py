@@ -1,12 +1,15 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
+from botzilla_interfaces.msg import CubeBoxes
 from geometry_msgs.msg import Point
 from rclpy.qos import qos_profile_sensor_data
 import cv_bridge
 import cv2
 import numpy as np
 import os
+import time
+from botzilla_perception.cube_depth import depth_at, KINECT_MIN_RANGE_M
 from ultralytics import YOLO
 
 # Dynamically locate best.pt model path
@@ -38,9 +41,6 @@ def resolve_model_path():
 
 file_path = resolve_model_path()
 
-# Kinect minimum sensing range (objects closer become 0 or invalid)
-KINECT_MIN_RANGE_M = 0.55
-
 class YoloDetector(Node):
     def __init__(self):
         super().__init__('yolo_node')
@@ -52,27 +52,42 @@ class YoloDetector(Node):
         # 'mono8' on hardware (kinect_bridge's rescaled 11-bit), '32FC1' in sim.
         self.latest_depth_encoding = None
 
-        # Subscribe to the Kinect RGB stream
-        self.subscription = self.create_subscription(
-            Image,
-            'camera/rgb/image_raw',
-            self.image_callback,
-            qos_profile_sensor_data
-        )
+        # mode 'full' (default): RGB + depth in, detected_cube out — the leader's own
+        # camera, exactly as before. mode 'boxes': compressed RGB in, pixel boxes out —
+        # a second instance under the collector's namespace, so the collector's camera
+        # is detected on this GPU instead of the Pi's CPU (botzilla_fleet
+        # remote_detection_node does the depth half on the Pi).
+        self.declare_parameter('mode', 'full')
+        self.mode = self.get_parameter('mode').value
+        if self.mode == 'boxes':
+            self.create_subscription(
+                CompressedImage, 'camera/rgb/compressed', self.boxes_callback,
+                qos_profile_sensor_data,
+            )
+            self.boxes_pub = self.create_publisher(CubeBoxes, 'yolo/boxes', 10)
+        else:
+            # Subscribe to the Kinect RGB stream
+            self.subscription = self.create_subscription(
+                Image,
+                'camera/rgb/image_raw',
+                self.image_callback,
+                qos_profile_sensor_data
+            )
 
-        # Subscribe to the Kinect Depth stream
-        self.subscription_depth = self.create_subscription(
-            Image,
-            'camera/depth/image_raw',
-            self.depth_callback,
-            qos_profile_sensor_data
-        )
+            # Subscribe to the Kinect Depth stream
+            self.subscription_depth = self.create_subscription(
+                Image,
+                'camera/depth/image_raw',
+                self.depth_callback,
+                qos_profile_sensor_data
+            )
 
-        # Publish annotated image for debugging in rqt_image_view
-        self.publisher_annotated = self.create_publisher(Image, 'perception/yolo_image', 10)
+            # Publish annotated image for debugging in rqt_image_view
+            self.publisher_annotated = self.create_publisher(
+                Image, 'perception/yolo_image', 10)
 
-        # Publish cube position to brain_node: x=normalized horizontal, z=distance in meters
-        self.cube_pub = self.create_publisher(Point, 'detected_cube', 10)
+            # Publish cube position to brain_node: x=normalized horizontal, z=distance in meters
+            self.cube_pub = self.create_publisher(Point, 'detected_cube', 10)
 
         # Load YOLO model
         # Confidence threshold, exposed as a parameter because the right value differs
@@ -90,7 +105,7 @@ class YoloDetector(Node):
         self.model = YOLO(file_path)
         self.get_logger().info(
             f'Loaded model {file_path} (classes={self.model.names}) '
-            f'confidence>={self.confidence}'
+            f'confidence>={self.confidence} mode={self.mode}'
         )
 
         self.get_logger().info('YOLO Perception Node Initialized. Waiting for video stream...')
@@ -117,61 +132,45 @@ class YoloDetector(Node):
             self.get_logger().error(f'Depth decode error: {e}')
 
     def get_depth_at(self, cx, cy, depth_img):
+        """Depth (m) at a box centre, or None — see cube_depth.depth_at."""
+        return depth_at(depth_img, cx, cy, getattr(self, 'latest_depth_encoding', 'mono8'))
+
+    def boxes_callback(self, msg):
+        """Boxes mode: JPEG in, pixel boxes out; no depth, no annotated image.
+
+        Runs on the leader's GPU for the collector's camera (botzilla_fleet
+        remote_detection_node). The output keeps the source image's stamp, so the
+        collector can pair the boxes with the depth frame taken at the same moment.
         """
-        Sample the depth around a bounding box center in a small patch to avoid noise.
-        Returns distance in meters, or None if invalid.
-
-        /camera/depth/image_raw carries a different format on hardware than in sim,
-        so the conversion has to branch on the message encoding:
-
-        * mono8   — hardware. kinect_bridge rescales the Kinect's native 11-bit
-                    disparity (0-2047, 2047 = no data) down to 0-255 to publish it
-                    as a standard mono8 Image. Undo that, then apply the Kinect
-                    disparity->metres formula.
-        * 32FC1   — simulation. simulation.launch.py's ros_gz_bridge maps Gazebo's
-                    depth camera straight through, and Gazebo already emits metres.
-                    Also what /camera/depth/image_meters carries on hardware.
-        * 16UC1   — millimetres, the common depth convention if a driver is ever
-                    swapped in that publishes it.
-
-        Getting this wrong is silent, not loud: the mono8 branch applied to metric
-        data returns a plausible-looking number that is simply wrong, which would
-        make the FSM misjudge every approach distance.
-        """
-        h, w = depth_img.shape[:2]
-        # Clamp coordinates to image bounds
-        cx = max(2, min(cx, w - 3))
-        cy = max(2, min(cy, h - 3))
-
-        # Sample a 5x5 patch and take the median valid value
-        patch = depth_img[cy - 2:cy + 3, cx - 2:cx + 3].flatten().astype(np.float32)
-        # Gazebo writes inf/NaN for "no return"; the Kinect path writes 0.
-        valid = patch[np.isfinite(patch) & (patch > 0)]
-        if len(valid) == 0:
-            return None
-
-        raw_val = float(np.median(valid))
-        encoding = getattr(self, 'latest_depth_encoding', 'mono8')
-
-        if encoding == '32FC1':
-            # Already metres.
-            distance_m = raw_val
-        elif encoding == '16UC1':
-            # Millimetres.
-            distance_m = raw_val / 1000.0
-        else:
-            # mono8 (hardware Kinect via kinect_bridge). Reverse the 0-255 rescale
-            # back to the native 11-bit value, then disparity -> metres.
-            raw_11bit = (raw_val / 255.0) * 2047.0
-            if raw_11bit >= 2040:  # Kinect reports 2047 for no-data pixels
-                return None
-            distance_m = 1.0 / (raw_11bit * -0.0030711016 + 3.3309495161)
-
-        # Guard against nonsense from any branch (negative/again-infinite values
-        # near the disparity formula's asymptote, or a bad sim frame).
-        if not np.isfinite(distance_m) or distance_m <= 0.0 or distance_m > 20.0:
-            return None
-        return distance_m
+        try:
+            frame = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                self.get_logger().warn('Undecodable compressed frame', throttle_duration_sec=5.0)
+                return
+            t0 = time.monotonic()
+            results = self.model.predict(
+                source=frame, conf=self.confidence, verbose=False, iou=0.5
+            )
+            out = CubeBoxes()
+            out.header = msg.header
+            out.height, out.width = frame.shape[:2]
+            out.inference_s = time.monotonic() - t0
+            boxes = results[0].boxes
+            if boxes is not None:
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    out.cx.append((x1 + x2) / 2.0)
+                    out.cy.append((y1 + y2) / 2.0)
+                    out.confidence.append(float(box.conf[0]))
+            self.boxes_pub.publish(out)
+            self.frame_count += 1
+            if self.frame_count % 50 == 0:
+                self.get_logger().info(
+                    f'boxes mode: {self.frame_count} frames, last inference '
+                    f'{out.inference_s * 1000:.0f} ms, {len(out.cx)} box(es)'
+                )
+        except Exception as e:
+            self.get_logger().error(f'Failed to process compressed frame: {e}')
 
     def image_callback(self, msg):
         try:

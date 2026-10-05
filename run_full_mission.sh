@@ -301,6 +301,9 @@ cleanup() {
     if [ -n "${YOLO_CID:-}" ]; then
         docker stop "$YOLO_CID" >/dev/null 2>&1 && ok "stopped YOLO container"
     fi
+    if [ -n "${FLEET_YOLO_NAME:-}" ]; then
+        docker stop "$FLEET_YOLO_NAME" >/dev/null 2>&1 && ok "stopped the collector's YOLO container"
+    fi
 
     # ros2 launch forwards SIGINT to its children, but they need a moment.
     for _ in $(seq 1 10); do
@@ -385,7 +388,7 @@ start_bg() {   # <logfile> <cmd...>
 # ── step numbering ───────────────────────────────────────────────────────────
 # The metrics node adds a stage, so the denominator is computed rather than written
 # into six separate strings that would disagree with each other the moment one moved.
-TOTAL_STEPS=6
+TOTAL_STEPS=6   # +1 each for --metrics and --fleet (fleet manager + collector YOLO)
 [ "$RUN_METRICS" = 1 ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 [ -n "$FLEET_NS" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 STEP_N=0
@@ -606,6 +609,22 @@ if [ -n "$FLEET_NS" ]; then
         ros2 run botzilla_fleet fleet_manager_node --ros-args \
             -p use_sim_time:=false -p "collector_ns:=$FLEET_NS"
     wait_for_log "$LOG_DIR/fleet.log" "fleet_manager_node: leader searches" 30 "fleet manager up"
+
+    # The collector's camera is detected here, on this GPU: its Pi sends JPEG frames on
+    # /$FLEET_NS/camera/rgb/compressed and gets pixel boxes back on /$FLEET_NS/yolo/boxes
+    # (botzilla_fleet remote_detection_node). A second container, not a second node in
+    # the first, so either can be restarted without the other.
+    FLEET_YOLO_NAME="botzilla_yolo_${FLEET_NS}"
+    docker rm -f "$FLEET_YOLO_NAME" >/dev/null 2>&1 || true
+    ( cd "$REPO_ROOT"
+      export ROS_DISCOVERY_SERVER="127.0.0.1:${DISCOVERY_PORT}"
+      export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+      export CONTAINER_NAME="$FLEET_YOLO_NAME"
+      exec ./docker/yolo/run_yolo_container.sh \
+          ros2 run botzilla_perception yolo_node --ros-args \
+              -r "__ns:=/$FLEET_NS" -p mode:=boxes ) > "$LOG_DIR/fleet_yolo.log" 2>&1 &
+    PIDS+=("$!")
+    wait_for_log "$LOG_DIR/fleet_yolo.log" "mode=boxes" 120 "YOLO for the collector's camera (boxes mode)"
 fi
 
 # ── ready ────────────────────────────────────────────────────────────────────

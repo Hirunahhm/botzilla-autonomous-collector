@@ -47,7 +47,14 @@ fi
 # any other component that still wants SHM.
 FASTDDS_PROFILE="$(dirname "${BASH_SOURCE[0]}")/fastdds_udp_only.xml"
 
-exec docker run --rm "${TTY_FLAGS[@]}" \
+# CONTAINER_NAME: optional, so a caller can stop exactly this container (the leader runs
+# a second one, in boxes mode, for the collector robot's camera).
+NAME_FLAGS=()
+if [ -n "${CONTAINER_NAME:-}" ]; then
+    NAME_FLAGS=(--name "$CONTAINER_NAME")
+fi
+
+exec docker run --rm "${TTY_FLAGS[@]}" "${NAME_FLAGS[@]}" \
     --runtime nvidia \
     --network host \
     --ipc host \

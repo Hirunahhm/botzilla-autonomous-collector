@@ -6,7 +6,12 @@ Starts, all in /<ns> with TF on /<ns>/tf:
   2. AMCL, localising in the LEADER's /map (no SLAM on the collector)
   3. Nav2 (controller, planner, behaviours, bt_navigator) + velocity_smoother, with the
      leader's nav2_params.yaml rewritten by params_rewrite.py
-  4. yolo_node (CPU), unless with_yolo:=false
+  4. cube detection, per detector:=
+       leader (default)  remote_detection_node: JPEG to the leader's GPU yolo_node,
+                         boxes back, depth paired here (see remote_detection.py; the
+                         Pi measured 1.2 fps running YOLO itself under full load)
+       local             yolo_node on the Pi's CPU (collector alone, no leader)
+       none              no detector (bring-up tests)
   5. collector_node — waits for tasks from the leader's fleet_manager_node
 
 Everything reaches the leader over the shared DDS graph: the collector's processes use
@@ -139,7 +144,16 @@ def _launch(context, *_args, **_kwargs):
         package='botzilla_fleet', executable='collector_node', name='collector_node',
         output='screen', parameters=[{'use_sim_time': False, 'robot_name': ns}],
     )]
-    if arg('with_yolo').lower() == 'true':
+    detector = arg('detector')
+    if detector not in ('leader', 'local', 'none'):
+        raise RuntimeError(f"detector must be leader, local or none (got '{detector}')")
+    if detector == 'leader':
+        mission.insert(0, Node(
+            package='botzilla_fleet', executable='remote_detection_node',
+            name='remote_detection_node', output='screen',
+            parameters=[{'use_sim_time': False}],
+        ))
+    elif detector == 'local':
         mission.insert(0, Node(
             package='botzilla_perception', executable='yolo_node', name='yolo_node',
             output='screen', parameters=[{'use_sim_time': False}],
@@ -149,7 +163,8 @@ def _launch(context, *_args, **_kwargs):
 
     return [
         LogInfo(msg=f'[collector] ns=/{ns} kobuki={kobuki} lidar={lidar} '
-                    f'start=({arg("start_x")}, {arg("start_y")}, {arg("start_yaw")})'),
+                    f'start=({arg("start_x")}, {arg("start_y")}, {arg("start_yaw")}) '
+                    f'detector={detector}'),
         LogInfo(msg=f'[collector] nav2 params: {nav2_file}'),
         GroupAction([
             PushRosNamespace(ns),
@@ -180,6 +195,9 @@ def generate_launch_description():
                               description='RPLIDAR port; empty = find it by id'),
         DeclareLaunchArgument('noreset_path', default_value=noreset_default,
                               description='Kinect LD_PRELOAD shim (needed on a Pi 5)'),
-        DeclareLaunchArgument('with_yolo', default_value='true'),
+        DeclareLaunchArgument(
+            'detector', default_value='leader',
+            description="'leader' (YOLO on the leader's GPU), 'local' (YOLO on this CPU) "
+                        "or 'none'"),
         OpaqueFunction(function=_launch),
     ])

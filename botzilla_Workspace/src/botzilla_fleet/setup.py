@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'fleet_manager_node = botzilla_fleet.fleet_manager_node:main',
             'collector_node = botzilla_fleet.collector_node:main',
+            'remote_detection_node = botzilla_fleet.remote_detection_node:main',
         ],
     },
 )

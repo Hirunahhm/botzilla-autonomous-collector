@@ -21,7 +21,9 @@
 #   --ns NAME           namespace (default bz2; must match the leader's --fleet NAME)
 #   --kobuki PORT       Kobuki serial port (default: found by id)
 #   --lidar PORT        LiDAR serial port (default: found by id)
-#   --no-yolo           do not start yolo_node (bring-up tests without the model)
+#   --local-yolo        run YOLO on this Pi's CPU instead of the leader's GPU (default
+#                       sends JPEG frames to the leader; the Pi alone manages ~1 fps)
+#   --no-yolo           no cube detection at all (bring-up tests)
 #   --build             colcon build the packages the collector needs first
 #
 # Ctrl+C once: stops the robot and tears everything down.
@@ -40,7 +42,7 @@ LEADER="hirunahhm.local"
 NS="bz2"
 START_X=""; START_Y=""; START_YAW=""
 KOBUKI=""; LIDAR=""
-WITH_YOLO=true
+DETECTOR=leader
 DO_BUILD=0
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
@@ -52,7 +54,8 @@ while [ $# -gt 0 ]; do
         --start)   START_X="${2:-}"; START_Y="${3:-}"; START_YAW="${4:-}"; shift 3 ;;
         --kobuki)  KOBUKI="${2:-}"; shift ;;
         --lidar)   LIDAR="${2:-}"; shift ;;
-        --no-yolo) WITH_YOLO=false ;;
+        --no-yolo) DETECTOR=none ;;
+        --local-yolo) DETECTOR=local ;;
         --build)   DO_BUILD=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -176,17 +179,17 @@ cat > "$LOG_DIR/run_config.json" <<EOF
   "leader": "$LEADER",
   "leader_addr": "$LEADER_ADDR",
   "start": [$START_X, $START_Y, $START_YAW],
-  "yolo": $WITH_YOLO,
+  "detector": "$DETECTOR",
   "git_commit": "$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)",
   "host": "$(hostname)"
 }
 EOF
 
 # ── launch ───────────────────────────────────────────────────────────────────
-step "collector stack (/$NS): hardware, AMCL, Nav2$( [ "$WITH_YOLO" = true ] && echo ', YOLO'), collector_node"
+step "collector stack (/$NS): hardware, AMCL, Nav2, detector=$DETECTOR, collector_node"
 echo "  ${C_WARN}the robot moves as soon as the leader assigns a cube${C_0}"
 ARGS=("ns:=$NS" "start_x:=$START_X" "start_y:=$START_Y" "start_yaw:=$START_YAW"
-      "with_yolo:=$WITH_YOLO")
+      "detector:=$DETECTOR")
 [ -n "$KOBUKI" ] && ARGS+=("serial_port:=$KOBUKI")
 [ -n "$LIDAR" ] && ARGS+=("lidar_port:=$LIDAR")
 ( source_ros; exec setsid ros2 launch botzilla_fleet collector.launch.py "${ARGS[@]}" ) \
