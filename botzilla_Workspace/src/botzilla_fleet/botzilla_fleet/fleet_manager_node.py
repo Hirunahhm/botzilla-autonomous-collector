@@ -37,6 +37,9 @@ COLLECTOR_HOME_EXCLUSION_M = 1.0    # = executor_node.HOME_CUBE_SUPPRESS_RADIUS_
 # Around the collector itself: the cube it is pushing sits ~0.3-0.6 m ahead of base_link.
 COLLECTOR_BODY_EXCLUSION_M = 0.8
 STATUS_TIMEOUT_S = 10.0
+# After the collector reports its own failure ('collector:' detail, e.g. Nav2 not up),
+# wait this long before assigning again; the cube goes back without a failure mark.
+COLLECTOR_FAULT_HOLDOFF_S = 15.0
 ALLOCATE_PERIOD_S = 1.0
 SUMMARY_PERIOD_S = 30.0
 MAP_FRAME = 'map'
@@ -74,6 +77,7 @@ class FleetManagerNode(Node):
         # again later, and reusing its id would let the collector's report of the first
         # attempt (still in its status as last_task_id) close the second one at once.
         self._task_seq = 0
+        self._holdoff_until = 0.0
         self._current = None         # (task_id, cube_id) assigned and not yet reported
         self._assigned_time = None
         self._home_zone_applied = False
@@ -168,6 +172,13 @@ class FleetManagerNode(Node):
                 and msg.last_result != CollectorStatus.RESULT_NONE):
             collected = msg.last_result == CollectorStatus.RESULT_COLLECTED
             task_id, cube_id = self._current
+            if not collected and msg.last_detail.startswith('collector:'):
+                self._registry.unassign(cube_id)
+                self._holdoff_until = self._now_s() + COLLECTOR_FAULT_HOLDOFF_S
+                self._event('collector_fault', id=cube_id, task=task_id,
+                            detail=msg.last_detail)
+                self._current = None
+                return
             cube = self._registry.report(cube_id, collected, self._now_s(),
                                          msg.last_detail)
             self._event('result', id=cube_id, task=task_id,
@@ -189,6 +200,8 @@ class FleetManagerNode(Node):
                 self._current = None
             return
         if self._current is not None or s.state != 'IDLE' or not s.localised:
+            return
+        if self._now_s() < self._holdoff_until:
             return
         cube = self._registry.next_task((s.x, s.y), self._now_s())
         if cube is None:

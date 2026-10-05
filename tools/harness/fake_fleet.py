@@ -32,6 +32,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
 
 RES = 0.05
@@ -74,6 +75,9 @@ class FakeFleet(Node):
         self.truth_pub = self.create_publisher(String, '/fake_fleet/truth', 10)
         self.create_subscription(Twist, '/bz2/cmd_vel', self.cmd_cb, 10)
         ActionServer(self, NavigateToPose, '/bz2/navigate_to_pose', self.nav)
+        # collector_node only reports IDLE once Nav2's lifecycle manager says active.
+        self.create_service(Trigger, '/bz2/lifecycle_manager_navigation/is_active',
+                            lambda req, res: setattr(res, 'success', True) or res)
         self.create_timer(0.05, self.step)
         self.create_timer(0.5, self.detect)
         self.create_timer(2.0, self.pub_map)

@@ -138,6 +138,11 @@ def _launch(context, *_args, **_kwargs):
              name='lifecycle_manager_navigation', output='screen',
              parameters=[{
                  'use_sim_time': False, 'autostart': True,
+                 # The default 4 s is too short on the Pi: AMCL's activation waits for
+                 # and converts the leader's map, and on the loaded Pi that exceeded
+                 # 4 s, so the manager declared AMCL dead and aborted the whole Nav2
+                 # bring-up (run_logs/collector-20261005-184906).
+                 'bond_timeout': 20.0,
                  'node_names': ['amcl', 'controller_server', 'planner_server',
                                 'behavior_server', 'bt_navigator'],
              }]),

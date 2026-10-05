@@ -39,6 +39,7 @@ import numpy as np
 import rclpy
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
 
 # A detection this close to the task's estimate is the assigned cube. The leader's
 # estimate is a mean of projections made from up to 1 m away with a ~0.1 m range error
@@ -59,6 +60,13 @@ SEEK_PAUSE_S = 1.5                   # at each end of the sweep
 SEEK_TIMEOUT_S = 40.0
 SEEK_KP = 1.2
 STATUS_PERIOD_S = 0.5
+# A route that fails this fast never left the collector: Nav2 rejected or aborted it at
+# once (inactive, or still coming up). That is the collector's problem, not the cube's,
+# so it is reported with a 'collector:' prefix the leader does not count against the
+# cube, and the collector goes back to waiting for Nav2. In run_logs/20261005-184223
+# Nav2 never came up and four real cubes were each "failed" twice in 0.1 s.
+QUICK_FAIL_S = 2.0
+NAV_READY_POLL_S = 1.0
 
 
 class Collector:
@@ -86,6 +94,14 @@ class CollectorNode(ExecutorNode):
         self._seek = None             # SEEKING sub-state, see _do_seeking
 
         self._map = None              # (data, (ox, oy, res, w, h))
+        # IDLE (= ready for tasks) also requires Nav2 to be fully active, not just a pose:
+        # AMCL publishes map->odom before the rest of the stack is up, and once the
+        # lifecycle manager has aborted a bring-up it never will be.
+        self._nav_ready = False
+        self._nav_ready_future = None
+        self._nav_ready_polled = None
+        self._is_active_client = self.create_client(
+            Trigger, 'lifecycle_manager_navigation/is_active')
         latched = QoSProfile(depth=1)
         latched.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         latched.reliability = QoSReliabilityPolicy.RELIABLE
@@ -185,19 +201,41 @@ class CollectorNode(ExecutorNode):
         super()._control_loop()
 
     def _do_startup(self, now):
-        pose = self._get_robot_pose()
-        if pose is None:
+        if self._home is None:
+            pose = self._get_robot_pose()
+            if pose is None:
+                self.get_logger().info(
+                    f'Waiting for {MAP_FRAME}->base_link (AMCL in the leader map)...',
+                    throttle_duration_sec=5.0,
+                )
+                return
+            self._home = pose
             self.get_logger().info(
-                f'Waiting for {MAP_FRAME}->base_link (AMCL in the leader map)...',
-                throttle_duration_sec=5.0,
+                f'HOME latched at x={pose[0]:.3f} y={pose[1]:.3f} '
+                f'yaw={math.degrees(pose[2]):.1f}deg in the leader map.'
             )
+        if not self._poll_nav_ready(now):
+            self.get_logger().info('Waiting for Nav2 to be fully active...',
+                                   throttle_duration_sec=5.0)
             return
-        self._home = pose
-        self.get_logger().info(
-            f'HOME latched at x={pose[0]:.3f} y={pose[1]:.3f} '
-            f'yaw={math.degrees(pose[2]):.1f}deg in the leader map. Waiting for tasks.'
-        )
-        self._transition(Collector.IDLE, 'HOME latched.')
+        self._transition(Collector.IDLE, 'HOME latched and Nav2 active; waiting for tasks.')
+
+    def _poll_nav_ready(self, now):
+        """Ask the lifecycle manager whether every Nav2 node is active (non-blocking)."""
+        if self._nav_ready:
+            return True
+        fut = self._nav_ready_future
+        if fut is not None and fut.done():
+            result = fut.result()
+            self._nav_ready = bool(result is not None and result.success)
+            self._nav_ready_future = None
+            return self._nav_ready
+        if fut is None and self._is_active_client.service_is_ready() and (
+                self._nav_ready_polled is None
+                or (now - self._nav_ready_polled).nanoseconds / 1e9 > NAV_READY_POLL_S):
+            self._nav_ready_polled = now
+            self._nav_ready_future = self._is_active_client.call_async(Trigger.Request())
+        return False
 
     # ------------------------------------------------------------------ #
     # Task states
@@ -240,8 +278,16 @@ class CollectorNode(ExecutorNode):
         if self._nav_result is not None:
             status, self._nav_result = self._nav_result, None
             self._nav_goal_handle = None
+            took = ((now - self._nav_sent_time).nanoseconds / 1e9
+                    if self._nav_sent_time is not None else 0.0)
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self._enter_seeking('At the standoff.')
+            elif took < QUICK_FAIL_S:
+                self._finish_task(
+                    False, f'collector: navigation not ready (status {status} after '
+                           f'{took:.1f}s)')
+                self._nav_ready = False
+                self._transition(State.STARTUP, 'Nav2 rejected the route; re-checking it.')
             elif self._dist_to_task() < SEEK_ANYWAY_M:
                 self._enter_seeking(f'Route ended with status {status}, but close enough.')
             else:

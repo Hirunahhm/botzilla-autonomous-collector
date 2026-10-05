@@ -163,7 +163,7 @@ unset ROS_LOCALHOST_ONLY ROS_AUTOMATIC_DISCOVERY_RANGE
 step "waiting for the leader's /map (run ./run_full_mission.sh --fleet on the leader)"
 for i in $(seq 1 60); do
     if ( source_ros; export ROS_SUPER_CLIENT=True
-         timeout 10 ros2 topic list --no-daemon 2>/dev/null ) | grep -qx /map; then
+         timeout 15 ros2 topic list --no-daemon --spin-time 5 2>/dev/null ) | grep -qx /map; then
         printf '\r%72s\r' ''; ok "leader graph reachable, /map is published"; break
     fi
     [ "$i" = 60 ] && die "no /map from the leader after ~10 min of tries"
