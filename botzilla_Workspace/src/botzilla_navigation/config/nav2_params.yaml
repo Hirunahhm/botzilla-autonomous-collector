@@ -567,7 +567,19 @@ local_costmap:
         # translates away, which a global costmap mark never would. Watch for the
         # same "orbit forever in open floor" signature on hardware before ever
         # considering this for global_costmap.
-        observation_sources: scan scan_camera fleet_cubes
+        observation_sources: scan scan_camera fleet_cubes fleet_robots
+        fleet_robots:
+          # The OTHER robot's footprint, from botzilla_fleet's fleet_manager_node
+          # (two-robot runs only). Neither robot's LiDAR (0.24 m) sees the other's 0.09 m
+          # body reliably; see ROBOT_FOOTPRINT. Marking only, cleared by the LiDAR.
+          topic: /fleet/robot_obstacles
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.5
+          obstacle_max_range: 100.0     # measured from the cloud's origin (map origin)
+          obstacle_min_range: 0.0
         fleet_cubes:
           # Cubes the leader has already detected, from botzilla_fleet's fleet_manager_node
           # (two-robot runs only; nothing publishes this topic otherwise, so single-robot
@@ -662,7 +674,19 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan fleet_cubes
+        observation_sources: scan fleet_cubes fleet_robots
+        fleet_robots:
+          # The OTHER robot's footprint, from botzilla_fleet's fleet_manager_node
+          # (two-robot runs only). Neither robot's LiDAR (0.24 m) sees the other's 0.09 m
+          # body reliably; see ROBOT_FOOTPRINT. Marking only, cleared by the LiDAR.
+          topic: /fleet/robot_obstacles
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.5
+          obstacle_max_range: 100.0     # measured from the cloud's origin (map origin)
+          obstacle_min_range: 0.0
         fleet_cubes:
           # Cubes the leader has already detected, from botzilla_fleet's fleet_manager_node
           # (two-robot runs only; nothing publishes this topic otherwise, so single-robot

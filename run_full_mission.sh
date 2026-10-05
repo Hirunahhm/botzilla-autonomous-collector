@@ -102,6 +102,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/robot_stop.sh
+source "$REPO_ROOT/tools/robot_stop.sh"
 WS="${REPO_ROOT}/botzilla_Workspace"
 ROS_SETUP=/opt/ros/jazzy/setup.bash
 
@@ -282,32 +284,28 @@ cleanup() {
     echo
     step "shutting down"
 
-    # Stop the base first, while the graph is still alive to carry the message.
-    # Reported honestly: if the graph is already gone this cannot get through, and
-    # claiming otherwise would hide a robot that is still driving.
-    if ( source_ros
-         export ROS_DISCOVERY_SERVER="127.0.0.1:${DISCOVERY_PORT}"
-         export ROS_SUPER_CLIENT=True
-         timeout 8 ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist "{}" ) >/dev/null 2>&1
-    then ok "sent zero /cmd_vel"
-    else warn "could not publish zero /cmd_vel (graph already down?)"
-    fi
+    # The robot first, before anything that could stall: see tools/robot_stop.sh.
+    ok "$(stop_robot_motion)"
 
     # Reverse start order: consumers before producers.
     for (( i=${#PIDS[@]}-1 ; i>=0 ; i-- )); do
         kill -INT "${PIDS[i]}" 2>/dev/null
     done
 
+    # Bounded and in parallel: an unbounded `docker stop` once held up the rest of this
+    # cleanup with Nav2 and the base driver still alive.
+    local dpids=()
     if [ -n "${YOLO_CID:-}" ]; then
-        docker stop "$YOLO_CID" >/dev/null 2>&1 && ok "stopped YOLO container"
+        timeout 20 docker stop -t 5 "$YOLO_CID" >/dev/null 2>&1 & dpids+=("$!")
     fi
     if [ -n "${FLEET_YOLO_NAME:-}" ]; then
-        docker stop "$FLEET_YOLO_NAME" >/dev/null 2>&1 && ok "stopped the collector's YOLO container"
+        timeout 20 docker stop -t 5 "$FLEET_YOLO_NAME" >/dev/null 2>&1 & dpids+=("$!")
     fi
+    [ ${#dpids[@]} -gt 0 ] && wait "${dpids[@]}" && ok "stopped YOLO container(s)"
 
     # ros2 launch forwards SIGINT to its children, but they need a moment.
     for _ in $(seq 1 10); do
-        pgrep -f "$LAUNCH_PATTERN" >/dev/null 2>&1 || break
+        [ -z "$(pattern_pids "$LAUNCH_PATTERN")" ] && break
         sleep 1
     done
 
@@ -316,15 +314,15 @@ cleanup() {
     # without a TERM stage it would always need killing, and a KILL denies every node
     # the chance to shut its hardware down tidily.
     local survivors
-    survivors=$(pgrep -f "$LAUNCH_PATTERN" 2>/dev/null | grep -v "^$$\$" || true)
+    survivors=$(pattern_pids "$LAUNCH_PATTERN")
     if [ -n "$survivors" ]; then
         echo "$survivors" | while read -r p; do kill -TERM "$p" 2>/dev/null; done
         for _ in $(seq 1 5); do
-            pgrep -f "$LAUNCH_PATTERN" >/dev/null 2>&1 || break
+            [ -z "$(pattern_pids "$LAUNCH_PATTERN")" ] && break
             sleep 1
         done
     fi
-    survivors=$(pgrep -f "$LAUNCH_PATTERN" 2>/dev/null | grep -v "^$$\$" || true)
+    survivors=$(pattern_pids "$LAUNCH_PATTERN")
     if [ -n "$survivors" ]; then
         warn "forcing (SIGKILL): $(echo "$survivors" | tr '\n' ' ')"
         echo "$survivors" | while read -r p; do kill -9 "$p" 2>/dev/null; done
@@ -334,7 +332,7 @@ cleanup() {
     ( source_ros; ros2 daemon stop ) >/dev/null 2>&1
     rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
 
-    if pgrep -f "$LAUNCH_PATTERN" >/dev/null 2>&1; then
+    if [ -n "$(pattern_pids "$LAUNCH_PATTERN")" ]; then
         warn "some processes survived — check: pgrep -fa '$LAUNCH_PATTERN'"
     else
         ok "all processes stopped"
@@ -404,10 +402,10 @@ step "preflight"
 # common cause of a broken bringup: the new kobuki_base_node starts, its serial
 # reader thread dies with "device reports readiness to read but returned no data",
 # and the node then sits there alive but publishing nothing.
-stale=$(pgrep -f "$LAUNCH_PATTERN" 2>/dev/null | grep -v "^$$\$" || true)
+stale=$(pattern_pids "$LAUNCH_PATTERN")
 if [ -n "$stale" ]; then
     echo "  processes from a previous run are still alive:"
-    pgrep -af "$LAUNCH_PATTERN" | grep -v "^$$ " | sed 's/^/    /'
+    for p in $stale; do echo "    $p $(ps -o args= -p "$p" | cut -c1-120)"; done
     if [ "$FORCE_CLEAN" = 1 ]; then
         echo "  --yes given, clearing them"
     elif [ -t 0 ]; then

@@ -33,6 +33,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/robot_stop.sh
+source "$REPO_ROOT/tools/robot_stop.sh"
 WS="${REPO_ROOT}/botzilla_Workspace"
 ROS_SETUP=/opt/ros/jazzy/setup.bash
 DISCOVERY_PORT=11811
@@ -91,12 +93,8 @@ cleanup() {
     CLEANED=1
     echo
     step "shutting down"
-    if ( source_ros
-         export ROS_DISCOVERY_SERVER="$LEADER_ADDR:$DISCOVERY_PORT"
-         timeout 8 ros2 topic pub -1 "/$NS/cmd_vel" geometry_msgs/msg/Twist "{}" ) >/dev/null 2>&1
-    then ok "sent zero /$NS/cmd_vel"
-    else warn "could not publish zero /$NS/cmd_vel"
-    fi
+    # The robot first, before anything that could stall: see tools/robot_stop.sh.
+    ok "$(stop_robot_motion)"
     for pg in "${PGIDS[@]}"; do kill -INT -- "-$pg" 2>/dev/null; done
     for _ in $(seq 1 10); do
         alive=0

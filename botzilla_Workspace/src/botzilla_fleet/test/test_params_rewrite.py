@@ -57,3 +57,15 @@ def test_leader_params_untouched_and_amcl_merged():
 def test_namespaced():
     assert namespaced({'a': 1}, '/bz2/') == {'bz2': {'a': 1}}
     assert namespaced({'a': 1}, '') == {'a': 1}
+
+
+def test_fleet_sources_point_at_the_collectors_own_topics():
+    # The leader reads /fleet/robot_obstacles (the collector's body); the collector's
+    # copy must read the leader's body on /bz2/fleet/robot_obstacles, and its cube
+    # source must not be the leader's /fleet/cube_obstacles (its target would block it).
+    p = collector_nav2_params(load(), 'bz2')
+    lc = p['local_costmap']['local_costmap']['ros__parameters']['voxel_layer']
+    gc = p['global_costmap']['global_costmap']['ros__parameters']['obstacle_layer']
+    for layer in (lc, gc):
+        assert layer['fleet_robots']['topic'] == '/bz2/fleet/robot_obstacles'
+        assert layer['fleet_cubes']['topic'] == '/bz2/fleet/cube_obstacles'

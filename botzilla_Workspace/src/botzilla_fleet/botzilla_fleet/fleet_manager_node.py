@@ -63,6 +63,21 @@ CUBE_OBSTACLE_Z = 0.24
 CUBE_OBSTACLE_HALF_M = 0.05      # 3 x 3 points 5 cm apart: a ~0.15 m square per cube
 CUBE_OBSTACLE_HZ = 5.0
 
+# Each robot's footprint as an obstacle for the OTHER robot's costmaps (nav2_params.yaml
+# source 'fleet_robots'; the collector's copy reads /<ns>/fleet/robot_obstacles via
+# params_rewrite). Needed because neither robot's LiDAR sees the other's body: the
+# Kobuki is 0.09 m tall and the LiDARs scan at 0.24 m, where only the slim LiDAR
+# housing and camera mount are, so returns come and go as the robots close in — the
+# leader drove into the collector on 2026-10-05 after seeing it from further away.
+# Same height trick as the cubes: re-marked every publish, cleared by the LiDAR once the
+# robot has moved on. The footprint is nav2_params.yaml's (both robots share the URDF),
+# with this margin added, and points 5 cm apart so no costmap cell inside is missed.
+ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
+ROBOT_OBSTACLE_MARGIN_M = 0.05
+ROBOT_OBSTACLE_STEP_M = 0.05
+# A pose older than this is not drawn: a stale footprint would block empty floor.
+ROBOT_POSE_MAX_AGE_S = 1.5
+
 COLOURS = {
     'unconfirmed': (0.6, 0.6, 0.6),
     'pending': (1.0, 0.8, 0.0),
@@ -109,6 +124,15 @@ class FleetManagerNode(Node):
         self._task_pub = self.create_publisher(CubeTask, f'/{self._ns}/fleet/task', latched)
         self._marker_pub = self.create_publisher(MarkerArray, '/fleet/cubes', 10)
         self._obstacle_pub = self.create_publisher(PointCloud2, '/fleet/cube_obstacles', 10)
+        self._collector_body_pub = self.create_publisher(
+            PointCloud2, '/fleet/robot_obstacles', 10)            # for the leader
+        self._leader_body_pub = self.create_publisher(
+            PointCloud2, f'/{self._ns}/fleet/robot_obstacles', 10)  # for the collector
+        m = ROBOT_OBSTACLE_MARGIN_M
+        (x0, x1), (y0, y1) = ROBOT_FOOTPRINT
+        xs = np.arange(x0 - m, x1 + m + 1e-9, ROBOT_OBSTACLE_STEP_M)
+        ys = np.arange(y0 - m, y1 + m + 1e-9, ROBOT_OBSTACLE_STEP_M)
+        self._footprint_pts = np.array([(x, y) for x in xs for y in ys])
         self.create_timer(1.0 / CUBE_OBSTACLE_HZ, self._publish_obstacles)
         self.create_subscription(Point, '/detected_cube', self._cube_cb, 10)
         self.create_subscription(
@@ -262,6 +286,28 @@ class FleetManagerNode(Node):
         # than the last non-empty cloud.
         header = Header(frame_id=MAP_FRAME, stamp=self.get_clock().now().to_msg())
         self._obstacle_pub.publish(point_cloud2.create_cloud_xyz32(header, pts))
+
+        # Robot bodies, each for the other robot (see ROBOT_FOOTPRINT).
+        s = self._status
+        collector = None
+        if (s is not None and s.localised and self._status_time is not None
+                and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
+            collector = (s.x, s.y, s.yaw)
+        self._collector_body_pub.publish(
+            point_cloud2.create_cloud_xyz32(header, self._body_points(collector)))
+        self._leader_body_pub.publish(
+            point_cloud2.create_cloud_xyz32(header, self._body_points(self._leader_pose())))
+
+    def _body_points(self, pose):
+        """Footprint points of a robot at pose (x, y, yaw) in the map, or [] if None."""
+        if pose is None:
+            return []
+        x, y, yaw = pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        fp = self._footprint_pts
+        mx = x + c * fp[:, 0] - s * fp[:, 1]
+        my = y + s * fp[:, 0] + c * fp[:, 1]
+        return [(float(a), float(b), CUBE_OBSTACLE_Z) for a, b in zip(mx, my)]
 
     def _publish_markers(self):
         arr = MarkerArray()

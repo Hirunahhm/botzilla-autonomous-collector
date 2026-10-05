@@ -1,4 +1,5 @@
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.duration import Duration
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -684,11 +685,19 @@ def main(args=None):
     node = KobukiBaseNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info('Shutting down Kobuki node...')
-        # Stop motors safely (0 left, 0 right, 0 rotate flag)
-        node.robot.move(0, 0, 0) 
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
+        # Stop the motors on EVERY exit path, not only Ctrl-C. Under ros2 launch the
+        # shutdown usually arrives as SIGTERM / ExternalShutdownException, and this
+        # used to sit in the KeyboardInterrupt branch alone, so those exits left the
+        # base on its last command (seen 2026-10-05: the leader kept moving while the
+        # mission's cleanup stalled). Sent twice: it is one serial write each.
+        for _ in range(2):
+            try:
+                node.robot.move(0, 0, 0)
+            except Exception:
+                pass
         node.destroy_node()
         # rclpy may already have shut the context down on Ctrl-C; calling shutdown()
         # again raises RCLError and turns a clean stop into a -9/exit-1 in the logs.
