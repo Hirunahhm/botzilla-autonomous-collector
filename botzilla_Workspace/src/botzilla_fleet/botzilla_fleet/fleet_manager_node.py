@@ -16,8 +16,9 @@ collector finishes or fails its current task on its own, and a collector that go
 silent for STATUS_TIMEOUT_S has its task returned to the pool.
 
 Also publishes /fleet/cube_obstacles (PointCloud2) so the leader's own Nav2 stops driving
-into cubes it has already seen — see CUBE_OBSTACLE_Z — and /fleet/cubes (MarkerArray) for RViz and logs a one-line summary every
-SUMMARY_PERIOD_S, plus one JSON line per event to the run log for analysis.
+into cubes it has already seen — see CUBE_OBSTACLE_Z — and /fleet/cubes (MarkerArray)
+for RViz, and logs a one-line summary every SUMMARY_PERIOD_S, plus one JSON line per
+event to the run log for analysis.
 """
 import json
 import math
@@ -30,10 +31,10 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-import tf2_ros
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+import tf2_ros
 from tf2_ros import TransformException
 from visualization_msgs.msg import Marker, MarkerArray
 
