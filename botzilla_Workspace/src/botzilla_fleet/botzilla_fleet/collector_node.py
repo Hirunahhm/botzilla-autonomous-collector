@@ -108,7 +108,10 @@ class CollectorNode(ExecutorNode):
         latched.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         latched.reliability = QoSReliabilityPolicy.RELIABLE
         # The leader's map (absolute on purpose), for choosing a clear standoff pose.
-        self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
+        # The fleet manager's copy of the leader's map with this robot's own footprint and
+        # HOME cleared (see fleet_manager_node COLLECTOR_MAP_CLEAR_M); the same map the
+        # costmaps and AMCL use.
+        self.create_subscription(OccupancyGrid, 'fleet/map', self._map_cb, latched)
         self.create_subscription(CubeTask, 'fleet/task', self._task_cb, latched)
         self._fleet_status_pub = self.create_publisher(CollectorStatus, 'fleet/status', 10)
         self.create_timer(STATUS_PERIOD_S, self._publish_fleet_status)
@@ -284,9 +287,12 @@ class CollectorNode(ExecutorNode):
                     if self._nav_sent_time is not None else 0.0)
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self._enter_seeking('At the standoff.')
-            elif took < QUICK_FAIL_S:
+            elif self._nav_rejected:
+                # Nav2 refused the goal itself: it is not up. Accepted-then-failed is a
+                # real "no route" and is reported normally below — counting those as
+                # collector faults returned an unreachable cube to the pool forever.
                 self._finish_task(
-                    False, f'collector: navigation not ready (status {status} after '
+                    False, f'collector: navigation not ready (goal rejected after '
                            f'{took:.1f}s)')
                 self._nav_ready = False
                 self._transition(State.STARTUP, 'Nav2 rejected the route; re-checking it.')
@@ -353,7 +359,15 @@ class CollectorNode(ExecutorNode):
         self._cube_world_estimate = None
         self._cube_lost_time = None
         self._blind_spot_frames = 0
-        self._finish_task(collected, '' if collected else reason)
+        if collected:
+            detail = ''
+        elif self._state == State.DETACHING:
+            # ExecutorNode passes 'Delivery complete.' for every release, including one
+            # short of HOME; say what actually happened.
+            detail = 'released short of HOME (delivery route failed)'
+        else:
+            detail = reason
+        self._finish_task(collected, detail)
 
     def _finish_task(self, collected, detail):
         task_id = self._task[0] if self._task else 0

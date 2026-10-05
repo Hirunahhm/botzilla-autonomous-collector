@@ -24,9 +24,11 @@ import json
 import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
+from botzilla_fleet.map_tools import clear_discs
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point
+from nav_msgs.msg import OccupancyGrid
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -78,6 +80,15 @@ ROBOT_OBSTACLE_STEP_M = 0.05
 # A pose older than this is not drawn: a stale footprint would block empty floor.
 ROBOT_POSE_MAX_AGE_S = 1.5
 
+# The collector's map: the leader's /map republished on /<ns>/fleet/map with a disc of
+# this radius forced free around the collector's HOME and its current pose. The leader's
+# LiDAR maps the parked collector itself as an obstacle; on the raw /map the collector
+# started inside a lethal blob (every plan from its start failed, 11 back-up recoveries)
+# and its HOME was that same blob, so every delivery failed (2026-10-05). The robot is
+# physically there, so that floor cannot be an obstacle for it. 0.5 m covers the
+# footprint's farthest corner (0.42 m from base_link) with margin.
+COLLECTOR_MAP_CLEAR_M = 0.5
+
 COLOURS = {
     'unconfirmed': (0.6, 0.6, 0.6),
     'pending': (1.0, 0.8, 0.0),
@@ -128,6 +139,9 @@ class FleetManagerNode(Node):
             PointCloud2, '/fleet/robot_obstacles', 10)            # for the leader
         self._leader_body_pub = self.create_publisher(
             PointCloud2, f'/{self._ns}/fleet/robot_obstacles', 10)  # for the collector
+        self._collector_map_pub = self.create_publisher(
+            OccupancyGrid, f'/{self._ns}/fleet/map', latched)
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
         m = ROBOT_OBSTACLE_MARGIN_M
         (x0, x1), (y0, y1) = ROBOT_FOOTPRINT
         xs = np.arange(x0 - m, x1 + m + 1e-9, ROBOT_OBSTACLE_STEP_M)
@@ -297,6 +311,24 @@ class FleetManagerNode(Node):
             point_cloud2.create_cloud_xyz32(header, self._body_points(collector)))
         self._leader_body_pub.publish(
             point_cloud2.create_cloud_xyz32(header, self._body_points(self._leader_pose())))
+
+    def _map_cb(self, msg):
+        """Republish the leader's map for the collector, its own floor cleared."""
+        out = OccupancyGrid()
+        out.header = msg.header
+        out.info = msg.info
+        grid = np.array(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
+        s = self._status
+        spots = []
+        if s is not None and s.home_set:
+            spots.append((s.home_x, s.home_y))
+        if (s is not None and s.localised and self._status_time is not None
+                and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
+            spots.append((s.x, s.y))
+        clear_discs(grid, (msg.info.origin.position.x, msg.info.origin.position.y),
+                    msg.info.resolution, spots, COLLECTOR_MAP_CLEAR_M)
+        out.data = grid.flatten().tolist()
+        self._collector_map_pub.publish(out)
 
     def _body_points(self, pose):
         """Footprint points of a robot at pose (x, y, yaw) in the map, or [] if None."""

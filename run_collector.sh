@@ -91,6 +91,11 @@ CLEANED=0
 cleanup() {
     [ "$CLEANED" = 1 ] && return
     CLEANED=1
+    # Ignore further INT/TERM until done. Otherwise a second signal (timed_run.sh's
+    # timer and an operator's stop landing together, 2026-10-05) re-enters the trap,
+    # which sees CLEANED=1 and exits on the spot, abandoning this cleanup halfway and
+    # leaving the stack running.
+    trap '' INT TERM
     echo
     step "shutting down"
     # The robot first, before anything that could stall: see tools/robot_stop.sh.
@@ -207,7 +212,23 @@ ${C_OK}============ COLLECTOR /$NS IS UP ============${C_0}
     tail -f $LOG_DIR/collector.log | grep -E 'Task|\] -> \['
     ros2 topic echo /$NS/fleet/status        # (with ROS_DISCOVERY_SERVER set as above)
 
-  In the leader's RViz add: MarkerArray /fleet/cubes, PoseArray /$NS/particle_cloud
+  View the collector in RViz — on your laptop, in a SECOND terminal (the leader's RViz
+  keeps running in the first), with the same exports as for the leader:
+
+    source /opt/ros/jazzy/setup.bash
+    export ROS_DOMAIN_ID=0
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    export ROS_DISCOVERY_SERVER="${LEADER}:${DISCOVERY_PORT}"
+    export ROS_SUPER_CLIENT=true
+    unset ROS_LOCALHOST_ONLY ROS_AUTOMATIC_DISCOVERY_RANGE
+    ros2 daemon stop
+
+    # one-time (repeat if the config changes):
+    scp hirunahhm@${LEADER}:~/Desktop/Projects/sem5/final-project-botzilla/tools/rviz/botzilla_collector.rviz ~/
+    rviz2 -d ~/botzilla_collector.rviz --ros-args -r /tf:=/$NS/tf -r /tf_static:=/$NS/tf_static
+
+  (the /tf remaps are required: the collector's TF is on /$NS/tf. See ros_dds.md.)
+
   Logs: $LOG_DIR
   ${C_WARN}Ctrl+C to stop the collector.${C_0}
 

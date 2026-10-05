@@ -11,7 +11,8 @@ nav2_params.yaml) — a separate copy would drift — with only what has to diff
   file under the namespace key is how nav2_bringup's RewrittenYaml(root_key=...) does it.
 - Topics. Absolute topic names ("/scan") would read the LEADER's sensors over the shared
   DDS graph, so every absolute *topic parameter is moved into the namespace ("/scan" ->
-  "/bz2/scan") — except the map, which is deliberately the leader's /map. NOT made
+  "/bz2/scan") — except the map, which is the leader's map as republished for the
+  collector (COLLECTOR_MAP_TOPIC). NOT made
   relative: a costmap is its own node in a sub-namespace (/bz2/local_costmap/
   local_costmap), and its layers resolve a relative "scan" to /bz2/local_costmap/scan,
   which nothing publishes. Measured on Jazzy by activating the namespaced
@@ -25,7 +26,11 @@ nav2_params.yaml) — a separate copy would drift — with only what has to diff
 """
 import copy
 
-LEADER_MAP_TOPIC = '/map'
+# Not the leader's /map itself but the fleet manager's copy of it, with the collector's
+# own footprint and HOME cleared: the leader's LiDAR maps the parked collector as an
+# obstacle, and with the raw /map the collector started inside it and its HOME was
+# lethal, so every plan from the start and every delivery failed (2026-10-05).
+COLLECTOR_MAP_TOPIC = 'fleet/map'      # resolved under the collector's namespace
 COLLECTOR_PLANNERS_DROP = ('SweepStraight',)
 COLLECTOR_COSTMAP_LAYERS_DROP = ('coverage_layer',)
 
@@ -73,10 +78,13 @@ def collector_nav2_params(base, ns, amcl=None):
     for costmap in ('global_costmap', 'local_costmap'):
         params = p.get(costmap, {}).get(costmap, {}).get('ros__parameters', {})
         if isinstance(params.get('static_layer'), dict):
-            params['static_layer']['map_topic'] = LEADER_MAP_TOPIC
+            params['static_layer']['map_topic'] = f'/{ns}/{COLLECTOR_MAP_TOPIC}'
 
     if amcl:
         p.update(copy.deepcopy(amcl))
+        a = p.get('amcl', {}).get('ros__parameters', {})
+        if 'map_topic' in a:
+            a['map_topic'] = f'/{ns}/{COLLECTOR_MAP_TOPIC}'
     return p
 
 

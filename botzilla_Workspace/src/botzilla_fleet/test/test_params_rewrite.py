@@ -27,7 +27,7 @@ def test_absolute_topics_moved_into_namespace():
     p = collector_nav2_params(load(), 'bz2')
     for path, val in walk(p):
         if path and path[-1].endswith('topic') and isinstance(val, str):
-            assert not val.startswith('/') or val == '/map' or val.startswith('/bz2/'), \
+            assert not val.startswith('/') or val.startswith('/bz2/'), \
                 (path, val)
     # Costmap layers must name the robot's topic absolutely: a relative 'scan' in a
     # costmap resolves to /bz2/local_costmap/scan (see params_rewrite docstring).
@@ -43,7 +43,7 @@ def test_leader_only_plugins_removed():
     assert 'SweepStraight' not in planner
     gc = p['global_costmap']['global_costmap']['ros__parameters']
     assert 'coverage_layer' not in gc['plugins'] and 'coverage_layer' not in gc
-    assert gc['static_layer']['map_topic'] == '/map'
+    assert gc['static_layer']['map_topic'] == '/bz2/fleet/map'
 
 
 def test_leader_params_untouched_and_amcl_merged():
@@ -69,3 +69,8 @@ def test_fleet_sources_point_at_the_collectors_own_topics():
     for layer in (lc, gc):
         assert layer['fleet_robots']['topic'] == '/bz2/fleet/robot_obstacles'
         assert layer['fleet_cubes']['topic'] == '/bz2/fleet/cube_obstacles'
+
+
+def test_amcl_and_static_layers_use_the_cleaned_collector_map():
+    p = collector_nav2_params(load(), 'bz2', {'amcl': {'ros__parameters': {'map_topic': '/map'}}})
+    assert p['amcl']['ros__parameters']['map_topic'] == '/bz2/fleet/map'

@@ -10,7 +10,7 @@
 amcl:
   ros__parameters:
     use_sim_time: False
-    map_topic: /map
+    map_topic: /map   # replaced by /<ns>/fleet/map in params_rewrite (own floor cleared)
     scan_topic: scan
     global_frame_id: map
     odom_frame_id: odom

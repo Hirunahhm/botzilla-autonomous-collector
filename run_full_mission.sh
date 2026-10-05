@@ -281,6 +281,11 @@ source_ros() {
 cleanup() {
     [ "$CLEANED" = 1 ] && return
     CLEANED=1
+    # Ignore further INT/TERM until done. Otherwise a second signal (timed_run.sh's
+    # timer and an operator's stop landing together, 2026-10-05) re-enters the trap,
+    # which sees CLEANED=1 and exits on the spot, abandoning this cleanup halfway and
+    # leaving the stack running.
+    trap '' INT TERM
     echo
     step "shutting down"
 

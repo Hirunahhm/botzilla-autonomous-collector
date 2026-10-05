@@ -291,6 +291,10 @@ class ExecutorNode(Node):
         # made with and are dropped if it has moved on, so the late CANCELED result of
         # an abandoned goal can never be read as the result of the next one.
         self._nav_token = 0
+        # True when Nav2 refused the last goal outright (not accepted), as opposed to
+        # accepting it and then failing. botzilla_fleet's collector_node tells "Nav2 is
+        # not up" from "no route" by this.
+        self._nav_rejected = False
         # Delivery progress watchdog — see DELIVERY_NO_PROGRESS_S.
         self._home_best_dist = None
         self._home_progress_time = None
@@ -685,6 +689,7 @@ class ExecutorNode(Node):
         """Send a NavigateToPose goal; its result lands in self._nav_result."""
         self._nav_token += 1
         token = self._nav_token
+        self._nav_rejected = False
         self._nav_result = None
         self._nav_goal_handle = None
         self._nav_sent_time = self.get_clock().now()
@@ -717,6 +722,7 @@ class ExecutorNode(Node):
         handle = future.result()
         if not handle.accepted:
             self.get_logger().warn('Nav2 rejected the goal.')
+            self._nav_rejected = True
             self._nav_result = GoalStatus.STATUS_ABORTED
             return
         self._nav_goal_handle = handle
