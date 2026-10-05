@@ -519,7 +519,7 @@ local_costmap:
       cube_layer:
         # Two-robot runs: cubes already detected (fleet_manager_node, see
         # CUBE_HALO_RADIUS_M). AFTER inflation_layer on purpose: the cube is lethal, so no
-        # footprint passes over it, but it gets a 0.2 m soft halo instead of the 0.45 m
+        # footprint passes over it, but it gets a fading 0.35 m soft halo instead of the 0.45 m
         # inflated disc that blocked corridors. Inert in single-robot runs.
         plugin: "botzilla_coverage_layer::CoverageCostLayer"
         enabled: True
@@ -695,7 +695,7 @@ global_costmap:
       cube_layer:
         # Two-robot runs: cubes already detected (fleet_manager_node, see
         # CUBE_HALO_RADIUS_M). AFTER inflation_layer on purpose: the cube is lethal, so no
-        # footprint passes over it, but it gets a 0.2 m soft halo instead of the 0.45 m
+        # footprint passes over it, but it gets a fading 0.35 m soft halo instead of the 0.45 m
         # inflated disc that blocked corridors. Inert in single-robot runs.
         plugin: "botzilla_coverage_layer::CoverageCostLayer"
         enabled: True

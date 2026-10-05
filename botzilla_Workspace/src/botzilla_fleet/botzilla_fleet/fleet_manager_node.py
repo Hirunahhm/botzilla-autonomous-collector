@@ -80,8 +80,12 @@ CUBE_OBSTACLE_HALF_M = 0.05        # a 0.10 m square per cube
 # lethal, so no footprint can pass over one, but without the 0.45 m inflated disc that
 # made a cube in a corridor a wall the leader could not get past (2026-10-06). Instead a
 # soft halo makes the planner keep a little clear while still allowing a close pass.
-CUBE_HALO_RADIUS_M = 0.20
-CUBE_HALO_VALUE = 30               # -> costmap cost ~76: a preference, not a barrier
+# 0.35 m: the planner plans the robot's centre line and the robot is ~0.22 m wide each
+# side, so a shorter halo let it plan a centre line the footprint could not follow.
+CUBE_HALO_RADIUS_M = 0.35
+# 40 -> cost ~100 next to the cube, fading to ~25; never lethal or inscribed, so a
+# narrow gap stays passable.
+CUBE_HALO_VALUE = 40
 # Footprint from nav2_params.yaml (both robots share the URDF): base and grabber arms.
 ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
 ROBOT_OBSTACLE_MARGIN_M = 0.0

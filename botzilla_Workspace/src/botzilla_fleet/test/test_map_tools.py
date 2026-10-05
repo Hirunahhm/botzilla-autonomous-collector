@@ -38,11 +38,13 @@ def test_no_points_is_none():
 
 def test_halo_grid_core_and_halo():
     from botzilla_fleet.map_tools import halo_grid
-    data, ox, oy, w, h = halo_grid([(1.0, 1.0)], 0.05, 0.05, 0.2, 30)
+    data, ox, oy, w, h = halo_grid([(1.0, 1.0)], 0.05, 0.05, 0.35, 40)
 
     def at(x, y):
-        return data[int((y - oy) / 0.05), int((x - ox) / 0.05)]
+        i, j = int((x - ox) / 0.05), int((y - oy) / 0.05)
+        return data[j, i] if 0 <= i < w and 0 <= j < h else 0
     assert at(1.0, 1.0) == 100 and at(1.04, 0.96) == 100      # core
-    assert at(1.15, 1.0) == 30                                # halo
-    assert at(1.3, 1.0) == 0                                  # outside
+    assert 30 <= at(1.12, 1.0) <= 40                          # strong next to the core
+    assert 10 <= at(1.3, 1.0) < at(1.12, 1.0)                 # fading
+    assert at(1.45, 1.0) == 0                                 # outside the halo
     assert halo_grid([], 0.05, 0.05, 0.2, 30) is None

@@ -63,7 +63,11 @@ def points_to_grid(points, resolution):
 
 
 def halo_grid(centres, resolution, core_half_m, halo_radius_m, halo_value):
-    """Grid of square lethal cores (100) with a round soft halo (halo_value) around each.
+    """Grid of square lethal cores (100) with a round soft halo around each.
+
+    The halo fades linearly from halo_value next to the core to a quarter of it at
+    halo_radius_m, so the planner keeps well clear when it can but a narrow pass stays
+    cheap enough to take.
 
     centres: [(x, y), ...] in the map frame. Returns (data, origin_x, origin_y, width,
     height) like points_to_grid, or None when there are no centres.
@@ -82,6 +86,10 @@ def halo_grid(centres, resolution, core_half_m, halo_radius_m, halo_value):
     data = np.zeros((h, w), dtype=np.int8)
     for cx, cy in pts:
         dx, dy = np.abs(gx - cx), np.abs(gy - cy)
-        data[(dx * dx + dy * dy <= halo_radius_m ** 2) & (data < halo_value)] = halo_value
+        d = np.sqrt(dx * dx + dy * dy)
+        frac = np.clip((d - core_half_m) / max(halo_radius_m - core_half_m, 1e-9), 0.0, 1.0)
+        halo = np.round(halo_value * (1.0 - 0.75 * frac)).astype(np.int8)
+        inside = d <= halo_radius_m
+        data[inside] = np.maximum(data[inside], halo[inside])
         data[(dx <= core_half_m) & (dy <= core_half_m)] = 100
     return data, ox, oy, w, h
