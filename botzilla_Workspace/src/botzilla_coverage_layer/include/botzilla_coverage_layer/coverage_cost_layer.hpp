@@ -72,6 +72,10 @@ private:
   // the new grid's extent, so a grid that shrank, moved, or went all-zero clears
   // the stale penalty it used to cover.
   Extent dirty_;
+  bool lethal_{false};
+  double max_age_s_{0.0};
+  rclcpp::Clock::SharedPtr clock_;
+  rclcpp::Time received_{0, 0, RCL_ROS_TIME};
 };
 
 }  // namespace botzilla_coverage_layer

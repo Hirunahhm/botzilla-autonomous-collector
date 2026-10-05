@@ -179,6 +179,14 @@ DELIVERY_TIMEOUT_S = 300.0
 # until 609 s. 45 s leaves room for a normal replan plus one spin recovery.
 DELIVERY_NO_PROGRESS_S = 45.0
 DELIVERY_PROGRESS_M = 0.15
+# A HOME goal that fails within DELIVERY_QUICK_FAIL_S never really ran (Nav2 could not
+# even start it), so it is re-sent, up to DELIVERY_RETRIES goals in all, before the cube
+# is given up — giving up means DETACHING, which reverses to release the cube. Seen on
+# the collector robot (2026-10-05): bt_navigator timed out waiting 20 ms for the planner
+# to acknowledge, the delivery "failed" 30 ms after capture and the cube was released
+# on the spot.
+DELIVERY_QUICK_FAIL_S = 2.0
+DELIVERY_RETRIES = 3
 
 # Per-spot limit on cubes the robot cannot collect. A spot where a cube has failed
 # SPOT_FAIL_LIMIT times (a chase lost while targeting/approaching, or a cube released
@@ -295,6 +303,7 @@ class ExecutorNode(Node):
         # accepting it and then failing. botzilla_fleet's collector_node tells "Nav2 is
         # not up" from "no route" by this.
         self._nav_rejected = False
+        self._delivery_attempts = 0      # HOME goals sent for the current cube
         # Delivery progress watchdog — see DELIVERY_NO_PROGRESS_S.
         self._home_best_dist = None
         self._home_progress_time = None
@@ -572,9 +581,18 @@ class ExecutorNode(Node):
             status = self._nav_result
             self._nav_result = None
             self._nav_goal_handle = None
+            took = ((now - self._nav_sent_time).nanoseconds / 1e9
+                    if self._nav_sent_time is not None else float('inf'))
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self._delivery_arrived = True
                 self._transition(State.DETACHING, 'Arrived HOME.')
+            elif took < DELIVERY_QUICK_FAIL_S and self._delivery_attempts < DELIVERY_RETRIES:
+                self.get_logger().warn(
+                    f'HOME goal failed after {took:.2f}s (status {status}) — Nav2 never '
+                    f'really started it; re-sending ({self._delivery_attempts + 1}/'
+                    f'{DELIVERY_RETRIES}) instead of releasing the cube.'
+                )
+                self._send_home_goal()
             else:
                 # Releasing here is deliberate. The robot is somewhere short of HOME,
                 # but dropping the cube and carrying on beats wedging the whole
@@ -681,6 +699,7 @@ class ExecutorNode(Node):
 
         self._delivery_arrived = False
         self._home_best_dist = None
+        self._delivery_attempts += 1
         self.get_logger().info(f'Sending NavigateToPose to HOME ({x:.2f}, {y:.2f}).')
         self._send_nav_goal(goal)
         self._home_progress_time = self._nav_sent_time
@@ -857,6 +876,8 @@ class ExecutorNode(Node):
                     pose[1] + HELD_CUBE_OFFSET_M * math.sin(pose[2]),
                     'released short of HOME',
                 )
+        if new_state == State.DELIVERING:
+            self._delivery_attempts = 0
         if new_state == State.DETACHING:
             # Covers every DELIVERING exit (arrived, failed, timed out) uniformly,
             # and is a harmless no-op on paths that never lowered it in the first

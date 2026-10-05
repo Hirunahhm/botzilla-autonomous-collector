@@ -18,7 +18,20 @@ void CoverageCostLayer::onInitialize()
 
   declareParameter("enabled", rclcpp::ParameterValue(true));
   declareParameter("topic", rclcpp::ParameterValue(std::string("/coverage_cost_map")));
+  // lethal: the grid holds obstacles, not preferences. Cells >= 50 become LETHAL and
+  // nothing is capped or skipped. botzilla_fleet uses a second instance of this layer
+  // ('fleet_layer') for the other robot's footprint and the known cubes: they move or
+  // disappear, and this layer repaints its whole previous extent on every message, so
+  // an old footprint is gone at the next update. As marking points in an obstacle
+  // layer they lingered until a LiDAR ray happened to pass through each cell.
+  declareParameter("lethal", rclcpp::ParameterValue(false));
+  // max_age_s > 0: drop the grid if no message arrived for this long (measured on this
+  // machine's clock, at receipt), so a dead publisher cannot leave obstacles behind.
+  declareParameter("max_age_s", rclcpp::ParameterValue(0.0));
   node->get_parameter(name_ + ".enabled", enabled_);
+  node->get_parameter(name_ + ".lethal", lethal_);
+  node->get_parameter(name_ + ".max_age_s", max_age_s_);
+  clock_ = node->get_clock();
   std::string topic;
   node->get_parameter(name_ + ".topic", topic);
 
@@ -36,8 +49,9 @@ void CoverageCostLayer::onInitialize()
     std::bind(&CoverageCostLayer::coverageCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(
-    logger_, "CoverageCostLayer '%s': %s, listening on %s",
-    name_.c_str(), enabled_ ? "enabled" : "disabled", topic.c_str());
+    logger_, "CoverageCostLayer '%s': %s, listening on %s%s",
+    name_.c_str(), enabled_ ? "enabled" : "disabled", topic.c_str(),
+    lethal_ ? " (lethal obstacles)" : "");
 }
 
 void CoverageCostLayer::reset()
@@ -89,6 +103,7 @@ void CoverageCostLayer::coverageCallback(nav_msgs::msg::OccupancyGrid::ConstShar
     }
   }
   grid_ = msg;
+  received_ = clock_->now();
 }
 
 void CoverageCostLayer::updateBounds(
@@ -96,6 +111,21 @@ void CoverageCostLayer::updateBounds(
   double * min_x, double * min_y, double * max_x, double * max_y)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (max_age_s_ > 0.0 && grid_ && (clock_->now() - received_).seconds() > max_age_s_) {
+    // Stale: forget it, and repaint where it was so its cells are cleared.
+    Extent old = extentOf(*grid_);
+    if (old.valid) {
+      if (dirty_.valid) {
+        dirty_.min_x = std::min(dirty_.min_x, old.min_x);
+        dirty_.min_y = std::min(dirty_.min_y, old.min_y);
+        dirty_.max_x = std::max(dirty_.max_x, old.max_x);
+        dirty_.max_y = std::max(dirty_.max_y, old.max_y);
+      } else {
+        dirty_ = old;
+      }
+    }
+    grid_.reset();
+  }
   if (!dirty_.valid) {
     return;
   }
@@ -134,6 +164,24 @@ void CoverageCostLayer::updateCosts(
   // Published 0..100 -> internal 0..252. Capped one below INSCRIBED so this layer
   // can never, by itself, make a cell a collision.
   constexpr int kMaxInternal = nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE - 1;
+
+  if (lethal_) {
+    for (int j = min_j; j < max_j; ++j) {
+      for (int i = min_i; i < max_i; ++i) {
+        double wx, wy;
+        master_grid.mapToWorld(i, j, wx, wy);
+        const int gx = static_cast<int>(std::floor((wx - ox) / res));
+        const int gy = static_cast<int>(std::floor((wy - oy) / res));
+        if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
+          continue;
+        }
+        if (grid->data[gy * gw + gx] >= 50) {
+          master_grid.setCost(i, j, nav2_costmap_2d::LETHAL_OBSTACLE);
+        }
+      }
+    }
+    return;
+  }
 
   for (int j = min_j; j < max_j; ++j) {
     for (int i = min_i; i < max_i; ++i) {

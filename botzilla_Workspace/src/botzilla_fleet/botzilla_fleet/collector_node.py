@@ -219,6 +219,13 @@ class CollectorNode(ExecutorNode):
                 f'HOME latched at x={pose[0]:.3f} y={pose[1]:.3f} '
                 f'yaw={math.degrees(pose[2]):.1f}deg in the leader map.'
             )
+        if self._map is None:
+            # Not ready until the fleet manager's cleaned map has arrived: before it,
+            # AMCL and the costmaps run without the leader's map and every plan fails
+            # (the collector came up 38 s before the fleet manager on 2026-10-05).
+            self.get_logger().info('Waiting for the fleet map (fleet/map)...',
+                                   throttle_duration_sec=5.0)
+            return
         if not self._poll_nav_ready(now):
             self.get_logger().info('Waiting for Nav2 to be fully active...',
                                    throttle_duration_sec=5.0)

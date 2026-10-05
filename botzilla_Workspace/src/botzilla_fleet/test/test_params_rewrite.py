@@ -59,16 +59,16 @@ def test_namespaced():
     assert namespaced({'a': 1}, '') == {'a': 1}
 
 
-def test_fleet_sources_point_at_the_collectors_own_topics():
-    # The leader reads /fleet/robot_obstacles (the collector's body); the collector's
-    # copy must read the leader's body on /bz2/fleet/robot_obstacles, and its cube
-    # source must not be the leader's /fleet/cube_obstacles (its target would block it).
+def test_fleet_layer_reads_the_collectors_own_grid():
+    # The leader's fleet_layer reads /fleet/obstacle_grid (the collector + cubes); the
+    # collector's must read its own grid (the leader + cubes other than its target).
     p = collector_nav2_params(load(), 'bz2')
-    lc = p['local_costmap']['local_costmap']['ros__parameters']['voxel_layer']
-    gc = p['global_costmap']['global_costmap']['ros__parameters']['obstacle_layer']
-    for layer in (lc, gc):
-        assert layer['fleet_robots']['topic'] == '/bz2/fleet/robot_obstacles'
-        assert layer['fleet_cubes']['topic'] == '/bz2/fleet/cube_obstacles'
+    for costmap in ('local_costmap', 'global_costmap'):
+        params = p[costmap][costmap]['ros__parameters']
+        assert 'fleet_layer' in params['plugins']
+        assert params['plugins'].index('fleet_layer') < params['plugins'].index('inflation_layer')
+        assert params['fleet_layer']['topic'] == '/bz2/fleet/obstacle_grid'
+        assert params['fleet_layer']['lethal'] is True
 
 
 def test_amcl_and_static_layers_use_the_cleaned_collector_map():

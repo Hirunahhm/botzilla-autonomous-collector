@@ -15,8 +15,8 @@ Discrete goals only, never velocities (PROJECT.md §6): if the network drops the
 collector finishes or fails its current task on its own, and a collector that goes
 silent for STATUS_TIMEOUT_S has its task returned to the pool.
 
-Also publishes /fleet/cube_obstacles (PointCloud2) so the leader's own Nav2 stops driving
-into cubes it has already seen — see CUBE_OBSTACLE_Z — and /fleet/cubes (MarkerArray)
+Also publishes an obstacle grid per robot (the other robot and the known cubes, see
+OBSTACLE_GRID_HZ), the collector's cleaned map, and /fleet/cubes (MarkerArray)
 for RViz, and logs a one-line summary every SUMMARY_PERIOD_S, plus one JSON line per
 event to the run log for analysis.
 """
@@ -24,7 +24,7 @@ import json
 import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
-from botzilla_fleet.map_tools import clear_discs
+from botzilla_fleet.map_tools import clear_discs, place, points_to_grid, rect_points
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point
@@ -33,9 +33,6 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Header
 import tf2_ros
 from tf2_ros import TransformException
 from visualization_msgs.msg import Marker, MarkerArray
@@ -53,30 +50,30 @@ SUMMARY_PERIOD_S = 30.0
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
 
-# Known cubes as obstacles for the leader's costmaps (nav2_params.yaml source
-# 'fleet_cubes'). Needed because the leader drives into cubes it has detected: the
-# RPLIDAR scans at 0.24 m (URDF laser_joint), above a cube, so it never marks one and
-# its rays clear the cells under them; the depth camera's low scan only sees from
-# 0.55 m out; and in detect-only mode the executor deliberately ignores detections.
-# Points are placed AT the LiDAR's height on purpose: re-published at CUBE_OBSTACLE_HZ
-# a cube stays marked (each costmap update marks after it clears), and once a cube is
-# no longer published (collected) the LiDAR's own clearing rays erase it.
-CUBE_OBSTACLE_Z = 0.24
-CUBE_OBSTACLE_HALF_M = 0.05      # 3 x 3 points 5 cm apart: a ~0.15 m square per cube
-CUBE_OBSTACLE_HZ = 5.0
-
-# Each robot's footprint as an obstacle for the OTHER robot's costmaps (nav2_params.yaml
-# source 'fleet_robots'; the collector's copy reads /<ns>/fleet/robot_obstacles via
-# params_rewrite). Needed because neither robot's LiDAR sees the other's body: the
-# Kobuki is 0.09 m tall and the LiDARs scan at 0.24 m, where only the slim LiDAR
-# housing and camera mount are, so returns come and go as the robots close in — the
-# leader drove into the collector on 2026-10-05 after seeing it from further away.
-# Same height trick as the cubes: re-marked every publish, cleared by the LiDAR once the
-# robot has moved on. The footprint is nav2_params.yaml's (both robots share the URDF),
-# with this margin added, and points 5 cm apart so no costmap cell inside is missed.
+# Obstacles for each robot's costmaps, as a small OccupancyGrid per robot drawn by the
+# 'fleet_layer' (botzilla_coverage_layer in lethal mode, nav2_params.yaml), which repaints
+# its whole previous extent on every message — so a robot that moved, or a cube that was
+# collected, is gone from the costmap at the next update:
+#   /fleet/obstacle_grid        for the leader:    the collector's footprint + known cubes
+#   /<ns>/fleet/obstacle_grid   for the collector: the leader's footprint + known cubes
+#                               other than the one it is collecting
+# Why each is needed:
+# - cubes: the leader drove into cubes it had detected. The RPLIDAR scans at 0.24 m (URDF
+#   laser_joint), above a cube, the depth camera's low scan only sees from 0.55 m out, and
+#   in detect-only mode the executor deliberately ignores detections.
+# - robots: neither LiDAR sees the other robot's 0.09 m Kobuki body; at 0.24 m there is
+#   only a slim LiDAR housing and camera mount, so returns come and go as they close in —
+#   the leader drove into the collector on 2026-10-05.
+# These used to be PointCloud2 marking sources in the obstacle layers. Their marks
+# stayed until a LiDAR ray happened to cross each old cell, so a moving robot left a
+# trail of stale obstacles (seen 2026-10-05) that also blocked routes.
+OBSTACLE_GRID_HZ = 5.0
+OBSTACLE_GRID_RES = 0.05
+OBSTACLE_SAMPLE_M = 0.025          # half a cell, so a rotated footprint has no holes
+CUBE_OBSTACLE_HALF_M = 0.075       # a ~0.15 m square per cube
+# Footprint from nav2_params.yaml (both robots share the URDF), plus this margin.
 ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
 ROBOT_OBSTACLE_MARGIN_M = 0.05
-ROBOT_OBSTACLE_STEP_M = 0.05
 # A pose older than this is not drawn: a stale footprint would block empty floor.
 ROBOT_POSE_MAX_AGE_S = 1.5
 
@@ -134,20 +131,22 @@ class FleetManagerNode(Node):
         latched.reliability = QoSReliabilityPolicy.RELIABLE
         self._task_pub = self.create_publisher(CubeTask, f'/{self._ns}/fleet/task', latched)
         self._marker_pub = self.create_publisher(MarkerArray, '/fleet/cubes', 10)
-        self._obstacle_pub = self.create_publisher(PointCloud2, '/fleet/cube_obstacles', 10)
-        self._collector_body_pub = self.create_publisher(
-            PointCloud2, '/fleet/robot_obstacles', 10)            # for the leader
-        self._leader_body_pub = self.create_publisher(
-            PointCloud2, f'/{self._ns}/fleet/robot_obstacles', 10)  # for the collector
+        # Latched (transient local, reliable): the layer subscribes that way, and a
+        # volatile publisher is QoS-incompatible with it — DDS then delivers nothing,
+        # with only a warning on the publisher's side.
+        self._leader_grid_pub = self.create_publisher(
+            OccupancyGrid, '/fleet/obstacle_grid', latched)                 # for the leader
+        self._collector_grid_pub = self.create_publisher(
+            OccupancyGrid, f'/{self._ns}/fleet/obstacle_grid', latched)     # for the collector
         self._collector_map_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/map', latched)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
         m = ROBOT_OBSTACLE_MARGIN_M
         (x0, x1), (y0, y1) = ROBOT_FOOTPRINT
-        xs = np.arange(x0 - m, x1 + m + 1e-9, ROBOT_OBSTACLE_STEP_M)
-        ys = np.arange(y0 - m, y1 + m + 1e-9, ROBOT_OBSTACLE_STEP_M)
-        self._footprint_pts = np.array([(x, y) for x in xs for y in ys])
-        self.create_timer(1.0 / CUBE_OBSTACLE_HZ, self._publish_obstacles)
+        self._footprint_pts = rect_points((x0 - m, x1 + m), (y0 - m, y1 + m), OBSTACLE_SAMPLE_M)
+        h = CUBE_OBSTACLE_HALF_M
+        self._cube_pts = rect_points((-h, h), (-h, h), OBSTACLE_SAMPLE_M)
+        self.create_timer(1.0 / OBSTACLE_GRID_HZ, self._publish_obstacles)
         self.create_subscription(Point, '/detected_cube', self._cube_cb, 10)
         self.create_subscription(
             CollectorStatus, f'/{self._ns}/fleet/status', self._status_cb, 10
@@ -287,30 +286,45 @@ class FleetManagerNode(Node):
         )
 
     def _publish_obstacles(self):
-        """Every confirmed, not-yet-collected cube as a small square of points."""
-        offs = np.arange(-1, 2) * CUBE_OBSTACLE_HALF_M
-        pts = []
+        """Publish each robot's obstacle grid (see OBSTACLE_GRID_HZ)."""
+        assigned = self._current[1] if self._current is not None else None
+        cubes, cubes_but_target = [], []
         for cube in self._registry.cubes.values():
             if cube.status == 'collected' or not self._registry.confirmed(cube):
                 continue
-            for dx in offs:
-                for dy in offs:
-                    pts.append((cube.x + dx, cube.y + dy, CUBE_OBSTACLE_Z))
-        # Published even when empty, so the costmap's buffer holds "no cubes" rather
-        # than the last non-empty cloud.
-        header = Header(frame_id=MAP_FRAME, stamp=self.get_clock().now().to_msg())
-        self._obstacle_pub.publish(point_cloud2.create_cloud_xyz32(header, pts))
-
-        # Robot bodies, each for the other robot (see ROBOT_FOOTPRINT).
+            pts = self._cube_pts + (cube.x, cube.y)
+            cubes.append(pts)
+            if cube.id != assigned:
+                cubes_but_target.append(pts)
         s = self._status
         collector = None
         if (s is not None and s.localised and self._status_time is not None
                 and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
             collector = (s.x, s.y, s.yaw)
-        self._collector_body_pub.publish(
-            point_cloud2.create_cloud_xyz32(header, self._body_points(collector)))
-        self._leader_body_pub.publish(
-            point_cloud2.create_cloud_xyz32(header, self._body_points(self._leader_pose())))
+        leader = self._leader_pose()
+        self._leader_grid_pub.publish(self._grid(
+            cubes + ([place(self._footprint_pts, collector)] if collector else [])))
+        self._collector_grid_pub.publish(self._grid(
+            cubes_but_target + ([place(self._footprint_pts, leader)] if leader else [])))
+
+    def _grid(self, chunks):
+        """Build an OccupancyGrid of the given point arrays (empty when there are none).
+
+        Empty grids are published too: the layer then repaints, and so clears, wherever
+        the previous grid was.
+        """
+        msg = OccupancyGrid()
+        msg.header.frame_id = MAP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = OBSTACLE_GRID_RES
+        msg.info.origin.orientation.w = 1.0
+        raster = points_to_grid(np.concatenate(chunks) if chunks else None, OBSTACLE_GRID_RES)
+        if raster is not None:
+            data, ox, oy, w, h = raster
+            msg.info.origin.position.x, msg.info.origin.position.y = ox, oy
+            msg.info.width, msg.info.height = w, h
+            msg.data = data.ravel().tolist()
+        return msg
 
     def _map_cb(self, msg):
         """Republish the leader's map for the collector, its own floor cleared."""
@@ -329,17 +343,6 @@ class FleetManagerNode(Node):
                     msg.info.resolution, spots, COLLECTOR_MAP_CLEAR_M)
         out.data = grid.flatten().tolist()
         self._collector_map_pub.publish(out)
-
-    def _body_points(self, pose):
-        """Footprint points of a robot at pose (x, y, yaw) in the map, or [] if None."""
-        if pose is None:
-            return []
-        x, y, yaw = pose
-        c, s = math.cos(yaw), math.sin(yaw)
-        fp = self._footprint_pts
-        mx = x + c * fp[:, 0] - s * fp[:, 1]
-        my = y + s * fp[:, 0] + c * fp[:, 1]
-        return [(float(a), float(b), CUBE_OBSTACLE_Z) for a, b in zip(mx, my)]
 
     def _publish_markers(self):
         arr = MarkerArray()

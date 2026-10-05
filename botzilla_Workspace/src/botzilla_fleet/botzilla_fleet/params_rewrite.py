@@ -67,8 +67,13 @@ def collector_nav2_params(base, ns, amcl=None):
     # on the loaded Pi, discovering compute_path_to_pose took longer, so activation
     # failed and the lifecycle manager aborted the whole bring-up
     # (run_logs/collector-20261005-212145 on the Pi).
-    p.setdefault('bt_navigator', {}).setdefault('ros__parameters', {})[
-        'wait_for_service_timeout'] = 10000
+    bt = p.setdefault('bt_navigator', {}).setdefault('ros__parameters', {})
+    bt['wait_for_service_timeout'] = 10000
+    # Same machine, same cause, at run time: each BT action node waits only
+    # default_server_timeout (20 ms) for its server to acknowledge a goal. On the Pi the
+    # planner missed that, ComputePathToPose failed, and the delivery goal was aborted
+    # 30 ms after capture (collector run of 2026-10-05 22:11, task 2).
+    bt['default_server_timeout'] = 1000
 
     planner = p.get('planner_server', {}).get('ros__parameters', {})
     _drop_plugins(planner, 'planner_plugins', COLLECTOR_PLANNERS_DROP)

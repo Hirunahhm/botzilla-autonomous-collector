@@ -504,7 +504,19 @@ local_costmap:
       # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
       # margin; not rederived here since only the values below are load-bearing.
       footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      plugins: ["voxel_layer", "fleet_layer", "inflation_layer"]
+      fleet_layer:
+        # Two-robot runs: the other robot's footprint and the cubes already detected, as
+        # lethal cells, from botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ
+        # there). Repainted wholesale on every message, so a moved robot or a collected
+        # cube is gone at the next update. Before inflation_layer so they are inflated
+        # like any obstacle. Nothing publishes the topic in single-robot runs, so it is
+        # inert there. The collector's copy reads /<ns>/fleet/obstacle_grid.
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /fleet/obstacle_grid
+        lethal: True
+        max_age_s: 2.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -567,32 +579,7 @@ local_costmap:
         # translates away, which a global costmap mark never would. Watch for the
         # same "orbit forever in open floor" signature on hardware before ever
         # considering this for global_costmap.
-        observation_sources: scan scan_camera fleet_cubes fleet_robots
-        fleet_robots:
-          # The OTHER robot's footprint, from botzilla_fleet's fleet_manager_node
-          # (two-robot runs only). Neither robot's LiDAR (0.24 m) sees the other's 0.09 m
-          # body reliably; see ROBOT_FOOTPRINT. Marking only, cleared by the LiDAR.
-          topic: /fleet/robot_obstacles
-          data_type: "PointCloud2"
-          marking: True
-          clearing: False
-          min_obstacle_height: 0.0
-          max_obstacle_height: 0.5
-          obstacle_max_range: 100.0     # measured from the cloud's origin (map origin)
-          obstacle_min_range: 0.0
-        fleet_cubes:
-          # Cubes the leader has already detected, from botzilla_fleet's fleet_manager_node
-          # (two-robot runs only; nothing publishes this topic otherwise, so single-robot
-          # runs are unchanged). Marking only; points sit at the LiDAR's height so the
-          # LiDAR's clearing erases a cube once it is collected. See CUBE_OBSTACLE_Z.
-          topic: /fleet/cube_obstacles
-          data_type: "PointCloud2"
-          marking: True
-          clearing: False
-          min_obstacle_height: 0.0
-          max_obstacle_height: 0.5
-          obstacle_max_range: 100.0     # measured from the cloud's origin (map origin)
-          obstacle_min_range: 0.0
+        observation_sources: scan scan_camera
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -667,39 +654,14 @@ global_costmap:
       # only — in the local costmap DWB would start steering around inspected floor.
       # A no-op unless the explorer runs with coverage_cost > 0 (--coverage-cost), and
       # max-combined below inscribed cost, so no threshold anywhere else moves.
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "coverage_layer"]
+      plugins: ["static_layer", "obstacle_layer", "fleet_layer", "inflation_layer", "coverage_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan fleet_cubes fleet_robots
-        fleet_robots:
-          # The OTHER robot's footprint, from botzilla_fleet's fleet_manager_node
-          # (two-robot runs only). Neither robot's LiDAR (0.24 m) sees the other's 0.09 m
-          # body reliably; see ROBOT_FOOTPRINT. Marking only, cleared by the LiDAR.
-          topic: /fleet/robot_obstacles
-          data_type: "PointCloud2"
-          marking: True
-          clearing: False
-          min_obstacle_height: 0.0
-          max_obstacle_height: 0.5
-          obstacle_max_range: 100.0     # measured from the cloud's origin (map origin)
-          obstacle_min_range: 0.0
-        fleet_cubes:
-          # Cubes the leader has already detected, from botzilla_fleet's fleet_manager_node
-          # (two-robot runs only; nothing publishes this topic otherwise, so single-robot
-          # runs are unchanged). Marking only; points sit at the LiDAR's height so the
-          # LiDAR's clearing erases a cube once it is collected. See CUBE_OBSTACLE_Z.
-          topic: /fleet/cube_obstacles
-          data_type: "PointCloud2"
-          marking: True
-          clearing: False
-          min_obstacle_height: 0.0
-          max_obstacle_height: 0.5
-          obstacle_max_range: 100.0     # measured from the cloud's origin (map origin)
-          obstacle_min_range: 0.0
+        observation_sources: scan
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -710,6 +672,18 @@ global_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+      fleet_layer:
+        # Two-robot runs: the other robot's footprint and the cubes already detected, as
+        # lethal cells, from botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ
+        # there). Repainted wholesale on every message, so a moved robot or a collected
+        # cube is gone at the next update. Before inflation_layer so they are inflated
+        # like any obstacle. Nothing publishes the topic in single-robot runs, so it is
+        # inert there. The collector's copy reads /<ns>/fleet/obstacle_grid.
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /fleet/obstacle_grid
+        lethal: True
+        max_age_s: 2.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
