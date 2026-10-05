@@ -4,6 +4,8 @@
 #include <cmath>
 
 #include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/layered_costmap.hpp"
+#include "tf2/exceptions.h"
 #include "pluginlib/class_list_macros.hpp"
 
 namespace botzilla_coverage_layer
@@ -77,6 +79,35 @@ CoverageCostLayer::Extent CoverageCostLayer::extentOf(const nav_msgs::msg::Occup
   return e;
 }
 
+bool CoverageCostLayer::gridToCostmap(const std::string & grid_frame, Rigid2D & out)
+{
+  // The grid may be in another frame than this costmap: botzilla_fleet's obstacle grids
+  // are in 'map', while a local costmap works in 'odom'. Applying map coordinates as if
+  // they were odom ones drew the other robot shifted by the whole map->odom correction
+  // (seen 2026-10-06 in the collector's local costmap). The global costmap is in 'map'
+  // itself, so it was right and the coverage grid never showed this.
+  const std::string costmap_frame = layered_costmap_->getGlobalFrameID();
+  if (grid_frame.empty() || grid_frame == costmap_frame) {
+    out = Rigid2D();
+    return true;
+  }
+  try {
+    const auto t = tf_->lookupTransform(costmap_frame, grid_frame, tf2::TimePointZero);
+    const auto & q = t.transform.rotation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    out.x = t.transform.translation.x;
+    out.y = t.transform.translation.y;
+    out.c = std::cos(yaw);
+    out.s = std::sin(yaw);
+    return true;
+  } catch (const tf2::TransformException & e) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 5000, "CoverageCostLayer '%s': no transform %s -> %s yet: %s",
+      name_.c_str(), grid_frame.c_str(), costmap_frame.c_str(), e.what());
+    return false;
+  }
+}
+
 void CoverageCostLayer::coverageCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -103,6 +134,7 @@ void CoverageCostLayer::coverageCallback(nav_msgs::msg::OccupancyGrid::ConstShar
     }
   }
   grid_ = msg;
+  dirty_frame_ = msg->header.frame_id;
   received_ = clock_->now();
 }
 
@@ -129,14 +161,44 @@ void CoverageCostLayer::updateBounds(
   if (!dirty_.valid) {
     return;
   }
+  // dirty_ is in the grid's frame: take its corners into this costmap's frame.
+  Rigid2D g2c;
+  if (!gridToCostmap(dirty_frame_, g2c)) {
+    return;   // keep dirty_ for the next cycle
+  }
+  Extent window;
+  for (double gx : {dirty_.min_x, dirty_.max_x}) {
+    for (double gy : {dirty_.min_y, dirty_.max_y}) {
+      const double wx = g2c.x + g2c.c * gx - g2c.s * gy;
+      const double wy = g2c.y + g2c.s * gx + g2c.c * gy;
+      if (!window.valid) {
+        window = Extent{wx, wy, wx, wy, true};
+      } else {
+        window.min_x = std::min(window.min_x, wx);
+        window.min_y = std::min(window.min_y, wy);
+        window.max_x = std::max(window.max_x, wx);
+        window.max_y = std::max(window.max_y, wy);
+      }
+    }
+  }
+  // Also repaint where the previous grid was drawn in THIS frame: if map->odom moved
+  // since, the new window alone could leave a sliver of the old drawing behind.
+  const Extent drawn = window;
+  if (last_window_.valid) {
+    window.min_x = std::min(window.min_x, last_window_.min_x);
+    window.min_y = std::min(window.min_y, last_window_.min_y);
+    window.max_x = std::max(window.max_x, last_window_.max_x);
+    window.max_y = std::max(window.max_y, last_window_.max_y);
+  }
+  last_window_ = drawn;
   // Grow the update window over the whole coverage grid when it changes. Everything
   // inside the window is reset and repainted by every layer, so this is also what
   // removes a penalty the new grid no longer carries. Between messages this layer
   // adds nothing and just repaints whatever window the other layers asked for.
-  *min_x = std::min(*min_x, dirty_.min_x);
-  *min_y = std::min(*min_y, dirty_.min_y);
-  *max_x = std::max(*max_x, dirty_.max_x);
-  *max_y = std::max(*max_y, dirty_.max_y);
+  *min_x = std::min(*min_x, window.min_x);
+  *min_y = std::min(*min_y, window.min_y);
+  *max_x = std::max(*max_x, window.max_x);
+  *max_y = std::max(*max_y, window.max_y);
   dirty_.valid = false;
 }
 
@@ -161,6 +223,16 @@ void CoverageCostLayer::updateCosts(
   const double oy = grid->info.origin.position.y;
   const int gw = static_cast<int>(grid->info.width);
   const int gh = static_cast<int>(grid->info.height);
+  Rigid2D g2c;
+  if (!gridToCostmap(grid->header.frame_id, g2c)) {
+    return;
+  }
+  // Costmap world (wx, wy) -> grid frame: the inverse of g2c.
+  auto toGrid = [&g2c](double wx, double wy, double & gx_m, double & gy_m) {
+      const double dx = wx - g2c.x, dy = wy - g2c.y;
+      gx_m = g2c.c * dx + g2c.s * dy;
+      gy_m = -g2c.s * dx + g2c.c * dy;
+    };
   // Published 0..100 -> internal 0..252. Capped one below INSCRIBED so this layer
   // can never, by itself, make a cell a collision.
   constexpr int kMaxInternal = nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE - 1;
@@ -168,10 +240,11 @@ void CoverageCostLayer::updateCosts(
   if (lethal_) {
     for (int j = min_j; j < max_j; ++j) {
       for (int i = min_i; i < max_i; ++i) {
-        double wx, wy;
+        double wx, wy, px, py;
         master_grid.mapToWorld(i, j, wx, wy);
-        const int gx = static_cast<int>(std::floor((wx - ox) / res));
-        const int gy = static_cast<int>(std::floor((wy - oy) / res));
+        toGrid(wx, wy, px, py);
+        const int gx = static_cast<int>(std::floor((px - ox) / res));
+        const int gy = static_cast<int>(std::floor((py - oy) / res));
         if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
           continue;
         }
@@ -191,10 +264,11 @@ void CoverageCostLayer::updateCosts(
       {
         continue;
       }
-      double wx, wy;
+      double wx, wy, px, py;
       master_grid.mapToWorld(i, j, wx, wy);
-      const int gx = static_cast<int>(std::floor((wx - ox) / res));
-      const int gy = static_cast<int>(std::floor((wy - oy) / res));
+      toGrid(wx, wy, px, py);
+      const int gx = static_cast<int>(std::floor((px - ox) / res));
+      const int gy = static_cast<int>(std::floor((py - oy) / res));
       if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
         continue;
       }

@@ -46,3 +46,13 @@ def test_fallback_on_line():
     x, y, yaw = fallback_standoff((3.0, 0.0), (0.0, 0.0))
     assert abs(x - 2.25) < 1e-9 and abs(y) < 1e-9 and abs(yaw) < 1e-9
     assert fallback_standoff((0.5, 0.0), (0.0, 0.0))[:2] == (0.0, 0.0)
+
+
+def test_blocked_callback_moves_the_standoff():
+    data, info = room()
+    free = choose_standoff(data, info, (2.0, 2.0), (0.5, 2.0))
+    # Pretend the other robot stands on the preferred spot.
+    moved = choose_standoff(data, info, (2.0, 2.0), (0.5, 2.0),
+                            blocked=lambda x, y: math.hypot(x - free[0], y - free[1]) < 0.3)
+    assert moved is not None
+    assert math.hypot(moved[0] - free[0], moved[1] - free[1]) >= 0.3

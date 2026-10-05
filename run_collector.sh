@@ -163,14 +163,19 @@ export BOTZILLA_YOLO_MODEL="$REPO_ROOT/runs/best-fit/best.pt"
 export YOLO_CONFIG_DIR="${YOLO_CONFIG_DIR:-$HOME/.cache/ultralytics}"
 unset ROS_LOCALHOST_ONLY ROS_AUTOMATIC_DISCOVERY_RANGE
 
-step "waiting for the leader's /map (run ./run_full_mission.sh --fleet on the leader)"
+# Waits for the fleet manager's map for this robot, not the leader's /map: the collector
+# localises and plans on /$NS/fleet/map (the leader's map with its own floor cleared).
+# Started before the fleet manager exists, its AMCL has no map, the planner's costmap
+# waits forever for map->base_link and Nav2 aborts (2026-10-06 00:26). The fleet manager
+# starts last on the leader, after HOME is latched, so this also waits for that.
+step "waiting for /$NS/fleet/map from the leader's fleet manager (./run_full_mission.sh --fleet)"
 for i in $(seq 1 60); do
     if ( source_ros; export ROS_SUPER_CLIENT=True
-         timeout 15 ros2 topic list --no-daemon --spin-time 5 2>/dev/null ) | grep -qx /map; then
-        printf '\r%72s\r' ''; ok "leader graph reachable, /map is published"; break
+         timeout 15 ros2 topic list --no-daemon --spin-time 5 2>/dev/null ) | grep -qx "/$NS/fleet/map"; then
+        printf '\r%72s\r' ''; ok "leader graph reachable, /$NS/fleet/map is published"; break
     fi
-    [ "$i" = 60 ] && die "no /map from the leader after ~10 min of tries"
-    printf '\r  no /map yet (try %d)... ' "$i"
+    [ "$i" = 60 ] && die "no /$NS/fleet/map from the leader after ~10 min of tries"
+    printf '\r  no /%s/fleet/map yet (try %d)... ' "$NS" "$i"
     sleep 5
 done
 

@@ -63,11 +63,14 @@ def _line_open(data, grid_info, x0, y0, x1, y1, stop_short_m):
 
 def choose_standoff(data, grid_info, cube_xy, robot_xy,
                     distances=STANDOFF_DISTANCES_M, clearance_m=CLEARANCE_M,
-                    n_angles=N_ANGLES):
+                    n_angles=N_ANGLES, blocked=None):
     """Return (x, y, yaw) facing the cube, or None if no candidate is clear.
 
     data: 2-D int array (rows = y) of occupancy values, as in nav_msgs/OccupancyGrid.
     grid_info: (origin_x, origin_y, resolution, width, height).
+    blocked: optional (x, y) -> bool for what the static map cannot know — the
+    collector passes its live costmap, which holds the other robot (on 2026-10-06 the
+    chosen standoff was inside the parked leader and Nav2 refused it twice).
     """
     cx, cy = cube_xy
     rx, ry = robot_xy
@@ -77,6 +80,8 @@ def choose_standoff(data, grid_info, cube_xy, robot_xy,
             a = 2 * math.pi * k / n_angles
             x, y = cx + dist * math.cos(a), cy + dist * math.sin(a)
             if not _clear(data, grid_info, x, y, clearance_m):
+                continue
+            if blocked is not None and blocked(x, y):
                 continue
             # The cube's own cell may be marked occupied; stop the check short of it.
             if not _line_open(data, grid_info, x, y, cx, cy, stop_short_m=0.15):

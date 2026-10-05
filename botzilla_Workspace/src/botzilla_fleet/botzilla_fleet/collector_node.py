@@ -68,6 +68,8 @@ STATUS_PERIOD_S = 0.25
 # cube, and the collector goes back to waiting for Nav2. In run_logs/20261005-184223
 # Nav2 never came up and four real cubes were each "failed" twice in 0.1 s.
 QUICK_FAIL_S = 2.0
+# Published costmap scale: 99 = inscribed, 100 = lethal. Nav2 refuses goals there.
+COSTMAP_GOAL_BLOCKED = 99
 NAV_READY_POLL_S = 1.0
 
 
@@ -112,6 +114,12 @@ class CollectorNode(ExecutorNode):
         # HOME cleared (see fleet_manager_node COLLECTOR_MAP_CLEAR_M); the same map the
         # costmaps and AMCL use.
         self.create_subscription(OccupancyGrid, 'fleet/map', self._map_cb, latched)
+        # This robot's live global costmap: the leader, cubes, inflation and its own
+        # LiDAR, which the static map does not have — used to reject standoff poses
+        # Nav2 would refuse (see _costmap_blocked).
+        self._costmap = None
+        self.create_subscription(
+            OccupancyGrid, 'global_costmap/costmap', self._costmap_cb, latched)
         self.create_subscription(CubeTask, 'fleet/task', self._task_cb, latched)
         self._fleet_status_pub = self.create_publisher(CollectorStatus, 'fleet/status', 10)
         self.create_timer(STATUS_PERIOD_S, self._publish_fleet_status)
@@ -123,6 +131,22 @@ class CollectorNode(ExecutorNode):
     # ------------------------------------------------------------------ #
     # Inputs
     # ------------------------------------------------------------------ #
+
+    def _costmap_cb(self, msg):
+        info = msg.info
+        data = np.asarray(msg.data, dtype=np.int16).reshape(info.height, info.width)
+        self._costmap = (data, info.origin.position.x, info.origin.position.y,
+                         info.resolution)
+
+    def _costmap_blocked(self, x, y):
+        """Return True if Nav2 would refuse a goal at (x, y) (inscribed or lethal)."""
+        if self._costmap is None:
+            return False
+        data, ox, oy, res = self._costmap
+        i, j = int((x - ox) / res), int((y - oy) / res)
+        if not (0 <= j < data.shape[0] and 0 <= i < data.shape[1]):
+            return False
+        return data[j, i] >= COSTMAP_GOAL_BLOCKED
 
     def _map_cb(self, msg):
         info = msg.info
@@ -263,7 +287,8 @@ class CollectorNode(ExecutorNode):
         self._task_delivered_before = self._cubes_delivered
         standoff = None
         if self._map is not None:
-            standoff = choose_standoff(self._map[0], self._map[1], (cx, cy), pose[:2])
+            standoff = choose_standoff(self._map[0], self._map[1], (cx, cy), pose[:2],
+                                       blocked=self._costmap_blocked)
         how = 'clear standoff from the leader map'
         if standoff is None:
             standoff = fallback_standoff((cx, cy), pose[:2])

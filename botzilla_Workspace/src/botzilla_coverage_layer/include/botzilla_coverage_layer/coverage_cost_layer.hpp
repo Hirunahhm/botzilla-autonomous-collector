@@ -64,6 +64,14 @@ private:
     bool valid{false};
   };
   static Extent extentOf(const nav_msgs::msg::OccupancyGrid & grid);
+  // Grid frame -> costmap frame, as a 2-D rigid transform (rotation c, s; translation).
+  struct Rigid2D
+  {
+    double x{0.0}, y{0.0}, c{1.0}, s{0.0};
+  };
+  bool gridToCostmap(const std::string & grid_frame, Rigid2D & out);
+  std::string dirty_frame_;
+  Extent last_window_;   // costmap-frame window of the last repaint
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_;
   std::mutex mutex_;

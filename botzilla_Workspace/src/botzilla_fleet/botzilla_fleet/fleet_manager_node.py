@@ -70,10 +70,13 @@ ROBOT_FRAME = 'base_link'
 OBSTACLE_GRID_HZ = 5.0
 OBSTACLE_GRID_RES = 0.05
 OBSTACLE_SAMPLE_M = 0.025          # half a cell, so a rotated footprint has no holes
-CUBE_OBSTACLE_HALF_M = 0.075       # a ~0.15 m square per cube
-# Footprint from nav2_params.yaml (both robots share the URDF), plus this margin.
+# Marks are the bodies themselves, no margin: every costmap inflates lethal cells by
+# 0.45 m anyway, and with a margin on top the robots showed as oversized blocks that
+# took up corridors (2026-10-06).
+CUBE_OBSTACLE_HALF_M = 0.05        # a 0.10 m square per cube
+# Footprint from nav2_params.yaml (both robots share the URDF): base and grabber arms.
 ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
-ROBOT_OBSTACLE_MARGIN_M = 0.05
+ROBOT_OBSTACLE_MARGIN_M = 0.0
 # A pose older than this is not drawn: a stale footprint would block empty floor.
 ROBOT_POSE_MAX_AGE_S = 1.5
 
