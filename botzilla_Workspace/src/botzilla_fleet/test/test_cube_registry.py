@@ -96,3 +96,12 @@ def test_relocate_moves_a_released_cube_but_not_a_collected_one():
     r.report(d.id, True, 3.0)
     r.relocate(d.id, 0.0, 0.0)
     assert (d.x, d.y) == (3.0, 3.0)
+
+
+def test_mark_collected_takes_a_failed_cube_out_of_play():
+    r = CubeRegistry(confirm_sightings=1)
+    c = r.observe(1.0, 1.0, 0.0)
+    r.assign(c.id)
+    r.report(c.id, False, 1.0)
+    r.mark_collected(c.id)
+    assert c.status == 'collected' and r.next_task((0, 0), 2.0) is None

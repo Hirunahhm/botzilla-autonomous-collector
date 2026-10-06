@@ -157,6 +157,13 @@ class CubeRegistry:
             cube.x, cube.y = x, y
         return cube
 
+    def mark_collected(self, cube_id):
+        """Count a cube as collected (e.g. released inside the drop zone)."""
+        cube = self.cubes.get(cube_id)
+        if cube is not None:
+            cube.status = 'collected'
+        return cube
+
     def unassign(self, cube_id):
         """Put an assigned cube back without counting a failure (collector went silent)."""
         cube = self.cubes.get(cube_id)

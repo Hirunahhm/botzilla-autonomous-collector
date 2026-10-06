@@ -195,6 +195,11 @@ DELIVERY_RETRIES = 3
 # multi_robot_runs.md released the same two cubes four times in one spot.
 DELIVERY_STUCK_RETRIES = 2
 DELIVERY_STUCK_WAIT_S = 3.0
+# A HOME goal that fails with the robot already this close to HOME is a delivery: the
+# cube is in the drop zone. Nav2 can fail the last few centimetres when HOME itself is
+# crowded (earlier cubes, the other robot); in run 12 of multi_robot_runs.md three cubes
+# were left 0.1-0.2 m from HOME and counted as "released short".
+DELIVERY_CLOSE_ENOUGH_M = 0.5
 
 # Per-spot limit on cubes the robot cannot collect. A spot where a cube has failed
 # SPOT_FAIL_LIMIT times (a chase lost while targeting/approaching, or a cube released
@@ -593,9 +598,18 @@ class ExecutorNode(Node):
             self._nav_goal_handle = None
             took = ((now - self._nav_sent_time).nanoseconds / 1e9
                     if self._nav_sent_time is not None else float('inf'))
+            pose = self._get_robot_pose()
+            near_home = (pose is not None and self._home is not None and math.hypot(
+                pose[0] - self._home[0], pose[1] - self._home[1]) < DELIVERY_CLOSE_ENOUGH_M)
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self._delivery_arrived = True
                 self._transition(State.DETACHING, 'Arrived HOME.')
+            elif near_home:
+                self._delivery_arrived = True
+                self._transition(
+                    State.DETACHING,
+                    f'HOME goal ended with status {status} within '
+                    f'{DELIVERY_CLOSE_ENOUGH_M} m of HOME; delivering here.')
             elif took < DELIVERY_QUICK_FAIL_S and self._delivery_attempts < DELIVERY_RETRIES:
                 self.get_logger().warn(
                     f'HOME goal failed after {took:.2f}s (status {status}) — Nav2 never '

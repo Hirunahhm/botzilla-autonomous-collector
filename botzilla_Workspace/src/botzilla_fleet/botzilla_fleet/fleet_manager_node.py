@@ -102,6 +102,16 @@ COLLECTOR_SHAPE = ((-0.17, 0.31), (-0.165, 0.165))   # (x min/max, y min/max), b
 # it on a pink cube it was in reality only next to) and it stayed stuck for 4 minutes.
 # The mark stays in the other robot's grid, and comes back in this one once it moves off.
 LEADER_NAV_FOOTPRINT = 0.22
+# The collector's drop zone is kept out of the LEADER's way: a lethal disc of this radius
+# (the collector's footprint reaches 0.35 m from base_link) around the collector's HOME,
+# with a soft halo, in the leader's grid only. In run 12 of multi_robot_runs.md the
+# leader spent the whole second half within 0.2-0.35 m of that HOME, among the cubes
+# already dropped there: the collector's deliveries then failed in the last few
+# centimetres, and the leader itself was hemmed in (~220 footprint hits a minute). The
+# leader starts 0.64 m from it, outside. If ever caught inside, its own footprint is
+# still cleared (LEADER_NAV_FOOTPRINT) so it can drive out.
+DROP_ZONE_RADIUS_M = 0.45
+DROP_ZONE_HALO_M = 0.3
 COLLECTOR_NAV_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))
 ROBOT_HALO_RADIUS_M = 0.5
 ROBOT_HALO_VALUE = 45
@@ -273,13 +283,24 @@ class FleetManagerNode(Node):
             cube = self._registry.report(cube_id, collected, self._now_s(),
                                          msg.last_detail)
             if not collected and msg.last_released:
-                # The cube is no longer where it was estimated: the collector carried it
-                # and left it here. Without this the registry kept the old estimate, the
-                # obstacle mark stayed on empty floor and the next attempt went to the
-                # wrong spot (multi_robot_runs.md, run 10).
-                self._registry.relocate(cube_id, msg.release_x, msg.release_y)
-                self._event('relocated', id=cube_id, x=round(msg.release_x, 2),
-                            y=round(msg.release_y, 2))
+                in_home_zone = msg.home_set and math.hypot(
+                    msg.release_x - msg.home_x, msg.release_y - msg.home_y) < self._home_excl
+                if in_home_zone:
+                    # Left in the drop zone: that is a delivery, whatever the collector
+                    # called it. Relocating it there made it an obstacle ON HOME, which
+                    # blocked the next deliveries, and kept it pending, so the collector
+                    # was sent to look for cubes at its own drop zone (run 12).
+                    self._registry.mark_collected(cube_id)
+                    self._event('collected_in_home_zone', id=cube_id,
+                                x=round(msg.release_x, 2), y=round(msg.release_y, 2))
+                else:
+                    # The cube is no longer where it was estimated: the collector carried
+                    # it and left it here. Without this the registry kept the old
+                    # estimate, the obstacle mark stayed on empty floor and the next
+                    # attempt went to the wrong spot (multi_robot_runs.md, run 10).
+                    self._registry.relocate(cube_id, msg.release_x, msg.release_y)
+                    self._event('relocated', id=cube_id, x=round(msg.release_x, 2),
+                                y=round(msg.release_y, 2))
             self._event('result', id=cube_id, task=task_id,
                         result='collected' if collected else 'failed',
                         detail=msg.last_detail, delivered=msg.delivered,
@@ -352,9 +373,13 @@ class FleetManagerNode(Node):
                     if pose is not None else [])
         # Empty grids are published too: the layer then repaints, and so clears, wherever
         # the previous grid was.
+        drop_zone = []
+        if s is not None and s.home_set:
+            drop_zone = [((s.home_x, s.home_y, 0.0), DROP_ZONE_RADIUS_M,
+                          DROP_ZONE_HALO_M, ROBOT_HALO_VALUE)]
         res = OBSTACLE_GRID_RES
         self._leader_grid_pub.publish(self._to_msg(clear_shape(
-            shapes_grid(robot(collector, COLLECTOR_SHAPE) + cubes, res),
+            shapes_grid(robot(collector, COLLECTOR_SHAPE) + cubes + drop_zone, res),
             res, leader, LEADER_NAV_FOOTPRINT)))
         self._collector_grid_pub.publish(self._to_msg(clear_shape(
             shapes_grid(robot(leader, LEADER_SHAPE) + cubes_but_target, res),
