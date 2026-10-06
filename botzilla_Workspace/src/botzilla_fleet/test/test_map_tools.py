@@ -36,15 +36,26 @@ def test_no_points_is_none():
     assert points_to_grid([], 0.05) is None
 
 
-def test_halo_grid_core_and_halo():
-    from botzilla_fleet.map_tools import halo_grid
-    data, ox, oy, w, h = halo_grid([(1.0, 1.0)], 0.05, 0.05, 0.35, 40)
+def test_shapes_grid_exact_footprint_and_halo():
+    import math
+    from botzilla_fleet.map_tools import shapes_grid
+    fp = ((-0.22, 0.36), (-0.215, 0.215))
+    data, ox, oy, w, h = shapes_grid([((1.0, 1.0, 0.0), fp, 0.5, 45)], 0.05)
 
     def at(x, y):
         i, j = int((x - ox) / 0.05), int((y - oy) / 0.05)
         return data[j, i] if 0 <= i < w and 0 <= j < h else 0
-    assert at(1.0, 1.0) == 100 and at(1.04, 0.96) == 100      # core
-    assert 30 <= at(1.12, 1.0) <= 40                          # strong next to the core
-    assert 10 <= at(1.3, 1.0) < at(1.12, 1.0)                 # fading
-    assert at(1.45, 1.0) == 0                                 # outside the halo
-    assert halo_grid([], 0.05, 0.05, 0.2, 30) is None
+    # Lethal cells are exactly the footprint: count matches its area within one cell row.
+    lethal = (data == 100).sum() * 0.05 * 0.05
+    assert abs(lethal - 0.58 * 0.43) < 0.06
+    assert at(1.0, 1.0) == 100 and at(1.33, 1.19) == 100       # inside, near a corner
+    assert at(1.0, 1.24) < 100 and at(1.0, 1.24) > 30          # just outside: strong halo
+    assert at(1.0, 1.75) == 0                                   # beyond the 0.5 m halo
+    # Rotation: 90 deg turns the long axis to y.
+    data2, ox2, oy2, w2, h2 = shapes_grid([((0.0, 0.0, math.pi / 2), fp, 0.0, 0)], 0.05)
+    assert (data2 == 100).any(axis=1).sum() > (data2 == 100).any(axis=0).sum()
+
+
+def test_shapes_grid_empty():
+    from botzilla_fleet.map_tools import shapes_grid
+    assert shapes_grid([], 0.05) is None

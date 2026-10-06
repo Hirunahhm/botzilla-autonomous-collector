@@ -66,7 +66,9 @@ def test_fleet_layer_reads_the_collectors_own_grid():
     for costmap in ('local_costmap', 'global_costmap'):
         params = p[costmap][costmap]['ros__parameters']
         assert 'fleet_layer' in params['plugins']
-        assert params['plugins'].index('fleet_layer') < params['plugins'].index('inflation_layer')
+        # After inflation: the other robot and the cubes are not inflated (see
+        # fleet_manager_node OBSTACLE_GRID_HZ for the deadlock that caused).
+        assert params['plugins'].index('fleet_layer') > params['plugins'].index('inflation_layer')
         assert params['fleet_layer']['topic'] == '/bz2/fleet/obstacle_grid'
         assert params['fleet_layer']['lethal'] is True
 

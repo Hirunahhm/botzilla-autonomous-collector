@@ -504,28 +504,7 @@ local_costmap:
       # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
       # margin; not rederived here since only the values below are load-bearing.
       footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
-      plugins: ["voxel_layer", "fleet_layer", "inflation_layer", "cube_layer"]
-      fleet_layer:
-        # Two-robot runs: the other robot's footprint, as lethal cells, from
-        # botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ there). Repainted wholesale on every message, so a moved robot or a collected
-        # cube is gone at the next update. Before inflation_layer so they are inflated
-        # like any obstacle. Nothing publishes the topic in single-robot runs, so it is
-        # inert there. The collector's copy reads /<ns>/fleet/obstacle_grid.
-        plugin: "botzilla_coverage_layer::CoverageCostLayer"
-        enabled: True
-        topic: /fleet/obstacle_grid
-        lethal: True
-        max_age_s: 2.0
-      cube_layer:
-        # Two-robot runs: cubes already detected (fleet_manager_node, see
-        # CUBE_HALO_RADIUS_M). AFTER inflation_layer on purpose: the cube is lethal, so no
-        # footprint passes over it, but it gets a fading 0.35 m soft halo instead of the 0.45 m
-        # inflated disc that blocked corridors. Inert in single-robot runs.
-        plugin: "botzilla_coverage_layer::CoverageCostLayer"
-        enabled: True
-        topic: /fleet/cube_grid
-        lethal: True
-        max_age_s: 2.0
+      plugins: ["voxel_layer", "inflation_layer", "fleet_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -539,6 +518,20 @@ local_costmap:
         # barely manoeuvre". This does NOT narrow any passage: only cells within
         # inscribed_radius are lethal-equivalent.
         inflation_radius: 0.45
+      fleet_layer:
+        # Two-robot runs: the other robot and the cubes already detected, from
+        # botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ there): exact shapes
+        # as lethal cells with a fading soft halo. AFTER inflation_layer on purpose — not
+        # inflated. Lethal already stops the footprint check overlapping them; inflating
+        # the other robot by 0.45 m deadlocked both robots once they were side by side,
+        # and inflated cubes blocked corridors (2026-10-06). Repainted wholesale on every
+        # message, so a moved robot or a collected cube is gone at the next update. Inert
+        # in single-robot runs. The collector's copy reads /<ns>/fleet/obstacle_grid.
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /fleet/obstacle_grid
+        lethal: True
+        max_age_s: 2.0
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -663,7 +656,7 @@ global_costmap:
       # only — in the local costmap DWB would start steering around inspected floor.
       # A no-op unless the explorer runs with coverage_cost > 0 (--coverage-cost), and
       # max-combined below inscribed cost, so no threshold anywhere else moves.
-      plugins: ["static_layer", "obstacle_layer", "fleet_layer", "inflation_layer", "cube_layer", "coverage_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "fleet_layer", "coverage_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
@@ -681,27 +674,6 @@ global_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
-      fleet_layer:
-        # Two-robot runs: the other robot's footprint, as lethal cells, from
-        # botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ there). Repainted wholesale on every message, so a moved robot or a collected
-        # cube is gone at the next update. Before inflation_layer so they are inflated
-        # like any obstacle. Nothing publishes the topic in single-robot runs, so it is
-        # inert there. The collector's copy reads /<ns>/fleet/obstacle_grid.
-        plugin: "botzilla_coverage_layer::CoverageCostLayer"
-        enabled: True
-        topic: /fleet/obstacle_grid
-        lethal: True
-        max_age_s: 2.0
-      cube_layer:
-        # Two-robot runs: cubes already detected (fleet_manager_node, see
-        # CUBE_HALO_RADIUS_M). AFTER inflation_layer on purpose: the cube is lethal, so no
-        # footprint passes over it, but it gets a fading 0.35 m soft halo instead of the 0.45 m
-        # inflated disc that blocked corridors. Inert in single-robot runs.
-        plugin: "botzilla_coverage_layer::CoverageCostLayer"
-        enabled: True
-        topic: /fleet/cube_grid
-        lethal: True
-        max_age_s: 2.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -709,6 +681,20 @@ global_costmap:
         # planner and controller costmaps consistent so DWB doesn't reject the
         # global planner's route as infeasible.
         inflation_radius: 0.45
+      fleet_layer:
+        # Two-robot runs: the other robot and the cubes already detected, from
+        # botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ there): exact shapes
+        # as lethal cells with a fading soft halo. AFTER inflation_layer on purpose — not
+        # inflated. Lethal already stops the footprint check overlapping them; inflating
+        # the other robot by 0.45 m deadlocked both robots once they were side by side,
+        # and inflated cubes blocked corridors (2026-10-06). Repainted wholesale on every
+        # message, so a moved robot or a collected cube is gone at the next update. Inert
+        # in single-robot runs. The collector's copy reads /<ns>/fleet/obstacle_grid.
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /fleet/obstacle_grid
+        lethal: True
+        max_age_s: 2.0
       coverage_layer:
         plugin: "botzilla_coverage_layer::CoverageCostLayer"
         enabled: True

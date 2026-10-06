@@ -62,34 +62,39 @@ def points_to_grid(points, resolution):
     return data, ox, oy, w, h
 
 
-def halo_grid(centres, resolution, core_half_m, halo_radius_m, halo_value):
-    """Grid of square lethal cores (100) with a round soft halo around each.
+def shapes_grid(shapes, resolution):
+    """Rasterise rectangles with soft halos: [(pose, rect, halo_radius_m, halo_value), ...].
 
-    The halo fades linearly from halo_value next to the core to a quarter of it at
-    halo_radius_m, so the planner keeps well clear when it can but a narrow pass stays
-    cheap enough to take.
-
-    centres: [(x, y), ...] in the map frame. Returns (data, origin_x, origin_y, width,
-    height) like points_to_grid, or None when there are no centres.
+    pose (x, y, yaw) in the map; rect ((x0, x1), (y0, y1)) in that pose's frame. A cell
+    whose CENTRE lies inside a rectangle is 100 (lethal) — exactly the shape, no rounding
+    outwards. Outside it a halo fades linearly from halo_value at the edge to a quarter
+    of it at halo_radius_m, then stops. Cells keep the highest value of any shape.
+    Returns (data, origin_x, origin_y, width, height) like points_to_grid, or None.
     """
-    if not centres:
+    if not shapes:
         return None
-    pts = np.asarray(centres, dtype=float)
-    reach = max(core_half_m, halo_radius_m)
-    ox = math.floor((pts[:, 0].min() - reach) / resolution) * resolution
-    oy = math.floor((pts[:, 1].min() - reach) / resolution) * resolution
-    w = int(math.ceil((pts[:, 0].max() + reach - ox) / resolution)) + 1
-    h = int(math.ceil((pts[:, 1].max() + reach - oy) / resolution)) + 1
-    xs = ox + (np.arange(w) + 0.5) * resolution          # cell centres
-    ys = oy + (np.arange(h) + 0.5) * resolution
-    gx, gy = np.meshgrid(xs, ys)
+    xs_all, ys_all = [], []
+    for (x, y, _), ((x0, x1), (y0, y1)), radius, _v in shapes:
+        reach = max(abs(x0), abs(x1), abs(y0), abs(y1)) * math.sqrt(2) + radius
+        xs_all += [x - reach, x + reach]
+        ys_all += [y - reach, y + reach]
+    ox = math.floor(min(xs_all) / resolution) * resolution
+    oy = math.floor(min(ys_all) / resolution) * resolution
+    w = int(math.ceil((max(xs_all) - ox) / resolution)) + 1
+    h = int(math.ceil((max(ys_all) - oy) / resolution)) + 1
+    gx, gy = np.meshgrid(ox + (np.arange(w) + 0.5) * resolution,
+                         oy + (np.arange(h) + 0.5) * resolution)
     data = np.zeros((h, w), dtype=np.int8)
-    for cx, cy in pts:
-        dx, dy = np.abs(gx - cx), np.abs(gy - cy)
-        d = np.sqrt(dx * dx + dy * dy)
-        frac = np.clip((d - core_half_m) / max(halo_radius_m - core_half_m, 1e-9), 0.0, 1.0)
-        halo = np.round(halo_value * (1.0 - 0.75 * frac)).astype(np.int8)
-        inside = d <= halo_radius_m
-        data[inside] = np.maximum(data[inside], halo[inside])
-        data[(dx <= core_half_m) & (dy <= core_half_m)] = 100
+    for (x, y, yaw), ((x0, x1), (y0, y1)), radius, value in shapes:
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        u = c * (gx - x) + s_ * (gy - y)            # cell centres in the shape's frame
+        v = -s_ * (gx - x) + c * (gy - y)
+        du = np.maximum(np.maximum(x0 - u, u - x1), 0.0)
+        dv = np.maximum(np.maximum(y0 - v, v - y1), 0.0)
+        d = np.hypot(du, dv)                        # 0 inside, distance to the edge outside
+        if radius > 0:
+            halo = np.round(value * (1.0 - 0.75 * np.clip(d / radius, 0.0, 1.0))).astype(np.int8)
+            near = (d > 0) & (d <= radius)
+            data[near] = np.maximum(data[near], halo[near])
+        data[d == 0] = 100
     return data, ox, oy, w, h

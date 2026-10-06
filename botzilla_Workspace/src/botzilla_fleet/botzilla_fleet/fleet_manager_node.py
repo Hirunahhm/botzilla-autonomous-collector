@@ -25,7 +25,7 @@ import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
 from botzilla_fleet.map_tools import (
-    clear_discs, halo_grid, place, points_to_grid, rect_points,
+    clear_discs, shapes_grid,
 )
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
@@ -52,13 +52,13 @@ SUMMARY_PERIOD_S = 30.0
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
 
-# Obstacles for each robot's costmaps, as a small OccupancyGrid per robot drawn by the
-# 'fleet_layer' (botzilla_coverage_layer in lethal mode, nav2_params.yaml), which repaints
-# its whole previous extent on every message — so a robot that moved, or a cube that was
-# collected, is gone from the costmap at the next update:
-#   /fleet/obstacle_grid        for the leader:    the collector's footprint + known cubes
-#   /<ns>/fleet/obstacle_grid   for the collector: the leader's footprint + known cubes
-#                               other than the one it is collecting
+# Obstacles for each robot's costmaps, as one small OccupancyGrid per robot drawn by the
+# 'fleet_layer' (botzilla_coverage_layer in lethal mode, nav2_params.yaml, placed AFTER
+# the inflation layer). It repaints its whole previous extent on every message, so a
+# robot that moved, or a cube that was collected, is gone at the next update:
+#   /fleet/obstacle_grid        for the leader:    the collector + known cubes
+#   /<ns>/fleet/obstacle_grid   for the collector: the leader + known cubes other than
+#                               the one it is collecting
 # Why each is needed:
 # - cubes: the leader drove into cubes it had detected. The RPLIDAR scans at 0.24 m (URDF
 #   laser_joint), above a cube, the depth camera's low scan only sees from 0.55 m out, and
@@ -66,29 +66,29 @@ ROBOT_FRAME = 'base_link'
 # - robots: neither LiDAR sees the other robot's 0.09 m Kobuki body; at 0.24 m there is
 #   only a slim LiDAR housing and camera mount, so returns come and go as they close in —
 #   the leader drove into the collector on 2026-10-05.
-# These used to be PointCloud2 marking sources in the obstacle layers. Their marks
-# stayed until a LiDAR ray happened to cross each old cell, so a moving robot left a
-# trail of stale obstacles (seen 2026-10-05) that also blocked routes.
+# Each shape is drawn exactly (a cell is lethal when its centre lies inside the shape, no
+# margin) with a soft halo around it, and NOT inflated: lethal is enough to stop either
+# robot's footprint (DWB) from ever overlapping it, and the halo makes the planners keep
+# their distance when there is room. Inflating the other robot's footprint by 0.45 m
+# deadlocked both robots on 2026-10-06: once they were 0.36 m apart each stood inside the
+# other's inflated zone, so neither could plan out (16 failed plans, 29 back-ups, 32
+# spins on the leader; every delivery released short). Inflated cubes likewise turned a
+# cube in a corridor into a wall.
 OBSTACLE_GRID_HZ = 5.0
 OBSTACLE_GRID_RES = 0.05
-OBSTACLE_SAMPLE_M = 0.025          # half a cell, so a rotated footprint has no holes
-# Marks are the bodies themselves, no margin: every costmap inflates lethal cells by
-# 0.45 m anyway, and with a margin on top the robots showed as oversized blocks that
-# took up corridors (2026-10-06).
 CUBE_OBSTACLE_HALF_M = 0.05        # a 0.10 m square per cube
-# Cubes are published on their own grid, drawn by 'cube_layer' AFTER the inflation layer:
-# lethal, so no footprint can pass over one, but without the 0.45 m inflated disc that
-# made a cube in a corridor a wall the leader could not get past (2026-10-06). Instead a
-# soft halo makes the planner keep a little clear while still allowing a close pass.
-# 0.35 m: the planner plans the robot's centre line and the robot is ~0.22 m wide each
-# side, so a shorter halo let it plan a centre line the footprint could not follow.
+# Halos fade linearly from the value at the shape's edge to a quarter of it at the radius
+# (halo 45 -> costmap cost ~113). Never lethal or inscribed: a narrow pass stays possible.
+# Cube: 0.35 m, enough that the planner's centre line keeps the ~0.22 m half-width of the
+# robot off it when there is room.
 CUBE_HALO_RADIUS_M = 0.35
-# 40 -> cost ~100 next to the cube, fading to ~25; never lethal or inscribed, so a
-# narrow gap stays passable.
 CUBE_HALO_VALUE = 40
-# Footprint from nav2_params.yaml (both robots share the URDF): base and grabber arms.
+# Robot: footprint from nav2_params.yaml (both robots share the URDF): base and grabber
+# arms, 0.58 x 0.43 m. 0.5 m halo: the robots give each other room without ever being
+# trapped by it.
 ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
-ROBOT_OBSTACLE_MARGIN_M = 0.0
+ROBOT_HALO_RADIUS_M = 0.5
+ROBOT_HALO_VALUE = 45
 # A pose older than this is not drawn: a stale footprint would block empty floor.
 ROBOT_POSE_MAX_AGE_S = 1.5
 
@@ -153,16 +153,10 @@ class FleetManagerNode(Node):
             OccupancyGrid, '/fleet/obstacle_grid', latched)                 # for the leader
         self._collector_grid_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/obstacle_grid', latched)     # for the collector
-        self._leader_cube_pub = self.create_publisher(
-            OccupancyGrid, '/fleet/cube_grid', latched)
-        self._collector_cube_pub = self.create_publisher(
-            OccupancyGrid, f'/{self._ns}/fleet/cube_grid', latched)
+
         self._collector_map_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/map', latched)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
-        m = ROBOT_OBSTACLE_MARGIN_M
-        (x0, x1), (y0, y1) = ROBOT_FOOTPRINT
-        self._footprint_pts = rect_points((x0 - m, x1 + m), (y0 - m, y1 + m), OBSTACLE_SAMPLE_M)
         self.create_timer(1.0 / OBSTACLE_GRID_HZ, self._publish_obstacles)
         self.create_subscription(Point, '/detected_cube', self._cube_cb, 10)
         self.create_subscription(
@@ -303,41 +297,34 @@ class FleetManagerNode(Node):
         )
 
     def _publish_obstacles(self):
-        """Publish each robot's robot grid and cube grid (see OBSTACLE_GRID_HZ)."""
+        """Publish each robot's obstacle grid (see OBSTACLE_GRID_HZ)."""
         assigned = self._current[1] if self._current is not None else None
+        h = CUBE_OBSTACLE_HALF_M
         cubes, cubes_but_target = [], []
         for cube in self._registry.cubes.values():
             if cube.status == 'collected' or not self._registry.confirmed(cube):
                 continue
-            cubes.append((cube.x, cube.y))
+            shape = ((cube.x, cube.y, 0.0), ((-h, h), (-h, h)),
+                     CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE)
+            cubes.append(shape)
             if cube.id != assigned:
-                cubes_but_target.append((cube.x, cube.y))
+                cubes_but_target.append(shape)
         s = self._status
         collector = None
         if (s is not None and s.localised and self._status_time is not None
                 and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
             collector = (s.x, s.y, s.yaw)
         leader = self._leader_pose()
-        self._leader_grid_pub.publish(self._grid(
-            [place(self._footprint_pts, collector)] if collector else []))
-        self._collector_grid_pub.publish(self._grid(
-            [place(self._footprint_pts, leader)] if leader else []))
-        self._leader_cube_pub.publish(self._cube_grid(cubes))
-        self._collector_cube_pub.publish(self._cube_grid(cubes_but_target))
 
-    def _cube_grid(self, centres):
-        """Cubes as lethal cores with a soft halo (see CUBE_HALO_RADIUS_M)."""
-        return self._to_msg(halo_grid(centres, OBSTACLE_GRID_RES, CUBE_OBSTACLE_HALF_M,
-                                      CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE))
-
-    def _grid(self, chunks):
-        """Build an OccupancyGrid of the given point arrays (empty when there are none).
-
-        Empty grids are published too: the layer then repaints, and so clears, wherever
-        the previous grid was.
-        """
-        return self._to_msg(
-            points_to_grid(np.concatenate(chunks) if chunks else None, OBSTACLE_GRID_RES))
+        def robot(pose):
+            return ([(pose, ROBOT_FOOTPRINT, ROBOT_HALO_RADIUS_M, ROBOT_HALO_VALUE)]
+                    if pose is not None else [])
+        # Empty grids are published too: the layer then repaints, and so clears, wherever
+        # the previous grid was.
+        self._leader_grid_pub.publish(
+            self._to_msg(shapes_grid(robot(collector) + cubes, OBSTACLE_GRID_RES)))
+        self._collector_grid_pub.publish(
+            self._to_msg(shapes_grid(robot(leader) + cubes_but_target, OBSTACLE_GRID_RES)))
 
     def _to_msg(self, raster):
         """Wrap a (data, ox, oy, w, h) raster, or None, as an OccupancyGrid in the map."""
