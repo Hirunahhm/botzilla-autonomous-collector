@@ -170,14 +170,19 @@ unset ROS_LOCALHOST_ONLY ROS_AUTOMATIC_DISCOVERY_RANGE
 # starts last on the leader, after HOME is latched, so this also waits for that.
 step "waiting for /$NS/fleet/map from the leader's fleet manager (./run_full_mission.sh --fleet)"
 for i in $(seq 1 60); do
-    if ( source_ros; export ROS_SUPER_CLIENT=True
-         timeout 15 ros2 topic list --no-daemon --spin-time 5 2>/dev/null ) \
-            | grep -x "/$NS/fleet/map" > /dev/null; then
-        # Not grep -q: it exits at the first match, ros2 then dies of SIGPIPE while
-        # still printing, and under pipefail the whole test fails although the topic
-        # is there. /<ns>/fleet/map sorts near the top, so this never matched
-        # (2026-10-06); the old /map check only worked because /map sorts late.
-        printf '\r%72s\r' ''; ok "leader graph reachable, /$NS/fleet/map is published"; break
+    # Wait for an actual MESSAGE, not just the topic name. The name also appears when
+    # only a subscriber exists — the laptop's RViz with botzilla_collector.rviz open
+    # subscribes to it — and on 2026-10-06 that let the collector start before the
+    # fleet manager existed: AMCL had no map, missed its lifecycle bond and Nav2
+    # aborted. The map is latched, so one message is there as soon as it is published.
+    if ( source_ros
+         timeout 15 ros2 topic echo --once --qos-durability transient_local \
+             --qos-reliability reliable --field header.frame_id \
+             "/$NS/fleet/map" nav_msgs/msg/OccupancyGrid 2>/dev/null ) \
+            | grep -x "map" > /dev/null; then
+        # Not grep -q: it exits at the first match and, under pipefail, the SIGPIPE
+        # the writer then gets fails the whole test (2026-10-06).
+        printf '\r%72s\r' ''; ok "leader's fleet manager is publishing /$NS/fleet/map"; break
     fi
     [ "$i" = 60 ] && die "no /$NS/fleet/map from the leader after ~10 min of tries"
     printf '\r  no /%s/fleet/map yet (try %d)... ' "$NS" "$i"

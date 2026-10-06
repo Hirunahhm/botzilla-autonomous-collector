@@ -33,6 +33,7 @@ from geometry_msgs.msg import Point
 from nav_msgs.msg import OccupancyGrid
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 import tf2_ros
@@ -424,7 +425,7 @@ def main(args=None):
     node = FleetManagerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
