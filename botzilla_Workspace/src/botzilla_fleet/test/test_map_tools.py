@@ -70,3 +70,20 @@ def test_shapes_grid_circle():
     def at(x, y):
         return data[int((y - oy) / 0.05), int((x - ox) / 0.05)]
     assert at(1.0, 1.0) == 100 and at(1.12, 1.12) < 100       # corner of the box is outside
+
+
+def test_clear_shape_removes_marks_under_the_robot_only():
+    from botzilla_fleet.map_tools import clear_shape, shapes_grid
+    cube = ((1.0, 1.0, 0.0), ((-0.05, 0.05), (-0.05, 0.05)), 0.35, 40)
+    raster = shapes_grid([cube], 0.05)
+    data, ox, oy, w, h = raster
+
+    def at(x, y):
+        return data[int((y - oy) / 0.05), int((x - ox) / 0.05)]
+    assert at(1.0, 1.0) == 100
+    # The robot (0.22 m circle) stands with its centre 0.15 m from the cube estimate:
+    # the estimate is under it, so it must be cleared there...
+    clear_shape(raster, 0.05, (1.15, 1.0, 0.0), 0.22)
+    assert at(1.0, 1.0) == 0 and at(1.2, 1.0) == 0
+    # ...but not beyond the robot's own footprint.
+    assert at(0.75, 1.0) > 0

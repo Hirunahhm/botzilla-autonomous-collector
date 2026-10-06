@@ -25,7 +25,7 @@ import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
 from botzilla_fleet.map_tools import (
-    clear_discs, shapes_grid,
+    clear_discs, clear_shape, shapes_grid,
 )
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
@@ -93,6 +93,15 @@ CUBE_HALO_VALUE = 40
 # 0.5 m halo: the robots give each other room without ever being trapped by it.
 LEADER_SHAPE = 0.17                                  # circle radius, m
 COLLECTOR_SHAPE = ((-0.17, 0.31), (-0.165, 0.165))   # (x min/max, y min/max), base_link
+# Each robot's OWN Nav2 footprint (padded): nav2_params.yaml robot_radius for the leader,
+# params_rewrite.COLLECTOR_FOOTPRINT for the collector. Nothing in a robot's own grid is
+# drawn inside it. A robot cannot be standing on a cube, so a cube mark there is a wrong
+# estimate — and a lethal cell inside a robot's footprint makes Nav2 refuse every move,
+# even moving away. On 2026-10-06 a cube estimate ended up under the leader (RViz showed
+# it on a pink cube it was in reality only next to) and it stayed stuck for 4 minutes.
+# The mark stays in the other robot's grid, and comes back in this one once it moves off.
+LEADER_NAV_FOOTPRINT = 0.22
+COLLECTOR_NAV_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))
 ROBOT_HALO_RADIUS_M = 0.5
 ROBOT_HALO_VALUE = 45
 # A pose older than this is not drawn: a stale footprint would block empty floor.
@@ -327,10 +336,13 @@ class FleetManagerNode(Node):
                     if pose is not None else [])
         # Empty grids are published too: the layer then repaints, and so clears, wherever
         # the previous grid was.
-        self._leader_grid_pub.publish(self._to_msg(shapes_grid(
-            robot(collector, COLLECTOR_SHAPE) + cubes, OBSTACLE_GRID_RES)))
-        self._collector_grid_pub.publish(self._to_msg(shapes_grid(
-            robot(leader, LEADER_SHAPE) + cubes_but_target, OBSTACLE_GRID_RES)))
+        res = OBSTACLE_GRID_RES
+        self._leader_grid_pub.publish(self._to_msg(clear_shape(
+            shapes_grid(robot(collector, COLLECTOR_SHAPE) + cubes, res),
+            res, leader, LEADER_NAV_FOOTPRINT)))
+        self._collector_grid_pub.publish(self._to_msg(clear_shape(
+            shapes_grid(robot(leader, LEADER_SHAPE) + cubes_but_target, res),
+            res, collector, COLLECTOR_NAV_FOOTPRINT)))
 
     def _to_msg(self, raster):
         """Wrap a (data, ox, oy, w, h) raster, or None, as an OccupancyGrid in the map."""

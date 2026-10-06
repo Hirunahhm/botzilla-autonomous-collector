@@ -93,20 +93,40 @@ def shapes_grid(shapes, resolution):
     gx, gy = np.meshgrid(ox + (np.arange(w) + 0.5) * resolution,
                          oy + (np.arange(h) + 0.5) * resolution)
     data = np.zeros((h, w), dtype=np.int8)
-    for (x, y, yaw), shape, radius, value in shapes:
-        if isinstance(shape, (int, float)):
-            d = np.maximum(np.hypot(gx - x, gy - y) - shape, 0.0)
-        else:
-            (x0, x1), (y0, y1) = shape
-            c, s_ = math.cos(yaw), math.sin(yaw)
-            u = c * (gx - x) + s_ * (gy - y)        # cell centres in the shape's frame
-            v = -s_ * (gx - x) + c * (gy - y)
-            du = np.maximum(np.maximum(x0 - u, u - x1), 0.0)
-            dv = np.maximum(np.maximum(y0 - v, v - y1), 0.0)
-            d = np.hypot(du, dv)                    # 0 inside, distance to the edge outside
+    for pose, shape, radius, value in shapes:
+        d = _distance_to_shape(gx, gy, pose, shape)  # 0 inside, distance to the edge outside
         if radius > 0:
             halo = np.round(value * (1.0 - 0.75 * np.clip(d / radius, 0.0, 1.0))).astype(np.int8)
             near = (d > 0) & (d <= radius)
             data[near] = np.maximum(data[near], halo[near])
         data[d == 0] = 100
     return data, ox, oy, w, h
+
+
+def _distance_to_shape(gx, gy, pose, shape):
+    """Distance from each (gx, gy) to a rectangle or circle at pose; 0 inside it."""
+    x, y, yaw = pose
+    if isinstance(shape, (int, float)):
+        return np.maximum(np.hypot(gx - x, gy - y) - shape, 0.0)
+    (x0, x1), (y0, y1) = shape
+    c, s_ = math.cos(yaw), math.sin(yaw)
+    u = c * (gx - x) + s_ * (gy - y)
+    v = -s_ * (gx - x) + c * (gy - y)
+    du = np.maximum(np.maximum(x0 - u, u - x1), 0.0)
+    dv = np.maximum(np.maximum(y0 - v, v - y1), 0.0)
+    return np.hypot(du, dv)
+
+
+def clear_shape(raster, resolution, pose, shape):
+    """Zero every cell of a raster whose centre lies inside shape at pose; in place.
+
+    raster: (data, origin_x, origin_y, width, height) as from shapes_grid, or None.
+    shape: a rectangle ((x0, x1), (y0, y1)) in the pose's frame, or a circle radius.
+    """
+    if raster is None or pose is None:
+        return raster
+    data, ox, oy, w, h = raster
+    gx, gy = np.meshgrid(ox + (np.arange(w) + 0.5) * resolution,
+                         oy + (np.arange(h) + 0.5) * resolution)
+    data[_distance_to_shape(gx, gy, pose, shape) == 0] = 0
+    return raster

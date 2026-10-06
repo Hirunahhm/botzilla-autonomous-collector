@@ -2,7 +2,7 @@
 """fleet_layer_check.py — probe for fleet_layer_check.sh (see there)."""
 import math, time, numpy as np, rclpy, sys
 sys.path.insert(0, __import__('os').path.join(__import__('os').path.dirname(__file__), '..', '..', 'botzilla_Workspace', 'src', 'botzilla_fleet'))
-from botzilla_fleet.map_tools import shapes_grid
+from botzilla_fleet.map_tools import clear_shape, shapes_grid
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from nav_msgs.msg import OccupancyGrid
@@ -18,8 +18,12 @@ TX, TY, TYAW = 0.5, 0.3, 0.3                          # map->odom; base_link = o
 ME = (TX, TY)                                         # this robot's centre, in the map
 OTHER = (ME[0], ME[1] + 0.17 + 0.15 + 0.165, TYAW)    # side by side, 0.15 m gap
 CUBE = (ME[0] + 1.2, ME[1] - 0.8)
+UNDER = (ME[0] + 0.1, ME[1])            # a cube estimate that has drifted under this robot
 def tick():
-    r = shapes_grid([(OTHER, FP, 0.5, 45), ((CUBE[0], CUBE[1], 0.0), ((-0.05, 0.05), (-0.05, 0.05)), 0.35, 40)], 0.05)
+    cube = ((-0.05, 0.05), (-0.05, 0.05))
+    r = shapes_grid([(OTHER, FP, 0.5, 45), ((CUBE[0], CUBE[1], 0.0), cube, 0.35, 40),
+                     ((UNDER[0], UNDER[1], 0.0), cube, 0.35, 40)], 0.05)
+    clear_shape(r, 0.05, (ME[0], ME[1], TYAW), 0.22)   # as fleet_manager_node does
     data, ox, oy, w, h = r; g = OccupancyGrid(); g.header.frame_id = 'map'; g.header.stamp = n.get_clock().now().to_msg()
     g.info.resolution = 0.05; g.info.width, g.info.height = w, h; g.info.origin.position.x, g.info.origin.position.y = ox, oy
     g.info.origin.orientation.w = 1.0; g.data = data.ravel().tolist(); opub.publish(g)
@@ -33,6 +37,10 @@ def cost(x, y):
     return int(g[int((y - m.info.origin.position.y) / m.info.resolution), int((x - m.info.origin.position.x) / m.info.resolution)])
 end = time.time() + 8
 while time.time() < end: rclpy.spin_once(n, timeout_sec=0.05)
-print(f'own centre with the other robot 0.15 m away: cost {cost(*ME)}   (must be < 99 to plan out)')
+print(f'own centre with the other robot 0.15 m away and a cube estimate 0.1 m under it: '
+      f'cost {cost(*ME)}   (must be < 99 to plan out)')
+print('own footprint (0.22 m) lethal cells: '
+      f'{sum(cost(ME[0] + dx, ME[1] + dy) == 100 for dx in (-.2, -.1, 0, .1, .2) for dy in (-.2, -.1, 0, .1, .2) if (dx * dx + dy * dy) ** .5 < .22)}'
+      '   (must be 0)')
 print('cost from own centre towards the other robot: ' + ' '.join(f'{cost(ME[0], ME[1] + d):3d}' for d in (0, .1, .2, .3, .4, .5, .6, .7, .8)))
 print('cube profile 0..0.5 m:                        ' + ' '.join(f'{cost(CUBE[0] + d, CUBE[1]):3d}' for d in (0, .1, .2, .3, .4, .5)))
