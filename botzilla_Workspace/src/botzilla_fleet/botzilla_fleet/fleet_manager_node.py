@@ -29,7 +29,7 @@ from botzilla_fleet.map_tools import (
 )
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 import numpy as np
 import rclpy
@@ -92,7 +92,12 @@ CUBE_HALO_VALUE = 40
 #   chassis and 0.33 m across, base_link at the body centre (nav2_params.yaml's measured
 #   derivation): x -0.17..+0.31, y +-0.165.
 # 0.5 m halo: the robots give each other room without ever being trapped by it.
-LEADER_SHAPE = 0.17                                  # circle radius, m
+# The leader is drawn with LEADER_PADDING_M around its 0.17 m body and a longer halo:
+# the leader has right of way (collector_node YIELD_TRIGGER_M), so the collector's
+# planner should keep well clear of it in the first place.
+LEADER_PADDING_M = 0.10
+LEADER_SHAPE = 0.17 + LEADER_PADDING_M               # circle radius, m
+LEADER_HALO_RADIUS_M = 0.7
 COLLECTOR_SHAPE = ((-0.17, 0.31), (-0.165, 0.165))   # (x min/max, y min/max), base_link
 # Each robot's OWN Nav2 footprint (padded): nav2_params.yaml robot_radius for the leader,
 # params_rewrite.COLLECTOR_FOOTPRINT for the collector. Nothing in a robot's own grid is
@@ -186,6 +191,8 @@ class FleetManagerNode(Node):
         self._collector_grid_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/obstacle_grid', latched)     # for the collector
 
+        self._leader_pose_pub = self.create_publisher(
+            PoseStamped, f'/{self._ns}/fleet/leader_pose', 10)
         self._collector_map_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/map', latched)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
@@ -368,8 +375,8 @@ class FleetManagerNode(Node):
             collector = (s.x, s.y, s.yaw)
         leader = self._leader_pose()
 
-        def robot(pose, shape):
-            return ([(pose, shape, ROBOT_HALO_RADIUS_M, ROBOT_HALO_VALUE)]
+        def robot(pose, shape, halo=ROBOT_HALO_RADIUS_M):
+            return ([(pose, shape, halo, ROBOT_HALO_VALUE)]
                     if pose is not None else [])
         # Empty grids are published too: the layer then repaints, and so clears, wherever
         # the previous grid was.
@@ -381,8 +388,19 @@ class FleetManagerNode(Node):
         self._leader_grid_pub.publish(self._to_msg(clear_shape(
             shapes_grid(robot(collector, COLLECTOR_SHAPE) + cubes + drop_zone, res),
             res, leader, LEADER_NAV_FOOTPRINT)))
+        # The leader's pose for the collector's right-of-way rule (collector_node
+        # YIELD_TRIGGER_M); the collector has no other view of the leader.
+        if leader is not None:
+            msg = PoseStamped()
+            msg.header.frame_id = MAP_FRAME
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.pose.position.x, msg.pose.position.y = leader[0], leader[1]
+            msg.pose.orientation.z = math.sin(leader[2] / 2.0)
+            msg.pose.orientation.w = math.cos(leader[2] / 2.0)
+            self._leader_pose_pub.publish(msg)
         self._collector_grid_pub.publish(self._to_msg(clear_shape(
-            shapes_grid(robot(leader, LEADER_SHAPE) + cubes_but_target, res),
+            shapes_grid(robot(leader, LEADER_SHAPE, LEADER_HALO_RADIUS_M) + cubes_but_target,
+                        res),
             res, collector, COLLECTOR_NAV_FOOTPRINT)))
 
     def _to_msg(self, raster):

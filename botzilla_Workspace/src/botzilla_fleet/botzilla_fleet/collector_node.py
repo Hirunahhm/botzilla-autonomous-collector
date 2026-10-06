@@ -26,6 +26,7 @@ Per PROJECT.md §6/§9 the leader never sends velocities over the network, only 
 discrete goals; the collector plans and drives locally with its own Nav2 and LiDAR.
 """
 
+from collections import deque
 import math
 
 from action_msgs.msg import GoalStatus
@@ -34,11 +35,13 @@ from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.executor_node import (
     ExecutorNode, HELD_CUBE_OFFSET_M, MAP_FRAME, State,
 )
-from geometry_msgs.msg import Twist
-from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped, Twist
+from nav2_msgs.action import BackUp, DriveOnHeading, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import numpy as np
 import rclpy
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
@@ -79,6 +82,37 @@ class Collector:
     IDLE = 'IDLE'
     GOING = 'GOING'
     SEEKING = 'SEEKING'
+    YIELDING = 'YIELDING'
+
+
+# Right of way: the LEADER has priority. In a small arena the two robots kept meeting and
+# getting each other stuck (multi_robot_runs.md runs 7, 9, 12, 13). So when the leader
+# comes within YIELD_TRIGGER_M (centre to centre) and the collector has no cube in hand,
+# the collector pauses its task, moves YIELD_STEP_M away from the leader — Nav2's BackUp
+# if the leader is ahead, DriveOnHeading if it is behind; both check the costmap for
+# collisions — then holds still until the leader is YIELD_CLEAR_M away (or YIELD_MAX_S
+# has passed) and resumes the same task from its standoff. Never while capturing,
+# delivering or releasing: a cube in hand must not be dropped to make room.
+# YIELD_COOLDOWN_S stops it bouncing back and forth if the leader lingers nearby.
+# Only a MOVING leader is given way at YIELD_TRIGGER_M (a parked one only inside
+# YIELD_CLOSE_M), and the wait ends once the leader has been parked for YIELD_PARKED_S:
+# the leader stops near cubes to inspect them, and waiting out a parked leader cost the
+# fake-robot harness two thirds of its deliveries. Around a parked leader the collector
+# simply plans past it (it is drawn as an obstacle in its costmap).
+YIELD_CLOSE_M = 0.6
+YIELD_PARKED_S = 4.0
+LEADER_MOVING_M = 0.08             # moved this far in LEADER_MOVING_WINDOW_S = moving
+LEADER_MOVING_WINDOW_S = 1.5
+YIELD_TRIGGER_M = 0.9
+YIELD_CLEAR_M = 1.3
+YIELD_STEP_M = 0.3
+YIELD_SPEED = 0.10                 # m/s
+YIELD_MOVE_TIMEOUT_S = 12.0
+YIELD_MAX_S = 25.0
+YIELD_COOLDOWN_S = 10.0
+LEADER_POSE_MAX_AGE_S = 1.0
+YIELDABLE = (Collector.IDLE, Collector.GOING, Collector.SEEKING,
+             State.TARGETING, State.APPROACHING)
 
 
 def _wrap(a):
@@ -125,6 +159,15 @@ class CollectorNode(ExecutorNode):
         self.create_subscription(
             OccupancyGrid, 'global_costmap/costmap', self._costmap_cb, latched)
         self.create_subscription(CubeTask, 'fleet/task', self._task_cb, latched)
+        # Leader priority — see YIELD_TRIGGER_M.
+        self._leader_pose = None          # (x, y)
+        self._leader_pose_time = None
+        self._leader_hist = deque()       # (time_s, x, y), last few seconds
+        self._yield = None                # in-progress yield, see _start_yield
+        self._last_yield_end = None
+        self.create_subscription(PoseStamped, 'fleet/leader_pose', self._leader_cb, 10)
+        self._backup_client = ActionClient(self, BackUp, 'backup')
+        self._drive_client = ActionClient(self, DriveOnHeading, 'drive_on_heading')
         self._fleet_status_pub = self.create_publisher(CollectorStatus, 'fleet/status', 10)
         self.create_timer(STATUS_PERIOD_S, self._publish_fleet_status)
         self.get_logger().info(
@@ -171,8 +214,25 @@ class CollectorNode(ExecutorNode):
         else:
             self._queued_task = task
 
+    def _leader_cb(self, msg):
+        self._leader_pose = (msg.pose.position.x, msg.pose.position.y)
+        self._leader_pose_time = self.get_clock().now()
+        t = self._leader_pose_time.nanoseconds / 1e9
+        self._leader_hist.append((t, *self._leader_pose))
+        while self._leader_hist and t - self._leader_hist[0][0] > 3 * LEADER_MOVING_WINDOW_S:
+            self._leader_hist.popleft()
+
+    def _leader_moving(self, now):
+        """Return True if the leader moved LEADER_MOVING_M within the last window."""
+        t = now.nanoseconds / 1e9
+        recent = [(x, y) for ts, x, y in self._leader_hist if t - ts <= LEADER_MOVING_WINDOW_S]
+        if len(recent) < 2:
+            return False
+        return math.hypot(recent[-1][0] - recent[0][0],
+                          recent[-1][1] - recent[0][1]) > LEADER_MOVING_M
+
     def _cube_cb(self, msg):
-        if self._state in (State.STARTUP, Collector.IDLE):
+        if self._state in (State.STARTUP, Collector.IDLE, Collector.YIELDING):
             return
         if self._state in (Collector.GOING, Collector.SEEKING):
             self._maybe_start_chase(msg)
@@ -212,6 +272,14 @@ class CollectorNode(ExecutorNode):
 
     def _control_loop(self):
         now = self.get_clock().now()
+        if self._state == Collector.YIELDING:
+            self._do_yielding(now)
+            self._publish_status()
+            return
+        if self._state in YIELDABLE and self._should_yield(now):
+            self._start_yield(now)
+            self._publish_status()
+            return
         if self._state == Collector.IDLE:
             if self._queued_task is not None:
                 task, self._queued_task = self._queued_task, None
@@ -232,6 +300,104 @@ class CollectorNode(ExecutorNode):
             self._publish_status()
             return
         super()._control_loop()
+
+    # ------------------------------------------------------------------ #
+    # Leader priority (see YIELD_TRIGGER_M)
+    # ------------------------------------------------------------------ #
+
+    def _leader_distance(self, now):
+        """(distance, bearing in this robot's frame) to the leader, or None if unknown."""
+        if self._leader_pose is None or self._leader_pose_time is None:
+            return None
+        if (now - self._leader_pose_time).nanoseconds / 1e9 > LEADER_POSE_MAX_AGE_S:
+            return None
+        pose = self._get_robot_pose()
+        if pose is None:
+            return None
+        dx, dy = self._leader_pose[0] - pose[0], self._leader_pose[1] - pose[1]
+        return math.hypot(dx, dy), _wrap(math.atan2(dy, dx) - pose[2])
+
+    def _should_yield(self, now):
+        if self._last_yield_end is not None and (
+                now - self._last_yield_end).nanoseconds / 1e9 < YIELD_COOLDOWN_S:
+            return False
+        d = self._leader_distance(now)
+        if d is None:
+            return False
+        return d[0] < YIELD_CLOSE_M or (d[0] < YIELD_TRIGGER_M and self._leader_moving(now))
+
+    def _start_yield(self, now):
+        dist, bearing = self._leader_distance(now)
+        was = self._state
+        if was == Collector.GOING:
+            self._cancel_nav_goal()
+        # Any chase in progress is dropped; the task resumes from its standoff.
+        self._target_cube = None
+        self._cube_world_estimate = None
+        self._blind_spot_frames = 0
+        ahead = abs(bearing) < math.pi / 2
+        client, action, kind = ((self._backup_client, BackUp, 'backing up') if ahead
+                                else (self._drive_client, DriveOnHeading, 'driving forward'))
+        self._yield = {'start': now, 'phase': 'moving', 'resume': self._task is not None,
+                       'parked_since': None}
+        self.get_logger().info(
+            f'Leader {dist:.2f} m away ({math.degrees(bearing):+.0f} deg) during {was}: '
+            f'yielding — {kind} {YIELD_STEP_M} m, then waiting for it to pass.')
+        self._transition(Collector.YIELDING, f'Leader priority ({dist:.2f} m).')
+        if not client.wait_for_server(timeout_sec=1.0):
+            self._yield['phase'] = 'holding'
+            return
+        goal = action.Goal()
+        goal.target.x = YIELD_STEP_M
+        goal.speed = YIELD_SPEED
+        goal.time_allowance = Duration(seconds=YIELD_MOVE_TIMEOUT_S).to_msg()
+        yield_state = self._yield
+
+        def on_done(future):
+            if self._yield is yield_state:
+                yield_state['phase'] = 'holding'
+
+        def on_accept(future):
+            handle = future.result()
+            if not handle.accepted:
+                on_done(None)
+                return
+            yield_state['handle'] = handle
+            handle.get_result_async().add_done_callback(on_done)
+        client.send_goal_async(goal).add_done_callback(on_accept)
+
+    def _do_yielding(self, now):
+        y = self._yield
+        waited = (now - y['start']).nanoseconds / 1e9
+        if y['phase'] == 'moving' and waited < YIELD_MOVE_TIMEOUT_S + 1.0:
+            return   # the BackUp/DriveOnHeading action drives
+        d = self._leader_distance(now)
+        clear = d is None or d[0] > YIELD_CLEAR_M
+        if self._leader_moving(now):
+            y['parked_since'] = None
+        elif y['parked_since'] is None:
+            y['parked_since'] = now
+        parked = (y['parked_since'] is not None
+                  and (now - y['parked_since']).nanoseconds / 1e9 > YIELD_PARKED_S)
+        if not clear and not parked and waited < YIELD_MAX_S:
+            self.get_logger().info(
+                f'Yielding: leader {d[0]:.2f} m away, waiting ({waited:.0f}s).',
+                throttle_duration_sec=5.0)
+            return
+        if y.get('handle') is not None and y['phase'] == 'moving':
+            y['handle'].cancel_goal_async()
+        self._yield = None
+        self._last_yield_end = now
+        reason = ('leader clear' if clear else 'leader parked; planning past it' if parked
+                  else f'gave way for {YIELD_MAX_S:.0f}s')
+        if y['resume'] and self._task is not None:
+            self.get_logger().info(f'Yield over ({reason}); resuming task {self._task[0]}.')
+            self._start_task(self._task)
+            if self._state == Collector.YIELDING:
+                # Could not restart yet (no pose): it is queued and starts from IDLE.
+                self._transition(Collector.IDLE, 'Yield over; task queued.')
+        else:
+            self._transition(Collector.IDLE, f'Yield over ({reason}).')
 
     def _do_startup(self, now):
         if self._home is None:
@@ -436,8 +602,10 @@ class CollectorNode(ExecutorNode):
                 self._release_xy = (pose[0] + HELD_CUBE_OFFSET_M * math.cos(pose[2]),
                                     pose[1] + HELD_CUBE_OFFSET_M * math.sin(pose[2]))
         super()._transition(new_state, reason)
-        if new_state == Collector.GOING:
-            # Nav2 drives in GOING; the base class only knows EXPLORING/DELIVERING.
+        if new_state in (Collector.GOING, Collector.YIELDING):
+            # Nav2 drives in GOING (and its BackUp/DriveOnHeading while YIELDING, which
+            # also go through the smoother); the base class only knows
+            # EXPLORING/DELIVERING.
             self._smoother_enable_pub.publish(Bool(data=True))
 
     def _dist_to_task(self):

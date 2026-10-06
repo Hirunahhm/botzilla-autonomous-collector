@@ -23,7 +23,7 @@ import threading
 import time
 
 from geometry_msgs.msg import Point, TransformStamped, Twist
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import BackUp, DriveOnHeading, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import numpy as np
 import rclpy
@@ -42,6 +42,11 @@ BLIND_M = 0.55
 RANGE_M = 1.0
 LEADER_POSE = (2.5, 2.0)
 LEADER_W = 0.15                     # rad/s
+# LEADER_ORBIT=1: the leader drives a slow 0.9 m circle around LEADER_POSE instead of
+# turning in place, so it keeps crossing the collector's path (tests the right-of-way
+# yield in collector_node).
+LEADER_ORBIT = os.environ.get('LEADER_ORBIT') == '1'
+ORBIT_R, ORBIT_W = 0.9, 0.12
 COLLECTOR_START = (0.6, 0.6, 0.0)
 CUBES = [(3.2, 2.3), (1.9, 1.5), (2.6, 2.95)]
 # PHANTOM=1: a false detection only the leader's camera produces (the collector never
@@ -75,6 +80,11 @@ class FakeFleet(Node):
         self.truth_pub = self.create_publisher(String, '/fake_fleet/truth', 10)
         self.create_subscription(Twist, '/bz2/cmd_vel', self.cmd_cb, 10)
         ActionServer(self, NavigateToPose, '/bz2/navigate_to_pose', self.nav)
+        ActionServer(self, BackUp, '/bz2/backup', lambda gh: self.straight(gh, BackUp, -1))
+        ActionServer(self, DriveOnHeading, '/bz2/drive_on_heading',
+                     lambda gh: self.straight(gh, DriveOnHeading, +1))
+        self.yields = 0
+        self.orbit = 0.0
         # collector_node only reports IDLE once Nav2's lifecycle manager says active.
         self.create_service(Trigger, '/bz2/lifecycle_manager_navigation/is_active',
                             lambda req, res: setattr(res, 'success', True) or res)
@@ -124,6 +134,8 @@ class FakeFleet(Node):
         dt = 0.05
         with self.lock:
             self.lyaw = (self.lyaw + LEADER_W * dt) % (2 * math.pi)
+            if LEADER_ORBIT:
+                self.orbit = (self.orbit + ORBIT_W * dt) % (2 * math.pi)
             self.yaw += self.w * dt
             self.x += self.v * math.cos(self.yaw) * dt
             self.y += self.v * math.sin(self.yaw) * dt
@@ -141,7 +153,7 @@ class FakeFleet(Node):
                 c[0] = self.x + 0.3 * math.cos(self.yaw)
                 c[1] = self.y + 0.3 * math.sin(self.yaw)
             pose, lyaw = (self.x, self.y, self.yaw), self.lyaw
-        self.tf(self.leader_tf, *LEADER_POSE, lyaw)
+        self.tf(self.leader_tf, *self.leader_xy(), lyaw)
         self.tf(self.coll_tf, *pose)
 
     def local(self, c, origin=None):
@@ -166,8 +178,8 @@ class FakeFleet(Node):
 
     def detect(self):
         with self.lock:
-            lead = self.seen((*LEADER_POSE, self.lyaw), skip=self.carried)
-            lead += self.seen((*LEADER_POSE, self.lyaw), cubes=PHANTOMS)
+            lead = self.seen((*self.leader_xy(), self.lyaw), skip=self.carried)
+            lead += self.seen((*self.leader_xy(), self.lyaw), cubes=PHANTOMS)
             coll = self.seen((self.x, self.y, self.yaw), skip=self.carried)
         for p in lead:
             self.leader_det.publish(p)
@@ -175,6 +187,34 @@ class FakeFleet(Node):
             self.coll_det.publish(p)
 
     # -- collector Nav2 --------------------------------------------------------------
+
+    def leader_xy(self):
+        if not LEADER_ORBIT:
+            return LEADER_POSE
+        return (LEADER_POSE[0] + ORBIT_R * math.cos(self.orbit),
+                LEADER_POSE[1] + ORBIT_R * math.sin(self.orbit))
+
+    def straight(self, gh, action, sign):
+        """BackUp / DriveOnHeading: move target.x metres along the heading."""
+        dist = abs(gh.request.target.x)
+        speed = max(abs(gh.request.speed), 0.05)
+        with self.lock:
+            self.navigating = True
+            self.v = self.w = 0.0
+            self.yields += 1
+        moved = 0.0
+        while moved < dist and rclpy.ok():
+            step = min(speed * 0.05, dist - moved)
+            with self.lock:
+                self.x += sign * step * math.cos(self.yaw)
+                self.y += sign * step * math.sin(self.yaw)
+            moved += step
+            time.sleep(0.05)
+        with self.lock:
+            self.navigating = False
+        self.get_logger().info(f'yield move #{self.yields}: {"back" if sign < 0 else "forward"} {dist:.2f} m')
+        gh.succeed()
+        return action.Result()
 
     def nav(self, gh):
         g = gh.request.pose.pose
