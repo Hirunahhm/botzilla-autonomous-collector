@@ -83,10 +83,16 @@ CUBE_OBSTACLE_HALF_M = 0.05        # a 0.10 m square per cube
 # robot off it when there is room.
 CUBE_HALO_RADIUS_M = 0.35
 CUBE_HALO_VALUE = 40
-# Robot: footprint from nav2_params.yaml (both robots share the URDF): base and grabber
-# arms, 0.58 x 0.43 m. 0.5 m halo: the robots give each other room without ever being
-# trapped by it.
-ROBOT_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))   # (x min/max, y min/max), base_link
+# Robots, as measured and unpadded (the 0.05 m padding in their Nav2 footprints is each
+# robot's own safety margin, not part of the other robot's body):
+# - leader: a bare circular Kobuki since 2026-10-06 (arms moved to the collector),
+#   body radius 0.17 m (botzilla_qbot.urdf base_link cylinder);
+# - collector: Kobuki with the grabber arms, 0.48 m from arm tips to the back of the
+#   chassis and 0.33 m across, base_link at the body centre (nav2_params.yaml's measured
+#   derivation): x -0.17..+0.31, y +-0.165.
+# 0.5 m halo: the robots give each other room without ever being trapped by it.
+LEADER_SHAPE = 0.17                                  # circle radius, m
+COLLECTOR_SHAPE = ((-0.17, 0.31), (-0.165, 0.165))   # (x min/max, y min/max), base_link
 ROBOT_HALO_RADIUS_M = 0.5
 ROBOT_HALO_VALUE = 45
 # A pose older than this is not drawn: a stale footprint would block empty floor.
@@ -316,15 +322,15 @@ class FleetManagerNode(Node):
             collector = (s.x, s.y, s.yaw)
         leader = self._leader_pose()
 
-        def robot(pose):
-            return ([(pose, ROBOT_FOOTPRINT, ROBOT_HALO_RADIUS_M, ROBOT_HALO_VALUE)]
+        def robot(pose, shape):
+            return ([(pose, shape, ROBOT_HALO_RADIUS_M, ROBOT_HALO_VALUE)]
                     if pose is not None else [])
         # Empty grids are published too: the layer then repaints, and so clears, wherever
         # the previous grid was.
-        self._leader_grid_pub.publish(
-            self._to_msg(shapes_grid(robot(collector) + cubes, OBSTACLE_GRID_RES)))
-        self._collector_grid_pub.publish(
-            self._to_msg(shapes_grid(robot(leader) + cubes_but_target, OBSTACLE_GRID_RES)))
+        self._leader_grid_pub.publish(self._to_msg(shapes_grid(
+            robot(collector, COLLECTOR_SHAPE) + cubes, OBSTACLE_GRID_RES)))
+        self._collector_grid_pub.publish(self._to_msg(shapes_grid(
+            robot(leader, LEADER_SHAPE) + cubes_but_target, OBSTACLE_GRID_RES)))
 
     def _to_msg(self, raster):
         """Wrap a (data, ox, oy, w, h) raster, or None, as an OccupancyGrid in the map."""

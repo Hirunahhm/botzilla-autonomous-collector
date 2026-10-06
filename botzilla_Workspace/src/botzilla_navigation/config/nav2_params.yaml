@@ -503,7 +503,12 @@ local_costmap:
       # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
       # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
       # margin; not rederived here since only the values below are load-bearing.
-      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
+      # LEADER IS NOW CIRCULAR (2026-10-06): the grabber arms were taken off this robot and
+      # moved to the collector, so the leader is a bare Kobuki — body radius 0.17 m
+      # (botzilla_qbot.urdf base_link cylinder), symmetric. 0.22 = 0.17 + the same 0.05 m
+      # padding the polygon carried. The arm polygon documented above now belongs to the
+      # collector: botzilla_fleet's params_rewrite.py puts it back for that robot only.
+      robot_radius: 0.22
       plugins: ["voxel_layer", "inflation_layer", "fleet_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -647,7 +652,12 @@ global_costmap:
       # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
       # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
       # margin; not rederived here since only the values below are load-bearing.
-      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
+      # LEADER IS NOW CIRCULAR (2026-10-06): the grabber arms were taken off this robot and
+      # moved to the collector, so the leader is a bare Kobuki — body radius 0.17 m
+      # (botzilla_qbot.urdf base_link cylinder), symmetric. 0.22 = 0.17 + the same 0.05 m
+      # padding the polygon carried. The arm polygon documented above now belongs to the
+      # collector: botzilla_fleet's params_rewrite.py puts it back for that robot only.
+      robot_radius: 0.22
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
       # coverage_layer = soft penalty on floor the camera has already inspected, so

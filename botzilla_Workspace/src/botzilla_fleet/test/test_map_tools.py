@@ -59,3 +59,14 @@ def test_shapes_grid_exact_footprint_and_halo():
 def test_shapes_grid_empty():
     from botzilla_fleet.map_tools import shapes_grid
     assert shapes_grid([], 0.05) is None
+
+
+def test_shapes_grid_circle():
+    from botzilla_fleet.map_tools import shapes_grid
+    data, ox, oy, w, h = shapes_grid([((1.0, 1.0, 0.0), 0.17, 0.5, 45)], 0.05)
+    lethal = (data == 100).sum() * 0.05 * 0.05
+    assert abs(lethal - 3.14159 * 0.17 ** 2) < 0.03          # a 0.17 m disc, not a square
+
+    def at(x, y):
+        return data[int((y - oy) / 0.05), int((x - ox) / 0.05)]
+    assert at(1.0, 1.0) == 100 and at(1.12, 1.12) < 100       # corner of the box is outside

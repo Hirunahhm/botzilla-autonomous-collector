@@ -76,3 +76,15 @@ def test_fleet_layer_reads_the_collectors_own_grid():
 def test_amcl_and_static_layers_use_the_cleaned_collector_map():
     p = collector_nav2_params(load(), 'bz2', {'amcl': {'ros__parameters': {'map_topic': '/map'}}})
     assert p['amcl']['ros__parameters']['map_topic'] == '/bz2/fleet/map'
+
+
+def test_collector_gets_the_arm_polygon_leader_keeps_the_circle():
+    base = load()
+    for costmap in ('local_costmap', 'global_costmap'):
+        leader = base[costmap][costmap]['ros__parameters']
+        assert 'robot_radius' in leader and 'footprint' not in leader
+    p = collector_nav2_params(base, 'bz2')
+    for costmap in ('local_costmap', 'global_costmap'):
+        params = p[costmap][costmap]['ros__parameters']
+        assert 'robot_radius' not in params
+        assert params['footprint'].startswith('[[0.36, 0.215]')

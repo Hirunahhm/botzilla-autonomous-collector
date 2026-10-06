@@ -63,19 +63,27 @@ def points_to_grid(points, resolution):
 
 
 def shapes_grid(shapes, resolution):
-    """Rasterise rectangles with soft halos: [(pose, rect, halo_radius_m, halo_value), ...].
+    """Rasterise shapes with soft halos: [(pose, shape, halo_radius_m, halo_value), ...].
 
-    pose (x, y, yaw) in the map; rect ((x0, x1), (y0, y1)) in that pose's frame. A cell
-    whose CENTRE lies inside a rectangle is 100 (lethal) — exactly the shape, no rounding
-    outwards. Outside it a halo fades linearly from halo_value at the edge to a quarter
-    of it at halo_radius_m, then stops. Cells keep the highest value of any shape.
+    pose (x, y, yaw) in the map; shape is a rectangle ((x0, x1), (y0, y1)) in that pose's
+    frame, or a number: a circle of that radius. A cell whose CENTRE lies inside a shape
+    is 100 (lethal) — exactly the shape, no rounding outwards. Outside it a halo fades
+    linearly from halo_value at the edge to a quarter of it at halo_radius_m, then
+    stops. Cells keep the highest value of any shape.
     Returns (data, origin_x, origin_y, width, height) like points_to_grid, or None.
     """
     if not shapes:
         return None
     xs_all, ys_all = [], []
-    for (x, y, _), ((x0, x1), (y0, y1)), radius, _v in shapes:
-        reach = max(abs(x0), abs(x1), abs(y0), abs(y1)) * math.sqrt(2) + radius
+
+    def extent(shape):
+        if isinstance(shape, (int, float)):
+            return shape
+        (x0, x1), (y0, y1) = shape
+        return max(abs(x0), abs(x1), abs(y0), abs(y1)) * math.sqrt(2)
+
+    for (x, y, _), shape, radius, _v in shapes:
+        reach = extent(shape) + radius
         xs_all += [x - reach, x + reach]
         ys_all += [y - reach, y + reach]
     ox = math.floor(min(xs_all) / resolution) * resolution
@@ -85,13 +93,17 @@ def shapes_grid(shapes, resolution):
     gx, gy = np.meshgrid(ox + (np.arange(w) + 0.5) * resolution,
                          oy + (np.arange(h) + 0.5) * resolution)
     data = np.zeros((h, w), dtype=np.int8)
-    for (x, y, yaw), ((x0, x1), (y0, y1)), radius, value in shapes:
-        c, s_ = math.cos(yaw), math.sin(yaw)
-        u = c * (gx - x) + s_ * (gy - y)            # cell centres in the shape's frame
-        v = -s_ * (gx - x) + c * (gy - y)
-        du = np.maximum(np.maximum(x0 - u, u - x1), 0.0)
-        dv = np.maximum(np.maximum(y0 - v, v - y1), 0.0)
-        d = np.hypot(du, dv)                        # 0 inside, distance to the edge outside
+    for (x, y, yaw), shape, radius, value in shapes:
+        if isinstance(shape, (int, float)):
+            d = np.maximum(np.hypot(gx - x, gy - y) - shape, 0.0)
+        else:
+            (x0, x1), (y0, y1) = shape
+            c, s_ = math.cos(yaw), math.sin(yaw)
+            u = c * (gx - x) + s_ * (gy - y)        # cell centres in the shape's frame
+            v = -s_ * (gx - x) + c * (gy - y)
+            du = np.maximum(np.maximum(x0 - u, u - x1), 0.0)
+            dv = np.maximum(np.maximum(y0 - v, v - y1), 0.0)
+            d = np.hypot(du, dv)                    # 0 inside, distance to the edge outside
         if radius > 0:
             halo = np.round(value * (1.0 - 0.75 * np.clip(d / radius, 0.0, 1.0))).astype(np.int8)
             near = (d > 0) & (d <= radius)

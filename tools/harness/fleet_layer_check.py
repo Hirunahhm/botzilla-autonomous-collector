@@ -13,10 +13,10 @@ opub = n.create_publisher(OccupancyGrid, '/fleet/obstacle_grid', q)
 spub = n.create_publisher(LaserScan, '/scan', qos_profile_sensor_data)
 st = {}
 n.create_subscription(OccupancyGrid, '/local_costmap/costmap', lambda m: st.update(cm=m), 10)
-FP = ((-0.22, 0.36), (-0.215, 0.215))
+FP = ((-0.17, 0.31), (-0.165, 0.165))   # the collector's measured shape
 TX, TY, TYAW = 0.5, 0.3, 0.3                          # map->odom; base_link = odom origin
 ME = (TX, TY)                                         # this robot's centre, in the map
-OTHER = (ME[0], ME[1] + 0.215 + 0.15 + 0.215, TYAW)   # side by side, 0.15 m gap
+OTHER = (ME[0], ME[1] + 0.17 + 0.15 + 0.165, TYAW)    # side by side, 0.15 m gap
 CUBE = (ME[0] + 1.2, ME[1] - 0.8)
 def tick():
     r = shapes_grid([(OTHER, FP, 0.5, 45), ((CUBE[0], CUBE[1], 0.0), ((-0.05, 0.05), (-0.05, 0.05)), 0.35, 40)], 0.05)

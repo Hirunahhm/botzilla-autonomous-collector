@@ -33,6 +33,11 @@ import copy
 COLLECTOR_MAP_TOPIC = 'fleet/map'      # resolved under the collector's namespace
 COLLECTOR_PLANNERS_DROP = ('SweepStraight',)
 COLLECTOR_COSTMAP_LAYERS_DROP = ('coverage_layer',)
+# The collector carries the grabber arms; the leader is now a bare circular Kobuki
+# (robot_radius in nav2_params.yaml). The collector's costmaps get the measured arm
+# polygon back, padded by 0.05 m on every side exactly as the leader's was while it had
+# the arms (see the derivation in nav2_params.yaml's local_costmap).
+COLLECTOR_FOOTPRINT = '[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]'
 
 
 def _namespace_topics(node, ns):
@@ -82,6 +87,9 @@ def collector_nav2_params(base, ns, amcl=None):
     _drop_plugins(gc, 'plugins', COLLECTOR_COSTMAP_LAYERS_DROP)
     for costmap in ('global_costmap', 'local_costmap'):
         params = p.get(costmap, {}).get(costmap, {}).get('ros__parameters', {})
+        if params:
+            params.pop('robot_radius', None)
+            params['footprint'] = COLLECTOR_FOOTPRINT
         if isinstance(params.get('static_layer'), dict):
             params['static_layer']['map_topic'] = f'/{ns}/{COLLECTOR_MAP_TOPIC}'
 

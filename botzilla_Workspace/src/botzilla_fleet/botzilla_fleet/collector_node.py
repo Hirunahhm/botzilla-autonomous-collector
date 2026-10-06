@@ -60,7 +60,7 @@ SEEK_PAUSE_S = 1.5                   # at each end of the sweep
 SEEK_TIMEOUT_S = 40.0
 SEEK_KP = 1.2
 # 4 Hz: the leader also draws this pose into its costmaps as an obstacle
-# (fleet_manager_node ROBOT_FOOTPRINT), so its age is the obstacle's lag.
+# (fleet_manager_node COLLECTOR_SHAPE), so its age is the obstacle's lag.
 STATUS_PERIOD_S = 0.25
 # A route that fails this fast never left the collector: Nav2 rejected or aborted it at
 # once (inactive, or still coming up). That is the collector's problem, not the cube's,
