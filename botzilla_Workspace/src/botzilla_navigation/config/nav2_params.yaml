@@ -673,7 +673,22 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan
+        observation_sources: scan scan_camera
+        # scan_camera here as well as in the local costmap (2026-10-06): the depth camera's
+        # low scan is the only sensor that sees a cube (the LiDAR scans above them). With it
+        # only in the local costmap the planner kept routing the leader through a cube the
+        # controller then refused, and the leader stayed stuck against it
+        # (multi_robot_runs.md, run 9). Same settings as the local costmap's source.
+        scan_camera:
+          topic: /scan_camera
+          max_obstacle_height: 0.30
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.55
         scan:
           topic: /scan
           max_obstacle_height: 2.0

@@ -31,7 +31,9 @@ import math
 from action_msgs.msg import GoalStatus
 from botzilla_fleet.standoff import choose_standoff, fallback_standoff
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
-from botzilla_navigation.executor_node import ExecutorNode, MAP_FRAME, State
+from botzilla_navigation.executor_node import (
+    ExecutorNode, HELD_CUBE_OFFSET_M, MAP_FRAME, State,
+)
 from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
@@ -96,6 +98,8 @@ class CollectorNode(ExecutorNode):
         self._last_result = CollectorStatus.RESULT_NONE
         self._last_detail = ''
         self._seek = None             # SEEKING sub-state, see _do_seeking
+        self._release_xy = None       # cube left short of HOME on this task, if any
+        self._last_release = None     # ... and reported for last_task_id
 
         self._map = None              # (data, (ox, oy, res, w, h))
         # IDLE (= ready for tasks) also requires Nav2 to be fully active, not just a pose:
@@ -407,6 +411,8 @@ class CollectorNode(ExecutorNode):
         self._last_result = (CollectorStatus.RESULT_COLLECTED if collected
                              else CollectorStatus.RESULT_FAILED)
         self._last_detail = detail
+        self._last_release = None if collected else self._release_xy
+        self._release_xy = None
         self._task = None
         self._seek = None
         verdict = 'COLLECTED' if collected else f'FAILED ({detail})'
@@ -422,6 +428,13 @@ class CollectorNode(ExecutorNode):
         pass   # no frontier explorer on the collector
 
     def _transition(self, new_state, reason=''):
+        if new_state == State.DETACHING and not self._delivery_arrived:
+            # Released short of HOME: remember where the cube is left (between the arms,
+            # HELD_CUBE_OFFSET_M ahead), so the leader's registry can move it there.
+            pose = self._get_robot_pose()
+            if pose is not None:
+                self._release_xy = (pose[0] + HELD_CUBE_OFFSET_M * math.cos(pose[2]),
+                                    pose[1] + HELD_CUBE_OFFSET_M * math.sin(pose[2]))
         super()._transition(new_state, reason)
         if new_state == Collector.GOING:
             # Nav2 drives in GOING; the base class only knows EXPLORING/DELIVERING.
@@ -449,6 +462,9 @@ class CollectorNode(ExecutorNode):
         if self._home is not None:
             msg.home_x, msg.home_y = self._home[0], self._home[1]
         msg.delivered = self._cubes_delivered
+        if self._last_release is not None:
+            msg.last_released = True
+            msg.release_x, msg.release_y = self._last_release
         self._fleet_status_pub.publish(msg)
 
 

@@ -150,6 +150,13 @@ class CubeRegistry:
             cube.status = 'pending'
         return cube
 
+    def relocate(self, cube_id, x, y):
+        """Move a cube's estimate to where it is now known to be (released short of HOME)."""
+        cube = self.cubes.get(cube_id)
+        if cube is not None and cube.status != 'collected':
+            cube.x, cube.y = x, y
+        return cube
+
     def unassign(self, cube_id):
         """Put an assigned cube back without counting a failure (collector went silent)."""
         cube = self.cubes.get(cube_id)

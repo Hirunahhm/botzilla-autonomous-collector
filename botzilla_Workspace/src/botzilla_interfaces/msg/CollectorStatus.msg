@@ -17,3 +17,6 @@ bool home_set
 float64 home_x                # where this collector delivers cubes
 float64 home_y
 uint32 delivered
+bool last_released            # last_task_id ended with the cube released short of HOME
+float64 release_x             # where that cube was left (map frame), if last_released
+float64 release_y

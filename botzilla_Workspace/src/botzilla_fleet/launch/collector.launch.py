@@ -111,6 +111,8 @@ def _launch(context, *_args, **_kwargs):
             # Depth aligned to RGB: unregistered, this Kinect's depth for a cube 0.9 m
             # away fell ~30 px beside the cube's RGB box (see kinect_bridge).
             'depth_registered': 'true',
+            # The collector carries the grabber arms (the leader no longer does).
+            'arms': 'true',
         }.items(),
     )
 

@@ -45,9 +45,10 @@ Usage:
 """
 
 import os
+import xml.etree.ElementTree as ET
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -56,6 +57,15 @@ from launch_ros.descriptions import ComposableNode
 _NORESET = os.path.join(
     os.path.expanduser('~'), 'Desktop/Projects/sem5/final-project-botzilla/noreset.so'
 )
+
+
+def _without_arms(urdf_text):
+    """The URDF minus every link and joint named arm_* (the grabber arms)."""
+    root = ET.fromstring(urdf_text)
+    for el in list(root):
+        if el.tag in ('link', 'joint') and el.get('name', '').startswith('arm_'):
+            root.remove(el)
+    return ET.tostring(root, encoding='unicode')
 
 
 def generate_launch_description():
@@ -78,6 +88,11 @@ def generate_launch_description():
     noreset_arg = DeclareLaunchArgument(
         'noreset_path', default_value=_NORESET,
         description='LD_PRELOAD shim for the Kinect (see repo-root noreset.so)',
+    )
+    arms_arg = DeclareLaunchArgument(
+        'arms', default_value='false',
+        description='true for the robot with the grabber arms (the collector); the '
+                    'leader is a bare Kobuki',
     )
     depth_registered_arg = DeclareLaunchArgument(
         'depth_registered', default_value='false',
@@ -109,16 +124,25 @@ def generate_launch_description():
     # ------------------------------------------------------------------ #
     # 1. Robot State Publisher (publishes /tf tree for hardware sensors)
     # ------------------------------------------------------------------ #
-    robot_state_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='screen',
-        parameters=[{
-            'robot_description': robot_description,
-            'use_sim_time': False,
-        }],
-    )
+    # arms:=false (the default) removes the grabber arms from the model: since 2026-10-06
+    # the leader is a bare circular Kobuki and only the collector robot carries the arms
+    # (botzilla_fleet's collector.launch.py passes arms:=true). Only the published model
+    # changes — RViz and the TF tree; Nav2's footprints are set separately.
+    def _robot_state_publisher(context, *_args, **_kwargs):
+        description = robot_description
+        if LaunchConfiguration('arms').perform(context).lower() not in ('true', '1', 'yes'):
+            description = _without_arms(robot_description)
+        return [Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='screen',
+            parameters=[{
+                'robot_description': description,
+                'use_sim_time': False,
+            }],
+        )]
+    robot_state_publisher = OpaqueFunction(function=_robot_state_publisher)
 
     # ------------------------------------------------------------------ #
     # 2. Kinect Bridge — publishes:
@@ -259,6 +283,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         noreset_arg,
+        arms_arg,
         depth_registered_arg,
         ekf_params_arg,
         serial_port_arg,

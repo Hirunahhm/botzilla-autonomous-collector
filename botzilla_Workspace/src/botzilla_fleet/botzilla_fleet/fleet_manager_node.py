@@ -115,6 +115,11 @@ ROBOT_POSE_MAX_AGE_S = 1.5
 # physically there, so that floor cannot be an obstacle for it. 0.5 m covers the
 # footprint's farthest corner (0.42 m from base_link) with margin.
 COLLECTOR_MAP_CLEAR_M = 0.5
+# Republish it at most this often. RTAB-Map updates /map about once a second, and every
+# copy makes the collector's global costmap redo its static layer and re-inflate the
+# whole map — heavy on the Pi, whose planner then answered too slowly (12 acknowledgement
+# time-outs in run 8 of multi_robot_runs.md). The floor plan changes far slower than that.
+COLLECTOR_MAP_PERIOD_S = 5.0
 
 COLOURS = {
     'unconfirmed': (0.6, 0.6, 0.6),
@@ -152,6 +157,7 @@ class FleetManagerNode(Node):
         self._current = None         # (task_id, cube_id) assigned and not yet reported
         self._assigned_time = None
         self._home_zone_applied = False
+        self._collector_map_sent = None   # see COLLECTOR_MAP_PERIOD_S
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -247,6 +253,7 @@ class FleetManagerNode(Node):
         self._task_seq = max(self._task_seq, msg.task_id, msg.last_task_id)
         if msg.home_set and not self._home_zone_applied:
             self._home_zone_applied = True
+            self._collector_map_sent = None   # republish now, with its HOME cleared
             gone = self._registry.drop_inside([(msg.home_x, msg.home_y, self._home_excl)])
             self._event('collector_home', x=round(msg.home_x, 2), y=round(msg.home_y, 2),
                         dropped=gone)
@@ -264,6 +271,14 @@ class FleetManagerNode(Node):
                 return
             cube = self._registry.report(cube_id, collected, self._now_s(),
                                          msg.last_detail)
+            if not collected and msg.last_released:
+                # The cube is no longer where it was estimated: the collector carried it
+                # and left it here. Without this the registry kept the old estimate, the
+                # obstacle mark stayed on empty floor and the next attempt went to the
+                # wrong spot (multi_robot_runs.md, run 10).
+                self._registry.relocate(cube_id, msg.release_x, msg.release_y)
+                self._event('relocated', id=cube_id, x=round(msg.release_x, 2),
+                            y=round(msg.release_y, 2))
             self._event('result', id=cube_id, task=task_id,
                         result='collected' if collected else 'failed',
                         detail=msg.last_detail, delivered=msg.delivered,
@@ -360,6 +375,11 @@ class FleetManagerNode(Node):
 
     def _map_cb(self, msg):
         """Republish the leader's map for the collector, its own floor cleared."""
+        now = self._now_s()
+        if (self._collector_map_sent is not None
+                and now - self._collector_map_sent < COLLECTOR_MAP_PERIOD_S):
+            return
+        self._collector_map_sent = now
         out = OccupancyGrid()
         out.header = msg.header
         out.info = msg.info

@@ -77,8 +77,9 @@ def collector_nav2_params(base, ns, amcl=None):
     # Same machine, same cause, at run time: each BT action node waits only
     # default_server_timeout (20 ms) for its server to acknowledge a goal. On the Pi the
     # planner missed that, ComputePathToPose failed, and the delivery goal was aborted
-    # 30 ms after capture (collector run of 2026-10-05 22:11, task 2).
-    bt['default_server_timeout'] = 1000
+    # 30 ms after capture (collector run of 2026-10-05 22:11, task 2). 1000 ms still
+    # timed out 12 times in run 8 of multi_robot_runs.md, so 5000.
+    bt['default_server_timeout'] = 5000
 
     planner = p.get('planner_server', {}).get('ros__parameters', {})
     _drop_plugins(planner, 'planner_plugins', COLLECTOR_PLANNERS_DROP)

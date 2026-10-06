@@ -187,6 +187,14 @@ DELIVERY_PROGRESS_M = 0.15
 # on the spot.
 DELIVERY_QUICK_FAIL_S = 2.0
 DELIVERY_RETRIES = 3
+# A HOME goal that genuinely ran and then failed (no route, recovery spin refused) is
+# tried again up to DELIVERY_STUCK_RETRIES more times after holding still for
+# DELIVERY_STUCK_WAIT_S, instead of releasing the cube at once: in a cluster of cubes,
+# or with the other robot alongside, the way is often clear a few seconds later. Every
+# release short of HOME also costs a cube-in-hand and leaves it somewhere new; run 10 of
+# multi_robot_runs.md released the same two cubes four times in one spot.
+DELIVERY_STUCK_RETRIES = 2
+DELIVERY_STUCK_WAIT_S = 3.0
 
 # Per-spot limit on cubes the robot cannot collect. A spot where a cube has failed
 # SPOT_FAIL_LIMIT times (a chase lost while targeting/approaching, or a cube released
@@ -304,6 +312,8 @@ class ExecutorNode(Node):
         # not up" from "no route" by this.
         self._nav_rejected = False
         self._delivery_attempts = 0      # HOME goals sent for the current cube
+        self._delivery_stuck_retries = 0  # see DELIVERY_STUCK_RETRIES
+        self._delivery_resend_at = None
         # Delivery progress watchdog — see DELIVERY_NO_PROGRESS_S.
         self._home_best_dist = None
         self._home_progress_time = None
@@ -593,6 +603,17 @@ class ExecutorNode(Node):
                     f'{DELIVERY_RETRIES}) instead of releasing the cube.'
                 )
                 self._send_home_goal()
+            elif (took >= DELIVERY_QUICK_FAIL_S
+                    and self._delivery_stuck_retries < DELIVERY_STUCK_RETRIES):
+                self._delivery_stuck_retries += 1
+                self._delivery_resend_at = now + Duration(seconds=DELIVERY_STUCK_WAIT_S)
+                self._nav_sent_time = None
+                self.get_logger().warn(
+                    f'HOME goal failed after {took:.0f}s (status {status}); holding still '
+                    f'{DELIVERY_STUCK_WAIT_S:.0f}s and trying again '
+                    f'({self._delivery_stuck_retries}/{DELIVERY_STUCK_RETRIES}) before '
+                    f'giving up the cube.'
+                )
             else:
                 # Releasing here is deliberate. The robot is somewhere short of HOME,
                 # but dropping the cube and carrying on beats wedging the whole
@@ -608,6 +629,11 @@ class ExecutorNode(Node):
                 self._transition(State.DETACHING, 'Delivery failed; releasing anyway.')
             return
 
+        if self._delivery_resend_at is not None:
+            if now >= self._delivery_resend_at:
+                self._delivery_resend_at = None
+                self._send_home_goal()
+            return
         if self._nav_sent_time is None:
             return
         elapsed = (now - self._nav_sent_time).nanoseconds / 1e9
@@ -878,6 +904,8 @@ class ExecutorNode(Node):
                 )
         if new_state == State.DELIVERING:
             self._delivery_attempts = 0
+            self._delivery_stuck_retries = 0
+            self._delivery_resend_at = None
         if new_state == State.DETACHING:
             # Covers every DELIVERING exit (arrived, failed, timed out) uniformly,
             # and is a harmless no-op on paths that never lowered it in the first

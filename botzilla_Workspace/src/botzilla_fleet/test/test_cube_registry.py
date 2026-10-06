@@ -82,3 +82,17 @@ def test_failed_cube_goes_after_untried_ones():
     r.assign(near.id)
     r.report(near.id, False, 1.0)
     assert r.next_task((0, 0), 2.0).id == far.id
+
+
+def test_relocate_moves_a_released_cube_but_not_a_collected_one():
+    r = CubeRegistry(confirm_sightings=1)
+    c = r.observe(1.0, 1.0, 0.0)
+    r.assign(c.id)
+    r.report(c.id, False, 1.0)
+    r.relocate(c.id, 2.0, -0.5)
+    assert (c.x, c.y) == (2.0, -0.5)
+    d = r.observe(3.0, 3.0, 2.0)
+    r.assign(d.id)
+    r.report(d.id, True, 3.0)
+    r.relocate(d.id, 0.0, 0.0)
+    assert (d.x, d.y) == (3.0, 3.0)
