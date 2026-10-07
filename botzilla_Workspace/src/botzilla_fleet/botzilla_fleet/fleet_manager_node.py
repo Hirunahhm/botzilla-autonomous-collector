@@ -115,8 +115,17 @@ LEADER_NAV_FOOTPRINT = 0.22
 # centimetres, and the leader itself was hemmed in (~220 footprint hits a minute). The
 # leader starts 0.64 m from it, outside. If ever caught inside, its own footprint is
 # still cleared (LEADER_NAV_FOOTPRINT) so it can drive out.
-DROP_ZONE_RADIUS_M = 0.45
-DROP_ZONE_HALO_M = 0.3
+# 0.25, not 0.45 (run 14, 2026-10-07): the leader starts 0.64 m from the collector's
+# HOME, and a 0.45 m lethal disc came within ~0.2 m of its own body at the start; its
+# first goals kept failing against it (241 footprint hits in one minute).
+DROP_ZONE_RADIUS_M = 0.25
+
+# NO soft halos in the LEADER's grid — bodies only (the collector, the cube cores, the
+# drop zone), lethal. The leader has right of way (collector_node YIELD_TRIGGER_M), so it
+# only needs to avoid what is actually there; DWB's footprint check still stops it
+# touching any of it. With halos the leader kept getting stuck inside them, near the
+# collector and near cubes, moving in short bursts (run 14). The collector's grid keeps
+# its halos: it is the one meant to keep its distance.
 COLLECTOR_NAV_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))
 ROBOT_HALO_RADIUS_M = 0.5
 ROBOT_HALO_VALUE = 45
@@ -363,11 +372,10 @@ class FleetManagerNode(Node):
         for cube in self._registry.cubes.values():
             if cube.status == 'collected' or not self._registry.confirmed(cube):
                 continue
-            shape = ((cube.x, cube.y, 0.0), ((-h, h), (-h, h)),
-                     CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE)
-            cubes.append(shape)
+            core = ((cube.x, cube.y, 0.0), ((-h, h), (-h, h)))
+            cubes.append(core + (0.0, 0))                                  # leader
             if cube.id != assigned:
-                cubes_but_target.append(shape)
+                cubes_but_target.append(core + (CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE))
         s = self._status
         collector = None
         if (s is not None and s.localised and self._status_time is not None
@@ -382,11 +390,10 @@ class FleetManagerNode(Node):
         # the previous grid was.
         drop_zone = []
         if s is not None and s.home_set:
-            drop_zone = [((s.home_x, s.home_y, 0.0), DROP_ZONE_RADIUS_M,
-                          DROP_ZONE_HALO_M, ROBOT_HALO_VALUE)]
+            drop_zone = [((s.home_x, s.home_y, 0.0), DROP_ZONE_RADIUS_M, 0.0, 0)]
         res = OBSTACLE_GRID_RES
         self._leader_grid_pub.publish(self._to_msg(clear_shape(
-            shapes_grid(robot(collector, COLLECTOR_SHAPE) + cubes + drop_zone, res),
+            shapes_grid(robot(collector, COLLECTOR_SHAPE, halo=0.0) + cubes + drop_zone, res),
             res, leader, LEADER_NAV_FOOTPRINT)))
         # The leader's pose for the collector's right-of-way rule (collector_node
         # YIELD_TRIGGER_M); the collector has no other view of the leader.
