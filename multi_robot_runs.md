@@ -48,6 +48,11 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 | 19 | 20261007-183841 | 11bc3fb | yes | 1 | 0 | 0 | — | 0 / 0 / 0 / 9 |
 | 20 | 20261007-184342 | 11bc3fb | yes | 6 | 4 | 0 | 100, 246, 333, 481 | 3 / 0 / 0 / 7 |
 | 21 | 20261007-200547 | 11bc3fb | yes | 8 | 2 | 1 | 417, 575 | 6 / 11 / 22 / 357 |
+| 23 | 20261007-210202 | d0d6356 | yes | 8 | 2 | 1 | 369, 495 | 8 / 5 / 9 / 139 |
+| 24 | 20261007-211701 | d0d6356 | yes | 4 | 0 | 1 | — | 0 / 2 / 3 / 26 |
+| 25 | 20261007-212525 | d0d6356 | yes | 5 | 0 | 1 | — | 2 / 2 / 0 / 5 |
+| 26 | 20261007-213304 | d0d6356 | yes | 5 | 2 | 2 | 112, 311 | 15 / 2 / 0 / 2 |
+| 27 | 20261007-221643 | d0d6356 | yes | 7 | 3 | 0 | 138, 271, 440 | 5 / 6 / 8 / 130 |
 
 **Totals over runs 3–10, where the collector actually worked:** 60 tasks, 17 cubes delivered, 23 released short.
 **Runs 12–16:** 30 tasks, 4 delivered (7 counting run 12's three releases at HOME), 11 released short. Every run from 13 on lost most of its time to the two robots blocking each other.
@@ -59,6 +64,7 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 - **Run 5** is the second attempt. The first, `20261006-002604`, aborted at start-up when the leader's Nav2 bond timed out.
 - **Runs 11–16:** delivery times are measured from the leader's HOME latch, so they may run a few seconds later than the earlier rows (run 10 recomputed this way gives 84, 180).
 - **Run 15** was killed at 6.6 min and **run 16** at 6.4 min, both with the robots stuck together.
+- **Runs 23 and 27** ran the full 10 min; **runs 24, 25 and 26** were stopped at 6.8, 5.2 and 5.8 min. Run 22 was cancelled before any data (see below), so it has no row.
 - **Runs 18 and 19** were stopped after 2.3 and 1.6 min because the collector looked like it was moving too fast (see below); neither got as far as a delivery. **Run 20** and **run 21** ran the full 10 min. Run 21's one release short came as the run ended, mid-delivery, so the leader logged no result for it; its 8 tasks include 3 handed back to a stuck leader.
 - **Run 17** ran the full 10 min. From it on, the collector starts with a **1 m gap** to the leader's left (`--start 0.0 1.34 0.0`, centres 1.34 m apart) instead of 0.3 m, so its HOME is no longer next to the leader's start. 2 of its 5 tasks were handed back to the leader as "gave way to a stuck leader" (collector faults, not cube failures).
 
@@ -87,8 +93,13 @@ Collector-side counters, per collector log:
 | 19 | collector-20261007-183945 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 |
 | 20 | collector-20261007-184445 | 4 | 4 | 0 | 0 | 1 | 1 | 0 | 0 |
 | 21 | collector-20261007-200721 | 3 | 2 | 1 | 1 | 1 | 4 | 0 | 2 |
+| 23 | collector-20261007-210304 | 3 | 2 | 1 | 0 | 8 | 9 | 1 | 1 |
+| 24 | collector-20261007-211808 | 2 | 0 | 1 | 0 | 1 | 2 | 3 | 4 |
+| 25 | collector-20261007-212623 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
+| 26 | collector-20261007-213403 | 4 | 2 | 2 | 1 | 0 | 3 | 1 | 4 |
+| 27 | collector-20261007-221753 | 3 | 3 | 0 | 2 | 4 | 4 | 0 | 0 |
 
-The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16, 11 in run 17, 2 in run 19, 2 in run 20 and 12 in run 21 (of which clear-outs for a STUCK leader: 1 in run 19, 2 in run 20, 9 in run 21). Collector logs before run 18 have no clear-outs: they did not exist yet.
+The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16, 11 in run 17, 2 in run 19, 2 in run 20, 12 in run 21, 6 in run 23, 5 in run 24, 1 in run 25, 0 in run 26 and 7 in run 27 (of which clear-outs for a STUCK leader: 1 in run 19, 2 in run 20, 9 in run 21, 2 in run 23, 4 in run 24, 1 in run 25, 4 in run 27). Collector logs before run 18 have no clear-outs: they did not exist yet.
 
 ## What each run found, and what changed after it
 
@@ -326,10 +337,39 @@ Same setup as run 17: 1 m gap, `--start 0.0 1.34 0.0`. From run 18 the Pi resolv
 - **Also fixed:** `fps:=15` typed as an integer on the command line used to crash the node (declared as a float); it now accepts either.
 - **Still to check in a run:** the Pi's overall load (median 6.3–6.5 in runs 20–21) and that TARGETING / APPROACHING behave the same with 15 fps camera input.
 
-## Still open after run 22
+## Runs 23–27 (commit d0d6356: the Kinect at 15 fps on the collector, plus the fixes after run 21)
 
-- **Pi load** (median 6.3–6.5 on 4 cores in runs 20 and 21). The Kinect now runs at 15 fps on the collector (above); still proposed: a decimated depth cloud (307,000 points a frame), higher priority for the Kobuki driver, a lighter Nav2 controller on the collector.
-- **The collector moving "too fast" (runs 18 and 19).** Not reproduced since: in run 21 real speed never exceeded the command. The position-based probe stays in place for the next runs.
-- **"Cube lost while approaching"** ended the last two tasks of run 20.
+Same setup as runs 20–22 (1 m gap, `--start 0.0 1.34 0.0`, collector started with `--leader 10.156.103.192`). Every collector log confirms "Kinect Bridge Started at 15 fps". The Pi load sampler and a speed probe ran on the Pi in every run; from run 24 the probe also logs the gyro's turn rate (`/bz2/imu`) next to the wheel encoders' every second.
+
+| Run | Length | Delivered | Pi load median / max (4 cores) | Peak temp | Over-speed seconds | Gyro/wheel disagreements |
+|---|---|---|---|---|---|---|
+| 20 (30 fps, for comparison) | 10 min | 4 | 6.3 / 8.4 | 61.5 °C | — | — |
+| 21 (30 fps) | 10 min | 2 | 6.5 / 9.4 | 64.2 °C | 0 | — |
+| 23 | 10 min | 2 | **4.2** / 7.3 | 60.4 °C | 28 | not logged |
+| 24 | 6.8 min | 0 | **3.6** / 7.0 | 60.4 °C | 0 | 0 |
+| 25 | 5.2 min | 0 | **4.2** / 8.5 | 60.4 °C | 0 | 0 |
+| 26 | 5.8 min | 2 | **3.2** / 6.7 | 60.4 °C | 0 | 0 |
+| 27 | 10 min | 3 | **4.6** / 8.0 | 60.9 °C | 0 | 0 |
+
+- **Pi load:** median 3.2–4.6 with the Kinect at 15 fps, against 6.3–6.5 at 30 fps (runs 20–21). Never throttled. Still above 4 cores at peaks, so the other proposals (decimated depth cloud, Kobuki driver priority, lighter Nav2 controller) remain open.
+- **Run 27: 3 delivered, 0 released short**, all 3 captures reaching HOME; 2 tasks handed back to a stuck leader, 1 "cube lost while targeting". The leader had one stuck spell (22:22–22:23, about 80 then 50 footprint hits a minute; 130 in the run). 3 cubes held back near the leader, 4 clear-outs, 3 escapes, the leader paused twice for a carrying collector.
+
+### Run 23: the collector turned much faster than commanded
+The speed probe caught what had looked "very fast" in runs 18 and 19. Commands were always normal; the base itself turned too fast:
+
+| When | Commanded | Actual (wheel encoders) | Motor PWM |
+|---|---|---|---|
+| 21:04:21, backing 0.3 m off the leader (BackUp, 7 s) | 0.10 m/s straight, **0 rad/s** | pivoting at **0.5–0.6 rad/s** (about 200° in all), 0.06 m/s back | 53 → 75 |
+| 21:05:22, approaching a cube (15 s) | 0.15 m/s, **0.35 rad/s** | **0.7–1.05 rad/s** (about two full circles) | 70–84 |
+| then, delivering | Nav2's **0.40 rad/s** | **0.8–0.9 rad/s** | up to 84 |
+
+Normal PWM is about 25. Checked and ruled out: the gyro's start-up calibration (−0.18 °/s, normal, and similar to run 21's −0.20 °/s), and its in-run bias tracking (it only adapts when the wheels are still *and* the command is zero). A blocked wheel fits the back-off spin (one wheel stopped and the other at ~0.14 m/s gives exactly 0.6 rad/s and 0.07 m/s), but not 15 s of steady over-turning while driving forward. Unresolved: the probe did not yet log the gyro. It does from run 24, and in runs 24–27 (about 24 minutes of collector driving) there was **no over-speed and no gyro/wheel disagreement**.
+
+## Still open after run 27
+
+- **Run 23's over-turning** has not recurred, so its cause is unknown (a wrong gyro reading in the base driver's speed loop, or a mechanical one). Proposed protection either way: the base driver stops the motors and logs a warning if the gyro and encoder turn rates disagree by more than ~0.3 rad/s, or it spins while commanded not to, for about half a second. It is the driver both robots use, so `docs/velocity_control_fix.md` should be read first.
+- **Reversing is blind** on the collector (the camera faces forward; the LiDAR at 24 cm misses low objects such as cubes), and the yield's 0.3 m BackUp reverses. A forward or sideways clear-out would avoid that.
+- **Pi load** peaks still exceed 4 cores (see above).
+- **"Cube lost while targeting / approaching"** is now the most common collector failure (runs 20, 23–25, 27).
 - **A route that has to pass close to a stuck leader** (a narrow arena) will keep handing the task back; the collector delivers nothing until the leader recovers. Safe, but slow.
 - **The leader's control loop** misses its 20 Hz rate about as often as in earlier runs (median about 16 Hz when it does), with two YOLO containers on the Jetson.
