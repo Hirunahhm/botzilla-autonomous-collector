@@ -116,15 +116,16 @@ class CubeRegistry:
     def confirmed(self, cube):
         return cube.sightings >= self.confirm_sightings
 
-    def next_task(self, robot_xy, t):
+    def next_task(self, robot_xy, t, skip=()):
         """Return the next cube for a collector at robot_xy, or None.
 
         Fewest failures first, then nearest: a cube that has just failed is retried only
         once nothing untried is left, so one bad spot cannot hold up the others.
+        Cube ids in skip are passed over for now — not failed, just not offered.
         """
         self._refresh(t)
         ready = [c for c in self.cubes.values()
-                 if c.status == 'pending' and self.confirmed(c)]
+                 if c.status == 'pending' and self.confirmed(c) and c.id not in skip]
         if not ready:
             return None
         rx, ry = robot_xy

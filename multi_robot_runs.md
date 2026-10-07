@@ -37,14 +37,23 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 | 8 | 20261006-183558 | b8cb5a1 | yes | 10 | 3 | 6 | 251, 346, 441 | 24 / 21 / 48 / 564 |
 | 9 | 20261006-190324 | e72fa88 | yes | 7 | 2 | 2 | 306, 440 | 1 / 35 / 68 / 1018 |
 | 10 | 20261006-224929 | 112a718 | yes | 6 | 2 | 4 | 76, 171 | 16 / 14 / 22 / 399 |
+| 11 | 20261006-232154 | 6be6770 | no (aborted at start-up) | 0 | 0 | 0 | — | 0 / 0 / 0 / 8 |
+| 12 | 20261007-004945 | de39f8d | yes | 12 | 0 (3 effectively) | 5 | — | 2 / 39 / 79 / 1144 |
+| 13 | 20261007-010955 | 98b056f | yes | 9 | 2 | 1 | 135, 310 | 0 / 51 / 103 / 1607 |
+| 14 | 20261007-013717 | dfa4e60 | yes | 5 | 2 | 2 | 271, 499 | 16 / 33 / 55 / 839 |
+| 15 | 20261007-101042 | 7996c0e | yes | 2 | 0 | 1 | — | 0 / 24 / 48 / 720 |
+| 16 | 20261007-102125 | b21b2e1 | yes | 2 | 0 | 2 | — | 10 / 34 / 66 / 980 |
 
 **Totals over runs 3–10, where the collector actually worked:** 60 tasks, 17 cubes delivered, 23 released short.
+**Runs 12–16:** 30 tasks, 4 delivered (7 counting run 12's three releases at HOME), 11 released short. Every run from 13 on lost most of its time to the two robots blocking each other.
 
 **Notes on the table:**
 - **Run 7** was stopped early: both robots were deadlocked (see below).
 - **Run 10** was stopped at about 8.5 min.
 - **Run 1:** the collector never came up, so the tasks were rejected instantly.
 - **Run 5** is the second attempt. The first, `20261006-002604`, aborted at start-up when the leader's Nav2 bond timed out.
+- **Runs 11–16:** delivery times are measured from the leader's HOME latch, so they may run a few seconds later than the earlier rows (run 10 recomputed this way gives 84, 180).
+- **Run 15** was killed at 6.6 min and **run 16** at 6.4 min, both with the robots stuck together.
 
 Collector-side counters, per collector log:
 
@@ -60,8 +69,14 @@ Collector-side counters, per collector log:
 | 8 | collector-20261006-183558 | 9 | 3 | 6 | 2 | 5 | 16 | 12 | 10 |
 | 9 | collector-20261006-190325 | 4 | 2 | 2 | 0 | 4 | 7 | 1 | 0 |
 | 10 | collector-20261006-224930 | 6 | 2 | 4 | 2 | 1 | 2 | 2 | 0 |
+| 11 | collector-20261006-232155 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 12 | collector-20261007-004946 | 5 | 0 | 5 | 3 | 0 | 9 | 1 | 6 |
+| 13 | collector-20261007-010955 | 3 | 2 | 1 | 0 | 19 | 37 | 0 | 2 |
+| 14 | collector-20261007-013717 | 5 | 2 | 2 | 4 | 2 | 0 | 0 | 0 |
+| 15 | collector-20261007-101042 | 2 | 0 | 1 | 4 | 16 | 37 | 4 | 0 |
+| 16 | collector-20261007-102126 | 2 | 0 | 2 | 0 | 13 | 15 | 0 | 2 |
 
-The HOME re-send retry did not exist before run 5.
+The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16.
 
 ## What each run found, and what changed after it
 
@@ -168,3 +183,62 @@ The HOME re-send retry did not exist before run 5.
 4. **Camera-seen cubes in the global costmap.** `scan_camera` is now a source in the global costmap's obstacle layer too, with the same settings as in the local costmap. Note that this also applies to single-robot runs on this branch.
 5. **Base drivers needing forcing at shutdown.** **Cause:** `KobukiDriver`'s serial reader was a non-daemon thread looping forever, so the process could never exit after `main()` had zeroed the motors. **Fix:** it is now a daemon thread.
 6. **Arm links on the leader.** `hardware.launch.py` has a new `arms` argument, default `false`, which strips the four `arm_*` links and joints from the published model. `collector.launch.py` passes `arms:=true`.
+
+## Runs 11–16
+
+### Run 11
+- **Problem:** aborted at start-up. The collector started before the fleet manager was publishing `/bz2/fleet/map`: the readiness check only looked for the topic in the graph, and the laptop's RViz, subscribed to it, had already made it appear.
+- **Fix:** `run_collector.sh` waits for an actual map message (`ros2 topic echo --once`, transient local). The fleet manager also exits cleanly on an external shutdown.
+
+### Run 12: deliveries miscounted
+- **Result:** 0 delivered by the count, but 3 of the 5 "released short" cubes were left 0.05–0.17 m from the collector's HOME: delivered in all but name. The last few centimetres failed because the leader kept hanging around that HOME, among the cubes already dropped there.
+- **Worse:** each of those was relocated *onto* HOME and stayed pending, so it became an obstacle on HOME and the collector was later sent to collect cubes from its own drop zone.
+- **Fixes:**
+  - a delivery that fails within 0.5 m of HOME counts as delivered (`DELIVERY_CLOSE_ENOUGH_M`);
+  - a cube released inside the HOME zone is marked collected, not relocated (`collected_in_home_zone` event);
+  - a lethal "drop zone" disc around the collector's HOME in the leader's grid, to keep the leader away.
+
+### Run 13
+- **Result:** 2 delivered.
+- **Problem:** the robots kept meeting: 19 back-ups and 37 refused spins on the collector, 1607 footprint hits on the leader.
+- **Fix:** leader right of way. An unladen collector backs off 0.3 m when the leader comes within 0.9 m (if moving) or 0.6 m, and waits for it to pass; the leader is drawn with 0.10 m of padding and a longer halo in the collector's grid.
+
+### Run 14
+- **Result:** 2 delivered; the collector yielded twice.
+- **Problem:** the leader moved in short bursts and got stuck inside the soft halos around the collector and around cubes.
+- **Fix:** no halos in the leader's grid at all, only lethal bodies; drop-zone radius 0.45 → 0.25 m.
+
+### Run 15
+- **Problem:** both robots pinned near the start. The collector's HOME is only 0.64 m from the leader's start, so the drop-zone disc and the collector together trapped the leader whenever it came back there. Killed at 6.6 min.
+- **Fix:** drop zone disabled (`DROP_ZONE_ENABLED = False`); its job is covered by the yield and the close-enough rule.
+
+### Run 16: the two robots wedged together
+- **Result:** 0 delivered; killed at 6.4 min.
+- **What happened** (leader poses from `metrics.jsonl`, collector log on the Pi):
+  1. 10:23:36: the leader confirmed a cube at (2.35, −0.01) while standing 0.4 m from it, turning to inspect it. It was assigned 1 s later.
+  2. The collector drove in and captured it right beside the leader. Spinning in place did not count as "moving", and the leader was more than 0.6 m away, so the collector did not yield. From 10:23:51 the leader was in Nav2 recovery almost continuously (about 220 footprint hits a minute).
+  3. Carrying, the collector could not get past the leader: no progress towards HOME for 45 s, then released short.
+  4. 10:24:47: it yielded to the leader at 0.72 m. Seven seconds later it decided the leader was "parked" (it was barely moving because it was stuck, not parked), resumed, drove in for the cube again and captured it. Every delivery attempt then had its spin refused.
+  5. From 10:25:20 the robots were 0.38 m apart, centre to centre: the leader's centre 0.32 m to the side of the collector's, so the bodies were touching or within about a centimetre. The collector tried to yield 13 more times; every back-up was refused at once ("Collision Ahead"), and each yield ended as "leader parked".
+- **Lesson:** shrinking footprints would not have helped (the bodies were really that close). The failure is in how the robots interact: the leader was given no time to leave a cube before it was assigned, and the collector could not tell a stuck leader from a parked one.
+
+## Fixes made after run 16
+
+1. **No assignment while the leader is beside the cube.** The fleet manager holds a confirmed cube back while the leader is within 1 m of it (`LEADER_CUBE_CLEAR_M`, `deferred` event) and offers it once the leader has moved on. If the leader stays PARKED there for 30 s (`LEADER_DEFER_MAX_S`), the cube is offered anyway. The leader only ever confirms cubes within 1 m, so otherwise a leader that stops for good would hold them for ever. Never while it is turning or stuck.
+2. **The leader says what it is doing.** `botzilla_fleet/leader_state.py` classifies the leader from its pose and its Nav2 `number_of_recoveries`. The fleet manager publishes the state on `/bz2/fleet/leader_state` and logs each change (`leader_state` event):
+   - **MOVING:** driving, or turning (inspection spins count);
+   - **STUCK:** Nav2 recovered recently and the leader has not got 0.25 m away since, or it has held a goal for 8 s without moving;
+   - **PARKED:** neither.
+3. **The collector never plans past a stuck leader.**
+   - It yields at 0.9 m to a MOVING or STUCK leader, and only inside 0.6 m to a PARKED one.
+   - The "leader parked; planning past it" exit only fires for a leader that really is PARKED.
+   - With a STUCK leader it holds clear for up to 30 s, giving the leader's recoveries room, then gives the task back as a collector fault (the cube is not marked failed). If it is already beyond 0.9 m it gives the task back after 5 s, since a stuck leader will not pass.
+   - The 10 s cooldown no longer applies inside 0.6 m unless the leader is PARKED.
+   - Without a `leader_state` message (an older fleet manager) it falls back to the position-only guess.
+4. **Tested** with unit tests (`test_leader_state.py`, `test_cube_registry.py`) and four `fake_fleet.py` scenarios: the default slow turn (3/3 delivered), an orbiting leader (3/3), `LEADER_MODE=inspect` (the cube is held back until the spinning leader leaves, then delivered) and `LEADER_MODE=stuck` (the collector gives way, never plans past the stuck leader, and delivers both reachable cubes on the second attempt).
+
+## Still open after run 16
+
+- **Robots already touching.** If the two do end up overlapping, every Nav2 move is refused for both, because each one's own footprint is inside the other's lethal mark. Escaping needs the fleet manager to stop drawing the other robot for the one that backs out (and, ideally, each robot's own sensor returns of the other filtered out).
+- **A carrying collector still never yields,** and the leader has no rule to give way to it.
+- **The leader's own LiDAR still maps the collector** into its `/map` and inflates it in its costmaps; only the collector's copy of the map is cleaned.

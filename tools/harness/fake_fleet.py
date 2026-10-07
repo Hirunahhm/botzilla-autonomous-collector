@@ -7,6 +7,7 @@ for everything around fleet_manager_node and collector_node:
 
   leader (un-namespaced)   turns slowly in place at LEADER_POSE, publishing map->base_link
                            on /tf and a /detected_cube for each cube in its camera cone
+                           (LEADER_MODE picks other behaviours, see below)
   collector (/bz2)         serves /bz2/navigate_to_pose (drives straight at 0.5 m/s),
                            integrates /bz2/cmd_vel, publishes map->base_link on /bz2/tf
                            and a /bz2/detected_cube for cubes in its cone (2 Hz, like
@@ -47,6 +48,20 @@ LEADER_W = 0.15                     # rad/s
 # yield in collector_node).
 LEADER_ORBIT = os.environ.get('LEADER_ORBIT') == '1'
 ORBIT_R, ORBIT_W = 0.9, 0.12
+# LEADER_MODE=inspect: the leader spins (0.6 rad/s) at INSPECT_POSE, 0.7 m from cube
+# (1.9, 1.5), for INSPECT_S, then drives to LEADER_AWAY and turns slowly there — run 16's
+# opening. That cube must be held back ('deferred') while the leader is beside it and
+# assigned once it has gone; the spin must read as MOVING, not PARKED.
+# LEADER_MODE=stuck: the leader turns at LEADER_POSE for STUCK_AFTER_S (so it sees the
+# cubes), then drives to STUCK_POSE beside the collector's route and stays stuck there,
+# with Nav2 feedback reporting a recovery every second. The collector must give it room
+# and never plan past it ('leader parked; planning past it' must not appear).
+LEADER_MODE = os.environ.get('LEADER_MODE', 'turn')
+INSPECT_POSE = (1.9, 2.2)
+INSPECT_S = 40.0
+LEADER_AWAY = (4.0, 1.0)
+STUCK_AFTER_S = 30.0
+STUCK_POSE = (1.3, 1.6)
 COLLECTOR_START = (0.6, 0.6, 0.0)
 CUBES = [(3.2, 2.3), (1.9, 1.5), (2.6, 2.95)]
 # PHANTOM=1: a false detection only the leader's camera produces (the collector never
@@ -75,6 +90,12 @@ class FakeFleet(Node):
         self.map_pub = self.create_publisher(OccupancyGrid, '/map', q)
         self.leader_tf = self.create_publisher(TFMessage, '/tf', 50)
         self.coll_tf = self.create_publisher(TFMessage, '/bz2/tf', 50)
+        # The leader's own Nav2 feedback, read by fleet_manager_node (leader_state.py).
+        self.leader_fb = self.create_publisher(
+            NavigateToPose.Impl.FeedbackMessage, '/navigate_to_pose/_action/feedback', 10)
+        self.t0 = time.monotonic()
+        self.lxy = INSPECT_POSE if LEADER_MODE == 'inspect' else LEADER_POSE
+        self.recoveries = 0
         self.leader_det = self.create_publisher(Point, '/detected_cube', 10)
         self.coll_det = self.create_publisher(Point, '/bz2/detected_cube', 10)
         self.truth_pub = self.create_publisher(String, '/fake_fleet/truth', 10)
@@ -92,6 +113,7 @@ class FakeFleet(Node):
         self.create_timer(0.5, self.detect)
         self.create_timer(2.0, self.pub_map)
         self.create_timer(5.0, self.pub_truth)
+        self.create_timer(0.2, self.pub_leader_feedback)
         self.pub_map()
 
     # -- world ---------------------------------------------------------------------
@@ -130,10 +152,41 @@ class FakeFleet(Node):
         t.transform.rotation.z, t.transform.rotation.w = quat(yaw)
         pub.publish(TFMessage(transforms=[t]))
 
+    def leader_goal(self, el):
+        """(target xy or None, turn rate) for the scripted LEADER_MODE at elapsed el."""
+        if LEADER_MODE == 'inspect':
+            return (None, 0.6) if el < INSPECT_S else (LEADER_AWAY, LEADER_W)
+        if LEADER_MODE == 'stuck':
+            return (None, LEADER_W) if el < STUCK_AFTER_S else (STUCK_POSE, 0.0)
+        return None, LEADER_W
+
+    def pub_leader_feedback(self):
+        el = time.monotonic() - self.t0
+        if LEADER_MODE != 'stuck' or el < STUCK_AFTER_S:
+            return
+        with self.lock:
+            arrived = math.hypot(self.lxy[0] - STUCK_POSE[0], self.lxy[1] - STUCK_POSE[1]) < 0.02
+        if arrived:
+            self.recoveries = int(el - STUCK_AFTER_S)        # one recovery a second
+        fb = NavigateToPose.Impl.FeedbackMessage()
+        fb.feedback.number_of_recoveries = self.recoveries
+        fb.feedback.distance_remaining = 1.0
+        self.leader_fb.publish(fb)
+
     def step(self):
         dt = 0.05
+        target, w = self.leader_goal(time.monotonic() - self.t0)
         with self.lock:
-            self.lyaw = (self.lyaw + LEADER_W * dt) % (2 * math.pi)
+            if target is not None:
+                dx, dy = target[0] - self.lxy[0], target[1] - self.lxy[1]
+                d = math.hypot(dx, dy)
+                if d > 0.01:
+                    step = min(d, 0.2 * dt)
+                    self.lxy = (self.lxy[0] + step * dx / d, self.lxy[1] + step * dy / d)
+                    self.lyaw = math.atan2(dy, dx)
+                else:
+                    self.lxy = target
+            self.lyaw = (self.lyaw + w * dt) % (2 * math.pi)
             if LEADER_ORBIT:
                 self.orbit = (self.orbit + ORBIT_W * dt) % (2 * math.pi)
             self.yaw += self.w * dt
@@ -190,7 +243,7 @@ class FakeFleet(Node):
 
     def leader_xy(self):
         if not LEADER_ORBIT:
-            return LEADER_POSE
+            return self.lxy
         return (LEADER_POSE[0] + ORBIT_R * math.cos(self.orbit),
                 LEADER_POSE[1] + ORBIT_R * math.sin(self.orbit))
 

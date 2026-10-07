@@ -30,6 +30,7 @@ from collections import deque
 import math
 
 from action_msgs.msg import GoalStatus
+from botzilla_fleet.leader_state import MOVING, PARKED, STUCK
 from botzilla_fleet.standoff import choose_standoff, fallback_standoff
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.executor_node import (
@@ -43,7 +44,7 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
 # A detection this close to the task's estimate is the assigned cube. The leader's
@@ -94,13 +95,27 @@ class Collector:
 # has passed) and resumes the same task from its standoff. Never while capturing,
 # delivering or releasing: a cube in hand must not be dropped to make room.
 # YIELD_COOLDOWN_S stops it bouncing back and forth if the leader lingers nearby.
-# Only a MOVING leader is given way at YIELD_TRIGGER_M (a parked one only inside
-# YIELD_CLOSE_M), and the wait ends once the leader has been parked for YIELD_PARKED_S:
-# the leader stops near cubes to inspect them, and waiting out a parked leader cost the
-# fake-robot harness two thirds of its deliveries. Around a parked leader the collector
-# simply plans past it (it is drawn as an obstacle in its costmap).
+# What the leader is doing comes from the fleet manager (fleet/leader_state, see
+# leader_state.py): MOVING (driving or turning), STUCK (Nav2 recovering or not getting
+# anywhere) or PARKED. A MOVING or STUCK leader is given way at YIELD_TRIGGER_M, a PARKED
+# one only inside YIELD_CLOSE_M. The wait ends once the leader has been PARKED for
+# YIELD_PARKED_S: the leader stops near cubes to inspect them, and waiting out a parked
+# leader cost the fake-robot harness two thirds of its deliveries. Around a parked leader
+# the collector simply plans past it (it is drawn as an obstacle in its costmap).
+# A STUCK leader is never planned past. Guessing from position alone could not tell stuck
+# from parked, so in run 16 (multi_robot_runs.md) the collector resumed "past" a leader
+# that was stuck beside it, drove closer, and wedged both for the rest of the run. It now
+# holds clear for up to YIELD_STUCK_MAX_S, giving the leader's recoveries room, then
+# hands its task back to the leader ('collector:' detail, so the cube is not marked
+# failed; the fleet manager re-offers it after its fault hold-off) rather than drive
+# past. Once already outside YIELD_TRIGGER_M of the stuck leader it is out of its way, and
+# a stuck leader never "passes", so it hands back after YIELD_STUCK_CLEAR_S instead: in
+# the harness, waiting the full time at 1.1-1.3 m only cost 45 s per encounter.
+# The cooldown does not apply inside YIELD_CLOSE_M to a MOVING or STUCK leader.
 YIELD_CLOSE_M = 0.6
 YIELD_PARKED_S = 4.0
+YIELD_STUCK_MAX_S = 30.0
+YIELD_STUCK_CLEAR_S = 5.0
 LEADER_MOVING_M = 0.08             # moved this far in LEADER_MOVING_WINDOW_S = moving
 LEADER_MOVING_WINDOW_S = 1.5
 YIELD_TRIGGER_M = 0.9
@@ -163,9 +178,12 @@ class CollectorNode(ExecutorNode):
         self._leader_pose = None          # (x, y)
         self._leader_pose_time = None
         self._leader_hist = deque()       # (time_s, x, y), last few seconds
+        self._leader_state = None         # MOVING / PARKED / STUCK from the fleet manager
+        self._leader_state_time = None
         self._yield = None                # in-progress yield, see _start_yield
         self._last_yield_end = None
         self.create_subscription(PoseStamped, 'fleet/leader_pose', self._leader_cb, 10)
+        self.create_subscription(String, 'fleet/leader_state', self._leader_state_cb, 10)
         self._backup_client = ActionClient(self, BackUp, 'backup')
         self._drive_client = ActionClient(self, DriveOnHeading, 'drive_on_heading')
         self._fleet_status_pub = self.create_publisher(CollectorStatus, 'fleet/status', 10)
@@ -221,6 +239,18 @@ class CollectorNode(ExecutorNode):
         self._leader_hist.append((t, *self._leader_pose))
         while self._leader_hist and t - self._leader_hist[0][0] > 3 * LEADER_MOVING_WINDOW_S:
             self._leader_hist.popleft()
+
+    def _leader_state_cb(self, msg):
+        self._leader_state = msg.data
+        self._leader_state_time = self.get_clock().now()
+
+    def _leader_status(self, now):
+        """Return MOVING / PARKED / STUCK: the fleet manager's word, else guessed from motion."""
+        if (self._leader_state_time is not None and self._leader_state in (MOVING, PARKED, STUCK)
+                and (now - self._leader_state_time).nanoseconds / 1e9 <= LEADER_POSE_MAX_AGE_S):
+            return self._leader_state
+        # A fleet manager without leader_state (older build): position only.
+        return MOVING if self._leader_moving(now) else PARKED
 
     def _leader_moving(self, now):
         """Return True if the leader moved LEADER_MOVING_M within the last window."""
@@ -318,13 +348,15 @@ class CollectorNode(ExecutorNode):
         return math.hypot(dx, dy), _wrap(math.atan2(dy, dx) - pose[2])
 
     def _should_yield(self, now):
-        if self._last_yield_end is not None and (
-                now - self._last_yield_end).nanoseconds / 1e9 < YIELD_COOLDOWN_S:
-            return False
         d = self._leader_distance(now)
         if d is None:
             return False
-        return d[0] < YIELD_CLOSE_M or (d[0] < YIELD_TRIGGER_M and self._leader_moving(now))
+        active = self._leader_status(now) != PARKED
+        cooling = self._last_yield_end is not None and (
+            now - self._last_yield_end).nanoseconds / 1e9 < YIELD_COOLDOWN_S
+        if cooling and not (active and d[0] < YIELD_CLOSE_M):
+            return False
+        return d[0] < YIELD_CLOSE_M or (d[0] < YIELD_TRIGGER_M and active)
 
     def _start_yield(self, now):
         dist, bearing = self._leader_distance(now)
@@ -341,7 +373,8 @@ class CollectorNode(ExecutorNode):
         self._yield = {'start': now, 'phase': 'moving', 'resume': self._task is not None,
                        'parked_since': None}
         self.get_logger().info(
-            f'Leader {dist:.2f} m away ({math.degrees(bearing):+.0f} deg) during {was}: '
+            f'Leader {dist:.2f} m away ({math.degrees(bearing):+.0f} deg, '
+            f'{self._leader_status(now)}) during {was}: '
             f'yielding — {kind} {YIELD_STEP_M} m, then waiting for it to pass.')
         self._transition(Collector.YIELDING, f'Leader priority ({dist:.2f} m).')
         if not client.wait_for_server(timeout_sec=1.0):
@@ -373,21 +406,34 @@ class CollectorNode(ExecutorNode):
             return   # the BackUp/DriveOnHeading action drives
         d = self._leader_distance(now)
         clear = d is None or d[0] > YIELD_CLEAR_M
-        if self._leader_moving(now):
+        status = self._leader_status(now)
+        if status != PARKED:
             y['parked_since'] = None
         elif y['parked_since'] is None:
             y['parked_since'] = now
         parked = (y['parked_since'] is not None
                   and (now - y['parked_since']).nanoseconds / 1e9 > YIELD_PARKED_S)
-        if not clear and not parked and waited < YIELD_MAX_S:
+        stuck = not clear and status == STUCK
+        limit = YIELD_MAX_S
+        if stuck:
+            limit = YIELD_STUCK_CLEAR_S if d[0] >= YIELD_TRIGGER_M else YIELD_STUCK_MAX_S
+        if not clear and not parked and waited < limit:
             self.get_logger().info(
-                f'Yielding: leader {d[0]:.2f} m away, waiting ({waited:.0f}s).',
+                f'Yielding: leader {d[0]:.2f} m away ({status}), waiting ({waited:.0f}s).',
                 throttle_duration_sec=5.0)
             return
         if y.get('handle') is not None and y['phase'] == 'moving':
             y['handle'].cancel_goal_async()
         self._yield = None
         self._last_yield_end = now
+        if stuck:
+            # Never plan past a stuck leader (see YIELD_STUCK_MAX_S): give the task back.
+            if y['resume'] and self._task is not None:
+                self._finish_task(False, f'collector: gave way to a stuck leader '
+                                         f'({d[0]:.2f} m) for {waited:.0f}s')
+            else:
+                self._transition(Collector.IDLE, 'Yield over (leader still stuck).')
+            return
         reason = ('leader clear' if clear else 'leader parked; planning past it' if parked
                   else f'gave way for {YIELD_MAX_S:.0f}s')
         if y['resume'] and self._task is not None:

@@ -42,6 +42,11 @@ rtabmap → /map ────────┼────────────
   - SEEKING: face the cube's estimate, wait 2.5 s (YOLO runs at about 1 fps on the Pi's CPU), then sweep ±60°.
   - Only a detection within 0.7 m of the task's estimate starts a chase.
   - The collector reports COLLECTED only for a release at HOME. Anything else is FAILED, with a reason.
+- **Leader right of way.** The fleet manager publishes the leader's pose on `/bz2/fleet/leader_pose` and what it is doing on `/bz2/fleet/leader_state` (MOVING, STUCK or PARKED, from `leader_state.py`: its motion plus its Nav2 recovery count).
+  - An unladen collector yields (YIELDING state) by backing off 0.3 m when a MOVING or STUCK leader is within 0.9 m, or any leader within 0.6 m.
+  - It resumes once the leader is 1.3 m away or has been PARKED for 4 s. It never plans past a STUCK leader: after holding clear it gives the task back instead.
+  - The fleet manager doesn't assign a cube while the leader is within 1 m of it, unless the leader has been PARKED there for 30 s.
+  - Why, and the runs behind each number: `multi_robot_runs.md`, runs 13–16.
 - **Why namespace + `/bz2/tf`.** Both robots use the same topic and frame names. Every shared node now uses relative topic names, so without a namespace (the leader) they resolve exactly as before.
 - **Nav2 params.** `params_rewrite.py` derives the collector's params from the leader's `nav2_params.yaml`, so the tuning can't drift. It:
   - nests the params under the namespace;

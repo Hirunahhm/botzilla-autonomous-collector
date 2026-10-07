@@ -105,3 +105,13 @@ def test_mark_collected_takes_a_failed_cube_out_of_play():
     r.report(c.id, False, 1.0)
     r.mark_collected(c.id)
     assert c.status == 'collected' and r.next_task((0, 0), 2.0) is None
+
+
+def test_skip_defers_without_failing():
+    r = CubeRegistry(confirm_sightings=1)
+    near = r.observe(1.0, 0.0, 0.0)
+    far = r.observe(3.0, 0.0, 0.0)
+    assert r.next_task((0, 0), 1.0, skip={near.id}).id == far.id
+    assert r.next_task((0, 0), 1.0, skip={near.id, far.id}) is None
+    assert near.failures == 0 and near.status == 'pending'
+    assert r.next_task((0, 0), 1.0).id == near.id

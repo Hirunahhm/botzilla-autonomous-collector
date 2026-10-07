@@ -24,18 +24,21 @@ import json
 import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
+from botzilla_fleet.leader_state import LeaderStateTracker, PARKED
 from botzilla_fleet.map_tools import (
     clear_discs, clear_shape, shapes_grid,
 )
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point, PoseStamped
+from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import String
 import tf2_ros
 from tf2_ros import TransformException
 from visualization_msgs.msg import Marker, MarkerArray
@@ -49,6 +52,20 @@ STATUS_TIMEOUT_S = 10.0
 # wait this long before assigning again; the cube goes back without a failure mark.
 COLLECTOR_FAULT_HOLDOFF_S = 15.0
 ALLOCATE_PERIOD_S = 1.0
+# A cube is not assigned while the leader is within this of it. In run 16
+# (multi_robot_runs.md) the leader confirmed a cube while standing 0.4 m from it, turning
+# to inspect it, and it was assigned one second later: the collector drove in to grab it
+# right beside the leader and wedged the two together for the rest of the run. The cube
+# stays pending and is offered once the leader has moved on — or after
+# LEADER_DEFER_MAX_S anyway if the leader is PARKED there (leader_state.py): the leader
+# only confirms cubes it sees within 1 m (CUBE_MAX_RANGE_M), so a leader that stops for
+# good near some (exploration over) would otherwise hold them back for ever (the fake
+# harness's default scenario delivered nothing). The collector's own right-of-way rules
+# (collector_node YIELD_TRIGGER_M) then handle the proximity. Never while the leader is
+# MOVING (turning to inspect) or STUCK there: that is exactly run 16's collision, and a
+# plain time cap released the cube to a leader still spinning beside it in the harness.
+LEADER_CUBE_CLEAR_M = 1.0
+LEADER_DEFER_MAX_S = 30.0
 SUMMARY_PERIOD_S = 30.0
 MAP_FRAME = 'map'
 ROBOT_FRAME = 'base_link'
@@ -189,6 +206,9 @@ class FleetManagerNode(Node):
         self._assigned_time = None
         self._home_zone_applied = False
         self._collector_map_sent = None   # see COLLECTOR_MAP_PERIOD_S
+        self._leader_state = LeaderStateTracker()   # see leader_state.py
+        self._leader_state_last = None
+        self._deferred = {}          # cube id -> when LEADER_CUBE_CLEAR_M first held it
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -208,6 +228,15 @@ class FleetManagerNode(Node):
 
         self._leader_pose_pub = self.create_publisher(
             PoseStamped, f'/{self._ns}/fleet/leader_pose', 10)
+        self._leader_state_pub = self.create_publisher(
+            String, f'/{self._ns}/fleet/leader_state', 10)
+        # The leader's Nav2 feedback (whoever sent the goal: frontier explorer or
+        # executor) — its number_of_recoveries is how leader_state.py sees it stuck.
+        self.create_subscription(
+            NavigateToPose.Impl.FeedbackMessage, '/navigate_to_pose/_action/feedback',
+            lambda m: self._leader_state.feedback(
+                self._now_s(), m.feedback.number_of_recoveries),
+            10)
         self._collector_map_pub = self.create_publisher(
             OccupancyGrid, f'/{self._ns}/fleet/map', latched)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
@@ -345,7 +374,7 @@ class FleetManagerNode(Node):
             return
         if self._now_s() < self._holdoff_until:
             return
-        cube = self._registry.next_task((s.x, s.y), self._now_s())
+        cube = self._registry.next_task((s.x, s.y), self._now_s(), self._held_back())
         if cube is None:
             return
         self._registry.assign(cube.id)
@@ -358,6 +387,28 @@ class FleetManagerNode(Node):
         self._event('assign', id=cube.id, task=self._task_seq,
                     x=round(cube.x, 2), y=round(cube.y, 2), sightings=cube.sightings,
                     dist=round(math.hypot(cube.x - s.x, cube.y - s.y), 2))
+
+    def _held_back(self):
+        """Return the ids of cubes not to offer yet, see LEADER_CUBE_CLEAR_M."""
+        leader = self._leader_pose()
+        if leader is None:
+            return set()
+        now = self._now_s()
+        parked = self._leader_state.state(now) == PARKED
+        held = set()
+        for c in self._registry.cubes.values():
+            if c.status != 'pending' or not self._registry.confirmed(c):
+                continue
+            dist = math.hypot(c.x - leader[0], c.y - leader[1])
+            if dist >= LEADER_CUBE_CLEAR_M:
+                continue
+            if c.id not in self._deferred:
+                self._deferred[c.id] = now
+                self._event('deferred', id=c.id, reason='leader near cube',
+                            leader_dist=round(dist, 2))
+            if not parked or now - self._deferred[c.id] < LEADER_DEFER_MAX_S:
+                held.add(c.id)
+        return held
 
     def _summary(self):
         c = self._registry.counts()
@@ -401,9 +452,17 @@ class FleetManagerNode(Node):
         self._leader_grid_pub.publish(self._to_msg(clear_shape(
             shapes_grid(robot(collector, COLLECTOR_SHAPE, halo=0.0) + cubes + drop_zone, res),
             res, leader, LEADER_NAV_FOOTPRINT)))
-        # The leader's pose for the collector's right-of-way rule (collector_node
-        # YIELD_TRIGGER_M); the collector has no other view of the leader.
+        # The leader's pose and state for the collector's right-of-way rule
+        # (collector_node YIELD_TRIGGER_M); the collector has no other view of the leader.
         if leader is not None:
+            now = self._now_s()
+            self._leader_state.pose(now, *leader)
+            state = self._leader_state.state(now)
+            self._leader_state_pub.publish(String(data=state))
+            if state != self._leader_state_last:
+                self._leader_state_last = state
+                self._event('leader_state', state=state, x=round(leader[0], 2),
+                            y=round(leader[1], 2))
             msg = PoseStamped()
             msg.header.frame_id = MAP_FRAME
             msg.header.stamp = self.get_clock().now().to_msg()
