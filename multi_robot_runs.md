@@ -308,9 +308,27 @@ Same setup as run 17: 1 m gap, `--start 0.0 1.34 0.0`. From run 18 the Pi resolv
 3. **No "planning past" after a clear-out** (`collector_node`). Once the collector has cleared out for a STUCK leader, that yield ends only with the leader clear (over 1.3 m), or by handing the task back ("gave way to a STUCK/PARKED leader"), never by "leader parked".
 4. **Tested:** 67 unit tests; harness scenario `LEADER_MODE=chase` (the leader drives a route through the collector's HOME and is blocked while the collector is within 0.55 m). Against the previous code (11bc3fb): leader blocked 18 s, 3 clear-outs, each further along its route. With the fixes: blocked about 1 s, 2 clear-outs, and the leader completes its route. The other five scenarios are unchanged: stuckhome 3/3, orbit 3/3, turn 3/3, inspect 1/1, stuck 1 delivered + 1 held back.
 
-## Still open after run 21
+### Run 22 (cancelled)
+- Commit e471747 (the fixes after run 21). The Pi's first build had not installed the new `botzilla_fleet` (its installed `standoff.py` was still the old one), so it was rebuilt before the run. Started at 20:49:44 and cancelled about a minute after the collector came up, to deal with the Pi's load first. No data worth recording.
 
-- **Pi load** (median 6.3–6.5 on 4 cores in runs 20 and 21). `kinect_bridge` publishes 30 fps of full-resolution RGB and depth while the collector uses about 8 fps (remote YOLO) and 5 Hz (local costmap); the depth cloud is 307,000 points a frame. Proposed: Kinect at 12–15 fps on the collector, a decimated depth cloud, higher priority for the Kobuki driver, a lighter Nav2 controller on the collector.
+## Fixes made after run 22: the Kinect's load on the Pi
+
+- **`kinect_bridge` `fps` parameter** (`hardware.launch.py` `camera_fps`, default 30; `collector.launch.py` passes 15). The Kinect always streams 30 fps, and every frame used to be copied and converted in the `freenect` callbacks (RGB 0.9 MB, depth to 16-bit and float metres, 1.8 MB) whether or not it would be published. Surplus frames are now dropped in the callbacks, before any conversion. The leader keeps 30 (every frame, as before). The collector's consumers use about 8 fps (remote YOLO, `RELAY_HZ`) and 5 Hz (the local costmap, via the depth cloud), so 15 leaves a margin. Remote detection still pairs every RGB frame with depth: the nearest kept depth frame is at most about 33 ms away (50 ms with jitter), inside its 60 ms tolerance.
+- **Measured on the Pi** (`kinect_bridge` alone, registered depth as on the collector, with stand-in subscribers for its three streams, 20 s CPU sample):
+
+| fps | `kinect_bridge` CPU | consumers' CPU | together |
+|---|---|---|---|
+| 30 (before) | 42.8% | 45.0% | ~88% |
+| 15 (collector) | 31.8% | 21.0% | ~53% |
+| 10 | 27.8% | 16.0% | ~44% |
+
+  About a third of a core freed at 15 fps. The bridge does not go much below ~28%: libfreenect still receives every frame from USB (the Kinect v1 cannot stream RGB slower at 640×480).
+- **Also fixed:** `fps:=15` typed as an integer on the command line used to crash the node (declared as a float); it now accepts either.
+- **Still to check in a run:** the Pi's overall load (median 6.3–6.5 in runs 20–21) and that TARGETING / APPROACHING behave the same with 15 fps camera input.
+
+## Still open after run 22
+
+- **Pi load** (median 6.3–6.5 on 4 cores in runs 20 and 21). The Kinect now runs at 15 fps on the collector (above); still proposed: a decimated depth cloud (307,000 points a frame), higher priority for the Kobuki driver, a lighter Nav2 controller on the collector.
 - **The collector moving "too fast" (runs 18 and 19).** Not reproduced since: in run 21 real speed never exceeded the command. The position-based probe stays in place for the next runs.
 - **"Cube lost while approaching"** ended the last two tasks of run 20.
 - **A route that has to pass close to a stuck leader** (a narrow arena) will keep handing the task back; the collector delivers nothing until the leader recovers. Safe, but slow.

@@ -117,6 +117,9 @@ def _launch(context, *_args, **_kwargs):
             'depth_registered': 'true',
             # The collector carries the grabber arms (the leader no longer does).
             'arms': 'true',
+            # Half the Kinect's 30 fps: kinect_bridge was the Pi's biggest CPU user, and
+            # nothing here uses more than ~8 fps (remote YOLO) or 5 Hz (local costmap).
+            'camera_fps': arg('camera_fps'),
             'scan_topic': 'scan_raw' if scan_filter else 'scan',
             'scan_camera_topic': 'scan_camera_raw' if scan_filter else 'scan_camera',
         }.items(),
@@ -221,6 +224,9 @@ def generate_launch_description():
             'detector', default_value='leader',
             description="'leader' (YOLO on the leader's GPU), 'local' (YOLO on this CPU) "
                         "or 'none'"),
+        DeclareLaunchArgument(
+            'camera_fps', default_value='15',
+            description='Kinect frames per second (kinect_bridge fps); 30 = every frame'),
         DeclareLaunchArgument(
             'scan_filter', default_value='true',
             description="remove the leader from this robot's scans (fleet_scan_filter)"),

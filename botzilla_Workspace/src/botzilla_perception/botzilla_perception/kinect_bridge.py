@@ -1,3 +1,4 @@
+from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
@@ -5,6 +6,7 @@ from rclpy.qos import qos_profile_sensor_data
 import freenect
 import numpy as np
 import threading
+import time
 
 # Pi 5 / RP1 USB controller fix: launch this node with
 #   LD_PRELOAD=/path/to/noreset.so
@@ -84,6 +86,24 @@ class KinectBridge(Node):
         self.declare_parameter('depth_registered', False)
         self._registered = bool(self.get_parameter('depth_registered').value)
 
+        # fps: how many frames a second of each stream to process and publish. The Kinect
+        # itself always streams 30, and every frame used to be copied and converted in the
+        # callbacks (RGB 0.9 MB, depth to 16-bit and to float metres, 1.8 MB) whether or
+        # not anything would publish it. On the collector's Raspberry Pi kinect_bridge was
+        # the biggest CPU user (about 45%, Pi load median 6.3 on 4 cores, runs 19-21 of
+        # multi_robot_runs.md) while its consumers there use about 8 fps (remote YOLO) and
+        # 5 Hz (the local costmap, via the depth cloud). Surplus frames are now dropped in
+        # the callbacks BEFORE any conversion. 30 (the default) keeps every frame, as before.
+        # dynamic typing: fps:=15 (an integer on the command line) must work as well as 15.0
+        self.declare_parameter('fps', 30.0, ParameterDescriptor(dynamic_typing=True))
+        fps = float(self.get_parameter('fps').value)
+        # A frame is kept once at least this long after the last kept one; the slack
+        # absorbs the Kinect's own frame jitter, so 15 fps really keeps every other frame.
+        self._min_period = 0.0 if fps >= 30.0 else 0.9 / fps
+        self._last_rgb_kept = 0.0
+        self._last_depth_kept = 0.0
+        self._frames_dropped = 0
+
         self.publisher_rgb = self.create_publisher(Image, 'camera/rgb/image_raw', qos_profile_sensor_data)
         # mono8, 0-255 rescaled from the raw 11-bit disparity — kept exactly as-is for
         # yolo_node.py's get_depth_at(), which reverses this specific scaling.
@@ -118,12 +138,25 @@ class KinectBridge(Node):
 
         self.timer = self.create_timer(1.0 / 30.0, self.publish_frames)
         self.get_logger().info(
-            'Decoupled 30FPS Kinect Bridge Started! depth: '
+            f'Decoupled Kinect Bridge Started at {min(fps, 30.0):.0f} fps! depth: '
             + ('registered to RGB, 16UC1 mm' if self._registered else 'raw disparity, mono8'))
+
+    def _keep(self, last_attr):
+        """Return True if a frame arriving now should be processed (see the fps param)."""
+        if self._min_period == 0.0:
+            return True
+        now = time.monotonic()
+        if now - getattr(self, last_attr) < self._min_period:
+            self._frames_dropped += 1
+            return False
+        setattr(self, last_attr, now)
+        return True
 
     # --- CAMERA THREAD (Producer) ---
 
     def video_cb(self, dev, data, timestamp):
+        if not self._keep('_last_rgb_kept'):
+            return
         self.latest_rgb = data.tobytes()
         self.latest_rgb_stamp = self.get_clock().now()
         self.new_rgb_available = True
@@ -134,6 +167,8 @@ class KinectBridge(Node):
         # Frames arriving during USB stream re-sync (Stream 70 "Invalid magic") are
         # nearly all-zero and would overwrite the last good frame, causing z=0.00m
         # forever. Drop any frame where fewer than 5% of pixels carry valid depth.
+        if not self._keep('_last_depth_kept'):
+            return
         valid_px = int(np.count_nonzero((data > 0) & (data < 2040)))
         if valid_px < 15000:  # 15k / 307200 ≈ 5%
             return
@@ -146,6 +181,8 @@ class KinectBridge(Node):
     def depth_cb_registered(self, dev, data, timestamp):
         # data is uint16 millimetres aligned to RGB; 0 = no data. Same stream re-sync
         # guard as depth_cb.
+        if not self._keep('_last_depth_kept'):
+            return
         if int(np.count_nonzero(data)) < 15000:
             return
         self.latest_depth = data.astype(np.uint16).tobytes()

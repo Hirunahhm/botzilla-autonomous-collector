@@ -99,6 +99,11 @@ def generate_launch_description():
         description='Kinect depth aligned to RGB, 16UC1 mm (see kinect_bridge); the '
                     'collector robot needs it, the leader keeps raw disparity',
     )
+    camera_fps_arg = DeclareLaunchArgument(
+        'camera_fps', default_value='30',
+        description='Kinect frames processed and published per second (kinect_bridge fps); '
+                    'the collector robot runs 15 to save CPU on its Pi',
+    )
     ekf_params_arg = DeclareLaunchArgument(
         'ekf_params_file', default_value=ekf_config_file,
         description='robot_localization params; the collector passes a namespaced copy',
@@ -170,6 +175,7 @@ def generate_launch_description():
             'use_sim_time': False,
             'depth_registered': ParameterValue(
                 LaunchConfiguration('depth_registered'), value_type=bool),
+            'fps': ParameterValue(LaunchConfiguration('camera_fps'), value_type=float),
         }],
         additional_env={'LD_PRELOAD': LaunchConfiguration('noreset_path')},
     )
@@ -297,6 +303,7 @@ def generate_launch_description():
         noreset_arg,
         arms_arg,
         depth_registered_arg,
+        camera_fps_arg,
         ekf_params_arg,
         serial_port_arg,
         lidar_port_arg,
