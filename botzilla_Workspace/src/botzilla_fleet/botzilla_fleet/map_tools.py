@@ -66,10 +66,11 @@ def shapes_grid(shapes, resolution):
     """Rasterise shapes with soft halos: [(pose, shape, halo_radius_m, halo_value), ...].
 
     pose (x, y, yaw) in the map; shape is a rectangle ((x0, x1), (y0, y1)) in that pose's
-    frame, or a number: a circle of that radius. A cell whose CENTRE lies inside a shape
-    is 100 (lethal) — exactly the shape, no rounding outwards. Outside it a halo fades
-    linearly from halo_value at the edge to a quarter of it at halo_radius_m, then
-    stops. Cells keep the highest value of any shape.
+    frame, or a number: a circle of that radius, or None: a point with a halo only and
+    NO lethal core (soft cost that never blocks, e.g. the leader's planned path). A cell
+    whose CENTRE lies inside a shape is 100 (lethal) — exactly the shape, no rounding
+    outwards. Outside it a halo fades linearly from halo_value at the edge to a quarter
+    of it at halo_radius_m, then stops. Cells keep the highest value of any shape.
     Returns (data, origin_x, origin_y, width, height) like points_to_grid, or None.
     """
     if not shapes:
@@ -77,6 +78,8 @@ def shapes_grid(shapes, resolution):
     xs_all, ys_all = [], []
 
     def extent(shape):
+        if shape is None:
+            return 0.0
         if isinstance(shape, (int, float)):
             return shape
         (x0, x1), (y0, y1) = shape
@@ -97,15 +100,18 @@ def shapes_grid(shapes, resolution):
         d = _distance_to_shape(gx, gy, pose, shape)  # 0 inside, distance to the edge outside
         if radius > 0:
             halo = np.round(value * (1.0 - 0.75 * np.clip(d / radius, 0.0, 1.0))).astype(np.int8)
-            near = (d > 0) & (d <= radius)
+            near = (d <= radius) if shape is None else ((d > 0) & (d <= radius))
             data[near] = np.maximum(data[near], halo[near])
-        data[d == 0] = 100
+        if shape is not None:
+            data[d == 0] = 100
     return data, ox, oy, w, h
 
 
 def _distance_to_shape(gx, gy, pose, shape):
     """Distance from each (gx, gy) to a rectangle or circle at pose; 0 inside it."""
     x, y, yaw = pose
+    if shape is None:
+        return np.hypot(gx - x, gy - y)
     if isinstance(shape, (int, float)):
         return np.maximum(np.hypot(gx - x, gy - y) - shape, 0.0)
     (x0, x1), (y0, y1) = shape

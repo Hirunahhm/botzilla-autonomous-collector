@@ -25,14 +25,15 @@ import time
 
 from geometry_msgs.msg import Point, TransformStamped, Twist
 from nav2_msgs.action import BackUp, DriveOnHeading, NavigateToPose
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 import numpy as np
 import rclpy
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import String
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
 
@@ -56,7 +57,19 @@ ORBIT_R, ORBIT_W = 0.9, 0.12
 # cubes), then drives to STUCK_POSE beside the collector's route and stays stuck there,
 # with Nav2 feedback reporting a recovery every second. The collector must give it room
 # and never plan past it ('leader parked; planning past it' must not appear).
+# LEADER_MODE=stuckhome: run 17's 150-310 s stall. The leader starts stuck 0.4 m beside
+# the collector's start (= its HOME) — close enough that their footprints overlap — for
+# STUCKHOME_S, then drives to LEADER_POSE and turns. The collector must escape (fleet
+# 'escape' event: the leader's body not drawn in its grid), clear out to a spot 1.4 m+
+# away instead of backing off 0.3 m, and later collect normally.
+# In every mode the leader stops while /exploration_enabled is False (the fleet manager
+# pausing it for a carrying collector) and publishes its route ahead on
+# /received_global_plan (path sharing).
 LEADER_MODE = os.environ.get('LEADER_MODE', 'turn')
+STUCKHOME_S = 60.0
+# The fake Nav2 routes around the leader when a straight line would pass this close
+# (FakeFleet.route), standing in for the planner and the leader's halo.
+NAV_AVOID_M = 1.0
 INSPECT_POSE = (1.9, 2.2)
 INSPECT_S = 40.0
 LEADER_AWAY = (4.0, 1.0)
@@ -82,6 +95,7 @@ class FakeFleet(Node):
         self.v = self.w = 0.0
         self.cubes = [list(c) for c in CUBES]
         self.carried = None
+        self.carried_since = 0.0
         self.navigating = False
 
         q = QoSProfile(depth=1)
@@ -95,12 +109,21 @@ class FakeFleet(Node):
             NavigateToPose.Impl.FeedbackMessage, '/navigate_to_pose/_action/feedback', 10)
         self.t0 = time.monotonic()
         self.lxy = INSPECT_POSE if LEADER_MODE == 'inspect' else LEADER_POSE
+        if LEADER_MODE == 'stuckhome':
+            self.lxy = (COLLECTOR_START[0], COLLECTOR_START[1] + 0.4)
         self.recoveries = 0
+        self.enabled = True
+        self.paused_s = 0.0
+        self.plan_pub = self.create_publisher(Path, '/received_global_plan', 10)
+        self.create_subscription(Bool, '/exploration_enabled', self.enabled_cb, q)
         self.leader_det = self.create_publisher(Point, '/detected_cube', 10)
         self.coll_det = self.create_publisher(Point, '/bz2/detected_cube', 10)
         self.truth_pub = self.create_publisher(String, '/fake_fleet/truth', 10)
         self.create_subscription(Twist, '/bz2/cmd_vel', self.cmd_cb, 10)
-        ActionServer(self, NavigateToPose, '/bz2/navigate_to_pose', self.nav)
+        # Accept cancels like Nav2 does (rclpy's default rejects them, and a cancelled route
+        # then kept driving and fought the next goal).
+        ActionServer(self, NavigateToPose, '/bz2/navigate_to_pose', self.nav,
+                     cancel_callback=lambda _req: CancelResponse.ACCEPT)
         ActionServer(self, BackUp, '/bz2/backup', lambda gh: self.straight(gh, BackUp, -1))
         ActionServer(self, DriveOnHeading, '/bz2/drive_on_heading',
                      lambda gh: self.straight(gh, DriveOnHeading, +1))
@@ -114,6 +137,7 @@ class FakeFleet(Node):
         self.create_timer(2.0, self.pub_map)
         self.create_timer(5.0, self.pub_truth)
         self.create_timer(0.2, self.pub_leader_feedback)
+        self.create_timer(0.5, self.pub_plan)
         self.pub_map()
 
     # -- world ---------------------------------------------------------------------
@@ -136,7 +160,8 @@ class FakeFleet(Node):
             s = ' '.join(f'({c[0]:.2f},{c[1]:.2f})' for c in self.cubes)
             carried = self.carried
         self.truth_pub.publish(String(data=f'cubes {s} carried={carried}'))
-        self.get_logger().info(f'truth: cubes {s} carried={carried}')
+        self.get_logger().info(f'truth: cubes {s} carried={carried} '
+                               f'leader_paused={self.paused_s:.0f}s')
 
     def cmd_cb(self, msg):
         with self.lock:
@@ -152,8 +177,43 @@ class FakeFleet(Node):
         t.transform.rotation.z, t.transform.rotation.w = quat(yaw)
         pub.publish(TFMessage(transforms=[t]))
 
+    def enabled_cb(self, msg):
+        if msg.data != self.enabled:
+            self.get_logger().info(f'leader exploration {"RESUMED" if msg.data else "PAUSED"}')
+        self.enabled = msg.data
+
+    def pub_plan(self):
+        """The leader's route: its next 2 m of orbit, or the line to its scripted target."""
+        el = time.monotonic() - self.t0
+        with self.lock:
+            lx, ly = self.leader_xy()
+            orbit = self.orbit
+        if LEADER_ORBIT:
+            pts = [(LEADER_POSE[0] + ORBIT_R * math.cos(orbit + k * 0.05),
+                    LEADER_POSE[1] + ORBIT_R * math.sin(orbit + k * 0.05)) for k in range(45)]
+        else:
+            target, _ = self.leader_goal(el)
+            if target is None:
+                return
+            d = math.hypot(target[0] - lx, target[1] - ly)
+            n = max(2, int(d / 0.05))
+            pts = [(lx + (target[0] - lx) * k / n, ly + (target[1] - ly) * k / n)
+                   for k in range(n + 1)]
+        msg = Path()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for x, y in pts:
+            p = PoseStamped()
+            p.header = msg.header
+            p.pose.position.x, p.pose.position.y = x, y
+            p.pose.orientation.w = 1.0
+            msg.poses.append(p)
+        self.plan_pub.publish(msg)
+
     def leader_goal(self, el):
         """(target xy or None, turn rate) for the scripted LEADER_MODE at elapsed el."""
+        if LEADER_MODE == 'stuckhome':
+            return (None, 0.0) if el < STUCKHOME_S else (LEADER_POSE, LEADER_W)
         if LEADER_MODE == 'inspect':
             return (None, 0.6) if el < INSPECT_S else (LEADER_AWAY, LEADER_W)
         if LEADER_MODE == 'stuck':
@@ -162,12 +222,18 @@ class FakeFleet(Node):
 
     def pub_leader_feedback(self):
         el = time.monotonic() - self.t0
-        if LEADER_MODE != 'stuck' or el < STUCK_AFTER_S:
+        if LEADER_MODE == 'stuckhome':
+            if el >= STUCKHOME_S:
+                return
+            self.recoveries = int(el)                       # one recovery a second
+        elif LEADER_MODE != 'stuck' or el < STUCK_AFTER_S:
             return
-        with self.lock:
-            arrived = math.hypot(self.lxy[0] - STUCK_POSE[0], self.lxy[1] - STUCK_POSE[1]) < 0.02
-        if arrived:
-            self.recoveries = int(el - STUCK_AFTER_S)        # one recovery a second
+        else:
+            with self.lock:
+                arrived = math.hypot(self.lxy[0] - STUCK_POSE[0],
+                                     self.lxy[1] - STUCK_POSE[1]) < 0.02
+            if arrived:
+                self.recoveries = int(el - STUCK_AFTER_S)    # one recovery a second
         fb = NavigateToPose.Impl.FeedbackMessage()
         fb.feedback.number_of_recoveries = self.recoveries
         fb.feedback.distance_remaining = 1.0
@@ -176,7 +242,12 @@ class FakeFleet(Node):
     def step(self):
         dt = 0.05
         target, w = self.leader_goal(time.monotonic() - self.t0)
+        if not self.enabled:                 # paused by the fleet manager: hold still
+            target, w = None, 0.0
+            self.paused_s += dt
         with self.lock:
+            if LEADER_ORBIT and self.enabled:
+                self.orbit = (self.orbit + ORBIT_W * dt) % (2 * math.pi)
             if target is not None:
                 dx, dy = target[0] - self.lxy[0], target[1] - self.lxy[1]
                 d = math.hypot(dx, dy)
@@ -187,8 +258,6 @@ class FakeFleet(Node):
                 else:
                     self.lxy = target
             self.lyaw = (self.lyaw + w * dt) % (2 * math.pi)
-            if LEADER_ORBIT:
-                self.orbit = (self.orbit + ORBIT_W * dt) % (2 * math.pi)
             self.yaw += self.w * dt
             self.x += self.v * math.cos(self.yaw) * dt
             self.y += self.v * math.sin(self.yaw) * dt
@@ -201,6 +270,7 @@ class FakeFleet(Node):
                 if (self.carried is None and not self.navigating and self.v > 0.01
                         and 0.1 < fx < 0.42 and abs(lx) < 0.12):
                     self.carried = i
+                    self.carried_since = time.monotonic()
             if self.carried is not None:
                 c = self.cubes[self.carried]
                 c[0] = self.x + 0.3 * math.cos(self.yaw)
@@ -234,6 +304,11 @@ class FakeFleet(Node):
             lead = self.seen((*self.leader_xy(), self.lyaw), skip=self.carried)
             lead += self.seen((*self.leader_xy(), self.lyaw), cubes=PHANTOMS)
             coll = self.seen((self.x, self.y, self.yaw), skip=self.carried)
+            # The real camera still sees a cube just taken between the arms (in the depth
+            # blind spot, so z = 0) before it drops out of view; without this the
+            # collector never confirmed the blind spot on a fast approach.
+            if self.carried is not None and time.monotonic() - self.carried_since < 1.0:
+                coll.append(Point(x=0.0, z=0.0))
         for p in lead:
             self.leader_det.publish(p)
         for p in coll:
@@ -255,6 +330,8 @@ class FakeFleet(Node):
             self.navigating = True
             self.v = self.w = 0.0
             self.yields += 1
+            if sign < 0:
+                self.carried = None             # reversing releases the cube, as in step()
         moved = 0.0
         while moved < dist and rclpy.ok():
             step = min(speed * 0.05, dist - moved)
@@ -269,6 +346,30 @@ class FakeFleet(Node):
         gh.succeed()
         return action.Result()
 
+    def route(self, gx, gy):
+        """Waypoints to (gx, gy): straight, or around the leader like Nav2 + the halos.
+
+        Nav2 plans around the leader's mark and soft halo in the collector's costmap; a
+        straight line through it made the harness's collector drive into a stuck leader's
+        space over and over. If the line passes within NAV_AVOID_M of the leader, go via
+        a point NAV_AVOID_M + 0.1 m out to the side the line already passes on.
+        """
+        lx, ly = self.leader_xy()
+        sx, sy = self.x, self.y
+        dx, dy = gx - sx, gy - sy
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-6:
+            return [(gx, gy)]
+        t = max(0.0, min(1.0, ((lx - sx) * dx + (ly - sy) * dy) / L2))
+        px, py = sx + t * dx, sy + t * dy
+        dist = math.hypot(px - lx, py - ly)
+        if dist >= NAV_AVOID_M or t in (0.0, 1.0):
+            return [(gx, gy)]
+        nx, ny = (px - lx, py - ly) if dist > 1e-3 else (-dy, dx)
+        n = math.hypot(nx, ny)
+        r = NAV_AVOID_M + 0.1
+        return [(lx + r * nx / n, ly + r * ny / n), (gx, gy)]
+
     def nav(self, gh):
         g = gh.request.pose.pose
         gx, gy = g.position.x, g.position.y
@@ -276,14 +377,19 @@ class FakeFleet(Node):
         with self.lock:
             self.navigating = True
             self.v = self.w = 0.0
+            waypoints = self.route(gx, gy)
         try:
             while rclpy.ok():
                 if gh.is_cancel_requested:
                     gh.canceled()
                     return NavigateToPose.Result()
                 with self.lock:
-                    dx, dy = gx - self.x, gy - self.y
+                    tx, ty = waypoints[0]
+                    dx, dy = tx - self.x, ty - self.y
                     d = math.hypot(dx, dy)
+                    if d < 0.05 and len(waypoints) > 1:
+                        waypoints.pop(0)
+                        continue
                     if d < 0.05:
                         self.yaw = gyaw
                         break

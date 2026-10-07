@@ -24,21 +24,22 @@ import json
 import math
 
 from botzilla_fleet.cube_registry import CubeRegistry
-from botzilla_fleet.leader_state import LeaderStateTracker, PARKED
+from botzilla_fleet.leader_state import LeaderStateTracker, MOVING, PARKED, STUCK
 from botzilla_fleet.map_tools import (
     clear_discs, clear_shape, shapes_grid,
 )
+from botzilla_fleet.right_of_way import EscapeLatch, GiveWay, path_ahead
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.cube_detections import project_detection
 from geometry_msgs.msg import Point, PoseStamped
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 import tf2_ros
 from tf2_ros import TransformException
 from visualization_msgs.msg import Marker, MarkerArray
@@ -112,9 +113,15 @@ CUBE_HALO_VALUE = 40
 # The leader is drawn with LEADER_PADDING_M around its 0.17 m body and a longer halo:
 # the leader has right of way (collector_node YIELD_TRIGGER_M), so the collector's
 # planner should keep well clear of it in the first place.
+LEADER_BODY_RADIUS_M = 0.17
 LEADER_PADDING_M = 0.10
-LEADER_SHAPE = 0.17 + LEADER_PADDING_M               # circle radius, m
+LEADER_SHAPE = LEADER_BODY_RADIUS_M + LEADER_PADDING_M   # circle radius, m
 LEADER_HALO_RADIUS_M = 0.7
+# A STUCK leader gets a wider halo in the collector's grid, so the collector's planner
+# keeps out of its recovery room when there is space: the collector gives way to a STUCK
+# leader inside collector_node YIELD_TRIGGER_M (0.9 m), and a route passing at 0.7-0.9 m
+# kept setting that off in the harness (yield, clear out, resume, yield again).
+LEADER_STUCK_HALO_RADIUS_M = 1.1
 COLLECTOR_SHAPE = ((-0.17, 0.31), (-0.165, 0.165))   # (x min/max, y min/max), base_link
 # Each robot's OWN Nav2 footprint (padded): nav2_params.yaml robot_radius for the leader,
 # params_rewrite.COLLECTOR_FOOTPRINT for the collector. Nothing in a robot's own grid is
@@ -136,12 +143,21 @@ LEADER_NAV_FOOTPRINT = 0.22
 # HOME, and a 0.45 m lethal disc came within ~0.2 m of its own body at the start; its
 # first goals kept failing against it (241 footprint hits in one minute).
 DROP_ZONE_RADIUS_M = 0.25
-# Off (2026-10-07, run 15): the collector's HOME is only 0.64 m from the leader's own
-# start, so whenever the leader came back near its start the drop-zone disc pinned it
-# against the collector — both robots stuck. Its job is covered without it: the collector
-# yields to the leader while unladen, and with a cube in hand a stop within
-# DELIVERY_CLOSE_ENOUGH_M of HOME counts as delivered.
-DROP_ZONE_ENABLED = False
+# Off for run 16 (2026-10-07, run 15): the collector's HOME was only 0.64 m from the
+# leader's own start, so whenever the leader came back near its start the drop-zone disc
+# pinned it against the collector — both robots stuck. Back on from run 18: the collector
+# now starts (so its HOME is) 1.34 m from the leader's start (run 17), and the disc is
+# not drawn while the leader is within LEADER_STATIC_CLEAR_M of it, so it can never trap
+# the leader again; it only keeps the leader from wandering onto the delivered cubes.
+DROP_ZONE_ENABLED = True
+# Cube marks and the drop zone are not drawn in the leader's grid within this of the
+# leader's centre (0.22 m footprint + ~0.13 m). Clearing only the cells under the
+# footprint (LEADER_NAV_FOOTPRINT) was not enough: in run 17 the leader ended 0.25 m from
+# a cube estimate, so the 0.10 m mark overlapped its 0.22 m footprint by 2 cm, and every
+# move was refused for the last 2.5 minutes. An estimate is only good to ~0.1 m anyway,
+# and the leader's own sensors still see the real cube. The COLLECTOR's mark is not
+# relaxed like this: it moves, and the leader must not creep into it.
+LEADER_STATIC_CLEAR_M = 0.35
 
 # NO soft halos in the LEADER's grid — bodies only (the collector, the cube cores, the
 # drop zone), lethal. The leader has right of way (collector_node YIELD_TRIGGER_M), so it
@@ -154,6 +170,14 @@ ROBOT_HALO_RADIUS_M = 0.5
 ROBOT_HALO_VALUE = 45
 # A pose older than this is not drawn: a stale footprint would block empty floor.
 ROBOT_POSE_MAX_AGE_S = 1.5
+# The leader's route ahead, as soft cost in the collector's grid (right_of_way.path_ahead):
+# a soft disc every 0.15 m along the next 1.5 m. Only while the leader is MOVING and the
+# route is fresh. From DWB's received_global_plan — the path the leader is actually
+# following — not /plan, which also carries the explorer's candidate-frontier queries.
+PATH_COST_RADIUS_M = 0.35
+PATH_COST_VALUE = 35
+PLAN_MAX_AGE_S = 3.0
+RIGHT_OF_WAY_HZ = 2.0
 
 # The collector's map: the leader's /map republished on /<ns>/fleet/map with a disc of
 # this radius forced free around the collector's HOME and its current pose. The leader's
@@ -209,6 +233,10 @@ class FleetManagerNode(Node):
         self._leader_state = LeaderStateTracker()   # see leader_state.py
         self._leader_state_last = None
         self._deferred = {}          # cube id -> when LEADER_CUBE_CLEAR_M first held it
+        self._plan = None            # (time_s, [(x, y), ...]) the leader's route
+        self._escape = EscapeLatch()     # see right_of_way.py
+        self._give_way = GiveWay()
+        self._escaping_logged = False
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -245,6 +273,11 @@ class FleetManagerNode(Node):
         self.create_subscription(
             CollectorStatus, f'/{self._ns}/fleet/status', self._status_cb, 10
         )
+        self.create_subscription(Path, '/received_global_plan', self._plan_cb, 10)
+        # Same latched QoS as executor_node's publisher, which frontier_explorer_node
+        # subscribes to; see GiveWay.
+        self._explore_pub = self.create_publisher(Bool, '/exploration_enabled', latched)
+        self.create_timer(1.0 / RIGHT_OF_WAY_HZ, self._right_of_way)
         self.create_timer(ALLOCATE_PERIOD_S, self._allocate)
         self.create_timer(SUMMARY_PERIOD_S, self._summary)
         self.get_logger().info(
@@ -410,6 +443,37 @@ class FleetManagerNode(Node):
                 held.add(c.id)
         return held
 
+    def _plan_cb(self, msg):
+        if msg.header.frame_id and msg.header.frame_id != MAP_FRAME:
+            return
+        self._plan = (self._now_s(), [(p.pose.position.x, p.pose.position.y)
+                                      for p in msg.poses])
+
+    def _collector_pose(self):
+        s = self._status
+        if (s is not None and s.localised and self._status_time is not None
+                and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
+            return (s.x, s.y, s.yaw)
+        return None
+
+    def _right_of_way(self):
+        """Pause the leader's exploration for a carrying collector (right_of_way.GiveWay)."""
+        leader, collector = self._leader_pose(), self._collector_pose()
+        dist = (math.hypot(leader[0] - collector[0], leader[1] - collector[1])
+                if leader is not None and collector is not None else None)
+        state = self._status.state if self._status is not None else ''
+        action = self._give_way.update(self._now_s(), state, dist)
+        if action is None:
+            return
+        self._explore_pub.publish(Bool(data=action == 'resume'))
+        self._event('leader_gives_way' if action == 'pause' else 'leader_resumes',
+                    collector_state=state, dist=round(dist, 2) if dist is not None else None)
+
+    def release_leader(self):
+        """Re-enable the leader's exploration if this node paused it (on shutdown)."""
+        if self._give_way.paused:
+            self._explore_pub.publish(Bool(data=True))
+
     def _summary(self):
         c = self._registry.counts()
         s = self._status
@@ -434,11 +498,13 @@ class FleetManagerNode(Node):
             if cube.id != assigned:
                 cubes_but_target.append(core + (CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE))
         s = self._status
-        collector = None
-        if (s is not None and s.localised and self._status_time is not None
-                and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
-            collector = (s.x, s.y, s.yaw)
+        collector = self._collector_pose()
         leader = self._leader_pose()
+        if leader is not None:
+            # See LEADER_STATIC_CLEAR_M: no cube mark right next to the leader.
+            cubes = [c for c in cubes
+                     if math.hypot(c[0][0] - leader[0], c[0][1] - leader[1])
+                     >= LEADER_STATIC_CLEAR_M]
 
         def robot(pose, shape, halo=ROBOT_HALO_RADIUS_M):
             return ([(pose, shape, halo, ROBOT_HALO_VALUE)]
@@ -446,7 +512,9 @@ class FleetManagerNode(Node):
         # Empty grids are published too: the layer then repaints, and so clears, wherever
         # the previous grid was.
         drop_zone = []
-        if DROP_ZONE_ENABLED and s is not None and s.home_set:
+        if (DROP_ZONE_ENABLED and s is not None and s.home_set and (
+                leader is None or math.hypot(s.home_x - leader[0], s.home_y - leader[1])
+                >= DROP_ZONE_RADIUS_M + LEADER_STATIC_CLEAR_M)):
             drop_zone = [((s.home_x, s.home_y, 0.0), DROP_ZONE_RADIUS_M, 0.0, 0)]
         res = OBSTACLE_GRID_RES
         self._leader_grid_pub.publish(self._to_msg(clear_shape(
@@ -470,9 +538,29 @@ class FleetManagerNode(Node):
             msg.pose.orientation.z = math.sin(leader[2] / 2.0)
             msg.pose.orientation.w = math.cos(leader[2] / 2.0)
             self._leader_pose_pub.publish(msg)
+        # The collector's grid: the leader (its body only while they do not overlap, see
+        # right_of_way.EscapeLatch; the halo always), the leader's route ahead as soft
+        # cost, and the cubes other than its target.
+        draw_body = self._escape.update(leader[:2] if leader is not None else None,
+                                        collector, COLLECTOR_NAV_FOOTPRINT, LEADER_SHAPE)
+        if self._escape.escaping != self._escaping_logged:
+            self._escaping_logged = self._escape.escaping
+            self._event('escape' if self._escape.escaping else 'escape_over',
+                        collector=[round(v, 2) for v in collector] if collector else None)
+        leader_marks = []
+        if leader is not None:
+            halo = (LEADER_STUCK_HALO_RADIUS_M if self._leader_state_last == STUCK
+                    else LEADER_HALO_RADIUS_M)
+            leader_marks = [(leader, LEADER_SHAPE if draw_body else None,
+                             halo, ROBOT_HALO_VALUE)]
+        route = []
+        if (leader is not None and self._plan is not None
+                and self._now_s() - self._plan[0] < PLAN_MAX_AGE_S
+                and self._leader_state_last == MOVING):
+            route = [((x, y, 0.0), None, PATH_COST_RADIUS_M, PATH_COST_VALUE)
+                     for x, y in path_ahead(self._plan[1], leader[:2])]
         self._collector_grid_pub.publish(self._to_msg(clear_shape(
-            shapes_grid(robot(leader, LEADER_SHAPE, LEADER_HALO_RADIUS_M) + cubes_but_target,
-                        res),
+            shapes_grid(leader_marks + route + cubes_but_target, res),
             res, collector, COLLECTOR_NAV_FOOTPRINT)))
 
     def _to_msg(self, raster):
@@ -543,6 +631,10 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        try:
+            node.release_leader()   # never leave the leader paused (GiveWay)
+        except Exception:   # noqa: B902 — the context may already be shut down
+            pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

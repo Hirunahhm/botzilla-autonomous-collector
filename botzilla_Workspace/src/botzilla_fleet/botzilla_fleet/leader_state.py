@@ -43,6 +43,12 @@ STUCK_ESCAPE_M = 0.25
 STILL_WITH_GOAL_S = 8.0
 STILL_GOAL_M = 0.05
 FEEDBACK_FRESH_S = 1.0
+# Once STUCK, it stays STUCK until the leader has got STUCK_ESCAPE_M from where it got
+# stuck, or STUCK_RELEASE_S have passed with nothing stuck about it. Without this the
+# state flipped to PARKED in the gap between the explorer cancelling a stuck goal and
+# sending the next one (no goal, no recoveries, no motion), and the collector "planned
+# past" a leader that had been stuck seconds earlier (run 17, 201 s and 241 s).
+STUCK_RELEASE_S = 15.0
 
 
 def _wrap(a):
@@ -58,6 +64,8 @@ class LeaderStateTracker:
         self._recovery_t = None         # time of the last increment
         self._recovery_xy = None        # where the leader was then
         self._feedback_t = None
+        self._stuck_xy = None           # where the current STUCK spell began
+        self._stuck_t = None            # last time it was stuck by the raw test
         self._history_s = max(MOVING_WINDOW_S, STILL_WITH_GOAL_S) + 1.0
 
     def pose(self, t, x, y, yaw):
@@ -106,9 +114,27 @@ class LeaderStateTracker:
             return self._translated(t, STILL_WITH_GOAL_S) < STILL_GOAL_M
         return False
 
+    def _sticky_stuck(self, t):
+        """Return True while stuck by the raw test, or still within its release window."""
+        here = self._poses[-1][1:3] if self._poses else None
+        if self.stuck(t):
+            if self._stuck_xy is None:
+                self._stuck_xy = here
+            self._stuck_t = t
+            return True
+        if self._stuck_t is None:
+            return False
+        escaped = (here is not None and self._stuck_xy is not None
+                   and math.hypot(here[0] - self._stuck_xy[0],
+                                  here[1] - self._stuck_xy[1]) >= STUCK_ESCAPE_M)
+        if escaped or t - self._stuck_t > STUCK_RELEASE_S:
+            self._stuck_xy = self._stuck_t = None
+            return False
+        return True
+
     def state(self, t):
         # STUCK first: a recovery's BackUp/Spin moves the robot, and it is still stuck.
-        if self.stuck(t):
+        if self._sticky_stuck(t):
             return STUCK
         if self.moving(t):
             return MOVING

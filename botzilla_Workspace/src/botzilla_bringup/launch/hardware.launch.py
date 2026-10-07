@@ -111,6 +111,17 @@ def generate_launch_description():
         ),
         description='Serial port for the Kobuki base',
     )
+    # Two-robot runs rename the scans so botzilla_fleet's fleet_scan_filter can sit in
+    # between and republish them as scan / scan_camera without the other robot in them.
+    scan_topic_arg = DeclareLaunchArgument(
+        'scan_topic', default_value='scan',
+        description="RPLIDAR output topic; 'scan_raw' when fleet_scan_filter runs",
+    )
+    scan_camera_topic_arg = DeclareLaunchArgument(
+        'scan_camera_topic', default_value='scan_camera',
+        description="depth camera virtual scan topic; 'scan_camera_raw' when "
+                    'fleet_scan_filter runs',
+    )
     lidar_port_arg = DeclareLaunchArgument(
         'lidar_port',
         default_value=(
@@ -186,6 +197,7 @@ def generate_launch_description():
         executable='rplidar_node',
         name='rplidar_node',
         output='screen',
+        remappings=[('scan', LaunchConfiguration('scan_topic'))],
         parameters=[{
             'use_sim_time': False,
             'port': LaunchConfiguration('lidar_port'),
@@ -264,7 +276,7 @@ def generate_launch_description():
         output='screen',
         remappings=[
             ('cloud_in', 'camera/points'),
-            ('scan', 'scan_camera'),
+            ('scan', LaunchConfiguration('scan_camera_topic')),
         ],
         parameters=[{
             'use_sim_time': False,
@@ -288,6 +300,8 @@ def generate_launch_description():
         ekf_params_arg,
         serial_port_arg,
         lidar_port_arg,
+        scan_topic_arg,
+        scan_camera_topic_arg,
         robot_state_publisher,
         kinect_bridge,
         kobuki_base_node,

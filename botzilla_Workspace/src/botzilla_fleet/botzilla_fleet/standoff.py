@@ -103,3 +103,39 @@ def fallback_standoff(cube_xy, robot_xy, dist=STANDOFF_DISTANCES_M[0]):
     if d <= dist:
         return rx, ry, yaw
     return cx - dist * math.cos(yaw), cy - dist * math.sin(yaw), yaw
+
+
+# Clear-out: where the collector goes to get out of a stuck leader's way (collector_node
+# CLEAR_OUT_*). Rings around the collector itself; every candidate must be at least
+# min_from_other from the leader, clear in the map and the live costmap, and reachable on
+# a straight line (a short hop, so the line is a fair proxy for Nav2's path). The nearest
+# wins; at that distance from the leader it is on the far side anyway.
+CLEAR_OUT_RINGS_M = (0.6, 0.9, 1.2, 1.5)
+
+
+def choose_clear_spot(data, grid_info, robot_xy, other_xy, min_from_other,
+                      rings=CLEAR_OUT_RINGS_M, clearance_m=CLEARANCE_M,
+                      n_angles=N_ANGLES, blocked=None):
+    """Return (x, y, yaw) at least min_from_other from other_xy, facing away; or None."""
+    rx, ry = robot_xy
+    ox, oy = other_xy
+    for ring in rings:
+        best = None
+        for k in range(n_angles):
+            a = 2 * math.pi * k / n_angles
+            x, y = rx + ring * math.cos(a), ry + ring * math.sin(a)
+            if math.hypot(x - ox, y - oy) < min_from_other:
+                continue
+            if not _clear(data, grid_info, x, y, clearance_m):
+                continue
+            if blocked is not None and blocked(x, y):
+                continue
+            if not _line_open(data, grid_info, rx, ry, x, y, stop_short_m=0.0):
+                continue
+            # Same ring: prefer the spot farthest from the other robot.
+            score = -math.hypot(x - ox, y - oy)
+            if best is None or score < best[0]:
+                best = (score, x, y, math.atan2(y - oy, x - ox))
+        if best is not None:
+            return best[1:]
+    return None

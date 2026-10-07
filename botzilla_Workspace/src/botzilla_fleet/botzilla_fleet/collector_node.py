@@ -31,7 +31,7 @@ import math
 
 from action_msgs.msg import GoalStatus
 from botzilla_fleet.leader_state import MOVING, PARKED, STUCK
-from botzilla_fleet.standoff import choose_standoff, fallback_standoff
+from botzilla_fleet.standoff import choose_clear_spot, choose_standoff, fallback_standoff
 from botzilla_interfaces.msg import CollectorStatus, CubeTask
 from botzilla_navigation.executor_node import (
     ExecutorNode, HELD_CUBE_OFFSET_M, MAP_FRAME, State,
@@ -116,6 +116,14 @@ YIELD_CLOSE_M = 0.6
 YIELD_PARKED_S = 4.0
 YIELD_STUCK_MAX_S = 30.0
 YIELD_STUCK_CLEAR_S = 5.0
+# Clear-out: for a STUCK leader the 0.3 m step is not enough. In run 17 the collector sat
+# IDLE at its HOME 0.5-0.75 m from a stuck leader, backed off 0.3 m at a time, and the
+# leader only got going again 4 s after the collector finally drove off on a task (a
+# 2.7 min stall). So it drives (Nav2) to a clear spot at least CLEAR_OUT_FROM_LEADER_M
+# from the leader (standoff.choose_clear_spot), and only falls back to the step if there
+# is none. This is the collector's half of deadlock resolution.
+CLEAR_OUT_FROM_LEADER_M = 1.4
+CLEAR_OUT_TIMEOUT_S = 25.0
 LEADER_MOVING_M = 0.08             # moved this far in LEADER_MOVING_WINDOW_S = moving
 LEADER_MOVING_WINDOW_S = 1.5
 YIELD_TRIGGER_M = 0.9
@@ -367,23 +375,50 @@ class CollectorNode(ExecutorNode):
         self._target_cube = None
         self._cube_world_estimate = None
         self._blind_spot_frames = 0
-        ahead = abs(bearing) < math.pi / 2
-        client, action, kind = ((self._backup_client, BackUp, 'backing up') if ahead
-                                else (self._drive_client, DriveOnHeading, 'driving forward'))
+        status = self._leader_status(now)
         self._yield = {'start': now, 'phase': 'moving', 'resume': self._task is not None,
-                       'parked_since': None}
+                       'parked_since': None, 'move_timeout': YIELD_MOVE_TIMEOUT_S,
+                       'cleared_out': False}
+        move = self._clear_out_move(now) if status == STUCK else None
+        if move is None:
+            ahead = abs(bearing) < math.pi / 2
+            client, action, kind = (
+                (self._backup_client, BackUp, f'backing up {YIELD_STEP_M} m') if ahead
+                else (self._drive_client, DriveOnHeading, f'driving forward {YIELD_STEP_M} m'))
+            goal = action.Goal()
+            goal.target.x = YIELD_STEP_M
+            goal.speed = YIELD_SPEED
+            goal.time_allowance = Duration(seconds=YIELD_MOVE_TIMEOUT_S).to_msg()
+            move = (client, goal, kind)
         self.get_logger().info(
-            f'Leader {dist:.2f} m away ({math.degrees(bearing):+.0f} deg, '
-            f'{self._leader_status(now)}) during {was}: '
-            f'yielding — {kind} {YIELD_STEP_M} m, then waiting for it to pass.')
+            f'Leader {dist:.2f} m away ({math.degrees(bearing):+.0f} deg, {status}) during '
+            f'{was}: yielding — {move[2]}, then waiting for it to pass.')
         self._transition(Collector.YIELDING, f'Leader priority ({dist:.2f} m).')
+        self._send_yield_move(move[0], move[1])
+
+    def _clear_out_move(self, now):
+        """Return (client, NavigateToPose goal, description) for a clear-out, or None."""
+        spot = self._clear_out_spot()
+        if spot is None:
+            return None
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = MAP_FRAME
+        goal.pose.header.stamp = now.to_msg()
+        goal.pose.pose.position.x, goal.pose.pose.position.y = spot[0], spot[1]
+        goal.pose.pose.orientation.z = math.sin(spot[2] / 2.0)
+        goal.pose.pose.orientation.w = math.cos(spot[2] / 2.0)
+        self._yield['move_timeout'] = CLEAR_OUT_TIMEOUT_S
+        self._yield['cleared_out'] = True
+        return (self._nav_client, goal,
+                f'clearing out to ({spot[0]:.2f}, {spot[1]:.2f}), '
+                f'{CLEAR_OUT_FROM_LEADER_M} m+ from it')
+
+    def _send_yield_move(self, client, goal):
+        """Send the yield's move; the yield goes to 'holding' once it ends."""
+        self._yield['phase'] = 'moving'
         if not client.wait_for_server(timeout_sec=1.0):
             self._yield['phase'] = 'holding'
             return
-        goal = action.Goal()
-        goal.target.x = YIELD_STEP_M
-        goal.speed = YIELD_SPEED
-        goal.time_allowance = Duration(seconds=YIELD_MOVE_TIMEOUT_S).to_msg()
         yield_state = self._yield
 
         def on_done(future):
@@ -399,14 +434,33 @@ class CollectorNode(ExecutorNode):
             handle.get_result_async().add_done_callback(on_done)
         client.send_goal_async(goal).add_done_callback(on_accept)
 
+    def _clear_out_spot(self):
+        """Return a clear (x, y, yaw) well away from the leader (CLEAR_OUT_*), or None."""
+        pose = self._get_robot_pose()
+        if pose is None or self._map is None or self._leader_pose is None:
+            return None
+        return choose_clear_spot(self._map[0], self._map[1], pose[:2], self._leader_pose,
+                                 CLEAR_OUT_FROM_LEADER_M, blocked=self._costmap_blocked)
+
     def _do_yielding(self, now):
         y = self._yield
         waited = (now - y['start']).nanoseconds / 1e9
-        if y['phase'] == 'moving' and waited < YIELD_MOVE_TIMEOUT_S + 1.0:
-            return   # the BackUp/DriveOnHeading action drives
+        if y['phase'] == 'moving' and waited < y['move_timeout'] + 1.0:
+            return   # the BackUp / DriveOnHeading / clear-out NavigateToPose drives
         d = self._leader_distance(now)
         clear = d is None or d[0] > YIELD_CLEAR_M
         status = self._leader_status(now)
+        if (status == STUCK and not y['cleared_out'] and d is not None
+                and d[0] < YIELD_TRIGGER_M):
+            # It turned STUCK while we held after a plain step (run-17 shape: the first
+            # yield saw it PARKED): upgrade to a proper clear-out now, not after the hold.
+            move = self._clear_out_move(now)
+            if move is not None:
+                self.get_logger().info(
+                    f'Leader now STUCK {d[0]:.2f} m away: {move[2]}.')
+                self._send_yield_move(move[0], move[1])
+                y['start'] = now
+                return
         if status != PARKED:
             y['parked_since'] = None
         elif y['parked_since'] is None:
@@ -426,11 +480,15 @@ class CollectorNode(ExecutorNode):
             y['handle'].cancel_goal_async()
         self._yield = None
         self._last_yield_end = now
-        if stuck:
+        if stuck or (y['cleared_out'] and status == STUCK):
             # Never plan past a stuck leader (see YIELD_STUCK_MAX_S): give the task back.
+            # Also after a clear-out that got us clear of a leader still stuck: resuming
+            # the same route took the collector straight back past it (harness: 28
+            # clear-outs in a row), so the leader re-offers the cube after its hold-off.
             if y['resume'] and self._task is not None:
                 self._finish_task(False, f'collector: gave way to a stuck leader '
-                                         f'({d[0]:.2f} m) for {waited:.0f}s')
+                                         f'({d[0]:.2f} m) for {waited:.0f}s' if d else
+                                         'collector: gave way to a stuck leader')
             else:
                 self._transition(Collector.IDLE, 'Yield over (leader still stuck).')
             return

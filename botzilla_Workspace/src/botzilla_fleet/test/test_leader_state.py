@@ -2,6 +2,7 @@ import math
 
 from botzilla_fleet.leader_state import (
     LeaderStateTracker, MOVING, PARKED, STILL_WITH_GOAL_S, STUCK, STUCK_HOLD_S,
+    STUCK_RELEASE_S,
 )
 
 
@@ -53,13 +54,44 @@ def test_recovery_then_escape_is_not_stuck():
     assert tr.state(t) == MOVING
 
 
-def test_stuck_expires_after_hold():
+def _states(tr, t0, t1, pose_at, dt=0.1, recoveries_at=None):
+    out, t = [], t0
+    while t <= t1 + 1e-9:
+        tr.pose(t, *pose_at(t))
+        if recoveries_at is not None:
+            tr.feedback(t, recoveries_at(t))
+        out.append(tr.state(t))
+        t += dt
+    return out
+
+
+def test_stuck_stays_through_the_gap_between_goals():
+    # run 17: the explorer cancels a stuck goal and sends the next a few seconds later;
+    # in between there is no goal, no recovery and no motion — still stuck, not PARKED
     tr = LeaderStateTracker()
-    _feed(tr, 0.0, 1.0, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 0)
-    _feed(tr, 1.1, 1.1, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 1)
-    # goal gone (no more feedback), leader sits still
-    t = _feed(tr, 1.2, 1.2 + STUCK_HOLD_S + 0.5, lambda t: (0.0, 0.0, 0.0))
-    assert tr.state(t) == PARKED
+    _states(tr, 0.0, 1.0, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 0)
+    _states(tr, 1.1, 1.1, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 1)
+    gap = _states(tr, 1.2, 1.2 + STUCK_HOLD_S + 3.0, lambda t: (0.0, 0.0, 0.0))
+    assert set(gap) == {STUCK}
+
+
+def test_stuck_released_after_quiet_spell():
+    tr = LeaderStateTracker()
+    _states(tr, 0.0, 1.0, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 0)
+    _states(tr, 1.1, 1.1, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 1)
+    end = 1.2 + STUCK_HOLD_S + STUCK_RELEASE_S + 1.0
+    states = _states(tr, 1.2, end, lambda t: (0.0, 0.0, 0.0))
+    assert states[-1] == PARKED
+
+
+def test_stuck_released_by_driving_away():
+    tr = LeaderStateTracker()
+    _states(tr, 0.0, 1.0, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 0)
+    _states(tr, 1.1, 1.1, lambda t: (0.0, 0.0, 0.0), recoveries_at=lambda t: 1)
+    # no goal now, but it drives 0.4 m off (e.g. the next goal led it out)
+    states = _states(tr, 1.2 + STUCK_HOLD_S, 3.2 + STUCK_HOLD_S,
+                     lambda t: (0.2 * (t - 1.2 - STUCK_HOLD_S), 0.0, 0.0))
+    assert states[-1] == MOVING
 
 
 def test_holding_a_goal_without_moving_is_stuck():

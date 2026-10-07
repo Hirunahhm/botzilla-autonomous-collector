@@ -56,3 +56,20 @@ def test_blocked_callback_moves_the_standoff():
                             blocked=lambda x, y: math.hypot(x - free[0], y - free[1]) < 0.3)
     assert moved is not None
     assert math.hypot(moved[0] - free[0], moved[1] - free[1]) >= 0.3
+
+
+def test_clear_spot_is_away_from_the_other_robot():
+    from botzilla_fleet.standoff import choose_clear_spot
+    data, info = room()
+    x, y, yaw = choose_clear_spot(data, info, (2.0, 2.0), (2.6, 2.0), min_from_other=1.4)
+    assert math.hypot(x - 2.6, y - 2.0) >= 1.4
+    assert x < 2.0                                   # on the far side from the other robot
+    assert abs(math.atan2(math.sin(yaw - math.pi), math.cos(yaw - math.pi))) < 0.6
+
+
+def test_clear_spot_respects_walls_and_blocked():
+    from botzilla_fleet.standoff import choose_clear_spot
+    data, info = room()
+    spot = choose_clear_spot(data, info, (0.5, 0.5), (1.1, 0.5), min_from_other=1.4,
+                             blocked=lambda x, y: y > 1.0)
+    assert spot is None or (spot[1] <= 1.0 and math.hypot(spot[0] - 1.1, spot[1] - 0.5) >= 1.4)

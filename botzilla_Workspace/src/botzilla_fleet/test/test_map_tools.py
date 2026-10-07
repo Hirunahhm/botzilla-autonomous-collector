@@ -87,3 +87,18 @@ def test_clear_shape_removes_marks_under_the_robot_only():
     assert at(1.0, 1.0) == 0 and at(1.2, 1.0) == 0
     # ...but not beyond the robot's own footprint.
     assert at(0.75, 1.0) > 0
+
+
+def test_soft_point_has_no_lethal_core():
+    from botzilla_fleet.map_tools import shapes_grid
+    data, ox, oy, w, h = shapes_grid([((1.0, 1.0, 0.0), None, 0.3, 40)], 0.05)
+    assert 30 < data.max() <= 40                 # soft, never lethal (100)
+    assert (data > 0).sum() > 50                 # a disc of soft cost around the point
+
+
+def test_soft_point_never_lowers_a_lethal_body():
+    from botzilla_fleet.map_tools import shapes_grid
+    data, ox, oy, w, h = shapes_grid([((1.0, 1.0, 0.0), 0.2, 0.0, 0),
+                                      ((1.0, 1.0, 0.0), None, 0.4, 40)], 0.05)
+    i, j = int((1.0 - ox) / 0.05), int((1.0 - oy) / 0.05)
+    assert data[j, i] == 100

@@ -350,7 +350,7 @@ cleanup() {
     echo "logs: $LOG_DIR"
 }
 # Everything this script starts, for pgrep-based checks and forced cleanup.
-LAUNCH_PATTERN="fast-discovery-server|fastdds discovery|ros2 launch botzilla|kobuki_base_node|kinect_bridge|rplidar_node|ekf_node|odom_covariance_relay|pointcloud_to_laserscan|robot_state_publisher|component_container|rtabmap|controller_server|planner_server|behavior_server|bt_navigator|velocity_smoother|lifecycle_manager|executor_node|frontier_explorer_node|mission_metrics_node|fleet_manager_node"
+LAUNCH_PATTERN="fast-discovery-server|fastdds discovery|ros2 launch botzilla|kobuki_base_node|kinect_bridge|rplidar_node|ekf_node|odom_covariance_relay|pointcloud_to_laserscan|robot_state_publisher|component_container|rtabmap|controller_server|planner_server|behavior_server|bt_navigator|velocity_smoother|lifecycle_manager|executor_node|frontier_explorer_node|mission_metrics_node|fleet_manager_node|fleet_scan_filter"
 # Ctrl+C must exit outright. With a bare `trap cleanup INT` the shell resumes the
 # interrupted `sleep` afterwards, the watch loop then notices the processes cleanup
 # just stopped, and reports them as an unexpected crash — alarming and untrue.
@@ -535,8 +535,20 @@ clear_line; ok "listening on 0.0.0.0:$DISCOVERY_PORT"
 
 # ── 2. hardware ──────────────────────────────────────────────────────────────
 next_step "hardware (Kobuki, Kinect, RPLIDAR, EKF)"
-start_bg "$LOG_DIR/hardware.log" ros2 launch botzilla_bringup hardware.launch.py
+HW_ARGS=()
+# Two-robot run: the sensors publish scan_raw / scan_camera_raw and fleet_scan_filter
+# republishes scan / scan_camera without the collector in them, so RTAB-Map does not
+# map it and the costmaps do not mark and inflate it (botzilla_fleet body_filter.py).
+[ -n "$FLEET_NS" ] && HW_ARGS+=("scan_topic:=scan_raw" "scan_camera_topic:=scan_camera_raw")
+start_bg "$LOG_DIR/hardware.log" ros2 launch botzilla_bringup hardware.launch.py "${HW_ARGS[@]}"
 wait_for_log "$LOG_DIR/hardware.log" "Gyro bias calibrated" 60 "Kobuki base + gyro calibrated"
+if [ -n "$FLEET_NS" ]; then
+    start_bg "$LOG_DIR/scan_filter.log" \
+        ros2 run botzilla_fleet fleet_scan_filter --ros-args \
+            -p use_sim_time:=false -p other:=collector -p "collector_ns:=$FLEET_NS"
+    wait_for_log "$LOG_DIR/scan_filter.log" "fleet_scan_filter: removing" 30 \
+        "scan filter up (scan_raw -> scan, collector removed)"
+fi
 
 # ── 3. SLAM ──────────────────────────────────────────────────────────────────
 next_step "RTAB-Map SLAM"

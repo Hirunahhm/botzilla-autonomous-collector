@@ -13,6 +13,9 @@ Starts, all in /<ns> with TF on /<ns>/tf:
        local             yolo_node on the Pi's CPU (collector alone, no leader)
        none              no detector (bring-up tests)
   5. collector_node — waits for tasks from the leader's fleet_manager_node
+  6. fleet_scan_filter (scan_filter:=true, the default) — the leader removed from this
+     robot's scans; the sensors publish scan_raw / scan_camera_raw and the filter
+     republishes scan / scan_camera (see botzilla_fleet body_filter.py)
 
 Everything reaches the leader over the shared DDS graph: the collector's processes use
 the leader's discovery server (run_collector.sh sets ROS_DISCOVERY_SERVER).
@@ -97,6 +100,7 @@ def _launch(context, *_args, **_kwargs):
     with open(os.path.join(nav_share, 'config', 'ekf_hardware.yaml')) as f:
         ekf_file = _write_yaml(namespaced(yaml.safe_load(f), ns), f'{ns}_ekf_')
 
+    scan_filter = arg('scan_filter').lower() in ('true', '1', 'yes')
     kobuki = _find_port(arg('serial_port'), KOBUKI_GLOBS, 'Kobuki')
     lidar = _find_port(arg('lidar_port'), LIDAR_GLOBS, 'RPLIDAR')
 
@@ -113,6 +117,8 @@ def _launch(context, *_args, **_kwargs):
             'depth_registered': 'true',
             # The collector carries the grabber arms (the leader no longer does).
             'arms': 'true',
+            'scan_topic': 'scan_raw' if scan_filter else 'scan',
+            'scan_camera_topic': 'scan_camera_raw' if scan_filter else 'scan_camera',
         }.items(),
     )
 
@@ -154,6 +160,12 @@ def _launch(context, *_args, **_kwargs):
         package='botzilla_fleet', executable='collector_node', name='collector_node',
         output='screen', parameters=[{'use_sim_time': False, 'robot_name': ns}],
     )]
+    if scan_filter:
+        mission.insert(0, Node(
+            package='botzilla_fleet', executable='fleet_scan_filter',
+            name='fleet_scan_filter', output='screen',
+            parameters=[{'use_sim_time': False, 'other': 'leader'}],
+        ))
     detector = arg('detector')
     if detector not in ('leader', 'local', 'none'):
         raise RuntimeError(f"detector must be leader, local or none (got '{detector}')")
@@ -174,7 +186,7 @@ def _launch(context, *_args, **_kwargs):
     return [
         LogInfo(msg=f'[collector] ns=/{ns} kobuki={kobuki} lidar={lidar} '
                     f'start=({arg("start_x")}, {arg("start_y")}, {arg("start_yaw")}) '
-                    f'detector={detector}'),
+                    f'detector={detector} scan_filter={scan_filter}'),
         LogInfo(msg=f'[collector] nav2 params: {nav2_file}'),
         GroupAction([
             PushRosNamespace(ns),
@@ -209,5 +221,8 @@ def generate_launch_description():
             'detector', default_value='leader',
             description="'leader' (YOLO on the leader's GPU), 'local' (YOLO on this CPU) "
                         "or 'none'"),
+        DeclareLaunchArgument(
+            'scan_filter', default_value='true',
+            description="remove the leader from this robot's scans (fleet_scan_filter)"),
         OpaqueFunction(function=_launch),
     ])
