@@ -43,6 +43,7 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 | 14 | 20261007-013717 | dfa4e60 | yes | 5 | 2 | 2 | 271, 499 | 16 / 33 / 55 / 839 |
 | 15 | 20261007-101042 | 7996c0e | yes | 2 | 0 | 1 | — | 0 / 24 / 48 / 720 |
 | 16 | 20261007-102125 | b21b2e1 | yes | 2 | 0 | 2 | — | 10 / 34 / 66 / 980 |
+| 17 | 20261007-173130 | 65ec1c0 | yes | 5 | 2 | 0 | 121, 366 | 0 / 19 / 29 / 441 |
 
 **Totals over runs 3–10, where the collector actually worked:** 60 tasks, 17 cubes delivered, 23 released short.
 **Runs 12–16:** 30 tasks, 4 delivered (7 counting run 12's three releases at HOME), 11 released short. Every run from 13 on lost most of its time to the two robots blocking each other.
@@ -54,6 +55,7 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 - **Run 5** is the second attempt. The first, `20261006-002604`, aborted at start-up when the leader's Nav2 bond timed out.
 - **Runs 11–16:** delivery times are measured from the leader's HOME latch, so they may run a few seconds later than the earlier rows (run 10 recomputed this way gives 84, 180).
 - **Run 15** was killed at 6.6 min and **run 16** at 6.4 min, both with the robots stuck together.
+- **Run 17** ran the full 10 min. From it on, the collector starts with a **1 m gap** to the leader's left (`--start 0.0 1.34 0.0`, centres 1.34 m apart) instead of 0.3 m, so its HOME is no longer next to the leader's start. 2 of its 5 tasks were handed back to the leader as "gave way to a stuck leader" (collector faults, not cube failures).
 
 Collector-side counters, per collector log:
 
@@ -75,8 +77,9 @@ Collector-side counters, per collector log:
 | 14 | collector-20261007-013717 | 5 | 2 | 2 | 4 | 2 | 0 | 0 | 0 |
 | 15 | collector-20261007-101042 | 2 | 0 | 1 | 4 | 16 | 37 | 4 | 0 |
 | 16 | collector-20261007-102126 | 2 | 0 | 2 | 0 | 13 | 15 | 0 | 2 |
+| 17 | collector-20261007-173254 | 2 | 2 | 0 | 0 | 8 | 14 | 0 | 0 |
 
-The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16.
+The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16, 11 in run 17.
 
 ## What each run found, and what changed after it
 
@@ -237,8 +240,28 @@ The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" 
    - Without a `leader_state` message (an older fleet manager) it falls back to the position-only guess.
 4. **Tested** with unit tests (`test_leader_state.py`, `test_cube_registry.py`) and four `fake_fleet.py` scenarios: the default slow turn (3/3 delivered), an orbiting leader (3/3), `LEADER_MODE=inspect` (the cube is held back until the spinning leader leaves, then delivered) and `LEADER_MODE=stuck` (the collector gives way, never plans past the stuck leader, and delivers both reachable cubes on the second attempt).
 
-## Still open after run 16
+### Run 17: 1 m gap, fixes after run 16
+- **Result:** 2 delivered, **0 released short** (both captures reached HOME), and the robots never wedged together. Cubes were held back near the leader 3 times (16 s, 84 s and 59 s). Only 3 cubes were confirmed in 10 min, because the leader was stuck for about half the run, in two spells:
+  1. **150–310 s, beside the idle collector.** The leader was at about (−0.6, 1.8), 0.75 m from the collector parked IDLE at its HOME (0, 1.34), with open floor around it. It started moving again at 313 s, 4 s after the collector drove off on a task. Backing off 0.3 m at a time did not get the collector out of the way.
+  2. **From about 451 s to the end, next to cube 3** (223 and 183 footprint hits a minute; the collector was 1.2 m+ away, then idle). The leader's centre was 0.25 m from the cube's estimate: its 0.22 m footprint and the 0.05 m half-width of the cube mark overlap by 2 cm, so every move was refused. Same family as run 9.
+- **Also:** the leader's state flipped STUCK → PARKED in the gap between the explorer cancelling a stuck goal and sending the next one, so the collector "planned past" twice seconds after the leader had been STUCK (201 s, 241 s); it re-yielded within about 2 s each time. RTAB-Map again mapped the parked collector into `/map` at its HOME.
 
-- **Robots already touching.** If the two do end up overlapping, every Nav2 move is refused for both, because each one's own footprint is inside the other's lethal mark. Escaping needs the fleet manager to stop drawing the other robot for the one that backs out (and, ideally, each robot's own sensor returns of the other filtered out).
-- **A carrying collector still never yields,** and the leader has no rule to give way to it.
-- **The leader's own LiDAR still maps the collector** into its `/map` and inflates it in its costmaps; only the collector's copy of the map is cleaned.
+## Fixes made after run 17
+
+Each is in `botzilla_fleet`; the pure logic is unit-tested (62 tests) and every rule has a `fake_fleet.py` scenario.
+
+1. **STUCK is sticky** (`leader_state.py`). Once STUCK, the leader stays STUCK until it has moved 0.25 m from where it got stuck, or 15 s pass with nothing stuck about it (`STUCK_RELEASE_S`).
+2. **No cube marks touching the leader** (`LEADER_STATIC_CLEAR_M`). In the leader's own grid, cube marks (and the drop zone) are not drawn within 0.35 m of its centre. The collector's mark is never relaxed like this: it moves, and the leader must not creep into it.
+3. **Clear-out instead of a 0.3 m step** (`collector_node.py`, `standoff.choose_clear_spot`). When the leader is STUCK within 0.9 m, an unladen collector drives (Nav2) to a clear spot at least 1.4 m from it, chosen on rings around itself. A yield that started as a plain step is upgraded the moment the leader turns STUCK. If the leader is still stuck once the collector is clear, it hands the task back rather than resume the same route past it. A STUCK leader also gets a wider soft halo (1.1 m) in the collector's grid, so its planner keeps out of the leader's recovery room when there is space.
+4. **Escape when touching** (`right_of_way.EscapeLatch`). While the collector's footprint overlaps the leader's mark, the leader's body is not drawn in the collector's grid (its halo still is), so Nav2 can move the collector off. It is drawn again once they are 0.10 m clear. Only the collector is released; the leader keeps the collector's mark. Logged as `escape` / `escape_over`.
+5. **The leader gives way to a carrying collector** (`right_of_way.GiveWay`). While the collector is CAPTURING, DELIVERING or DETACHING within 1.2 m, the fleet manager pauses the leader's exploration on `/exploration_enabled` (the same switch the executor uses), and resumes it once the collector is 1.6 m away or no longer carrying, after 30 s at most, with a 15 s cooldown. Logged as `leader_gives_way` / `leader_resumes`. The fleet manager re-enables exploration if it shuts down while it has the leader paused.
+6. **The leader's route is shared** (`right_of_way.path_ahead`). The next 1.5 m of the path the leader is following (DWB's `/received_global_plan`, not `/plan`, which also carries the explorer's candidate-frontier queries) is drawn in the collector's grid as soft cost, never lethal, while the leader is MOVING. The collector's planner then routes around where the leader is going, not just where it is.
+7. **Drop zone back on**, now that the collector's HOME is 1.34 m from the leader's start; never drawn within 0.35 m of the leader, so it cannot trap it as in run 15.
+8. **Each robot filtered out of the other's scans** (`fleet_scan_filter_node.py`, `body_filter.py`). In a two-robot run the LiDAR and the camera's virtual scan publish `scan_raw` / `scan_camera_raw` (new `scan_topic` / `scan_camera_topic` arguments in `hardware.launch.py`), and the filter republishes `scan` / `scan_camera` with returns on the other robot's body (+0.10 m) set to NaN, timestamps untouched. RTAB-Map, Nav2 and AMCL are unchanged. On the leader it is started by `run_full_mission.sh --fleet` (log `scan_filter.log`), on the collector by `collector.launch.py` (`scan_filter:=false` turns it off). If the other robot's pose is more than 1 s old, scans pass through unfiltered. The fleet layer is then the only place each robot sees the other: exact, current and uninflated, and the leader no longer maps the collector. **Not yet checked on hardware**: in RViz, the other robot should vanish from `/scan` and the costmaps' obstacle layers and appear only in the fleet layer; the filter logs its removal counts every 30 s. With the filter on, the collision monitor (off by default) would not see the other robot either.
+9. **Harness.** `fake_fleet.py` now: accepts cancels like Nav2 (a cancelled route used to keep driving, which hid chase failures); keeps a just-captured cube visible as a blind-spot detection for 1 s; routes its fake Nav2 around the leader (standing in for the planner and halos); obeys `/exploration_enabled`; publishes the leader's route. New `LEADER_MODE=stuckhome` (run 17's first stall: the leader stuck 0.4 m beside the collector's HOME for 60 s). Results, 200 s each: stuckhome 3/3, orbit 3/3, turn 3/3, inspect 1/1, stuck 1 delivered + 1 held back beside the permanently stuck leader (by design).
+
+## Still open after run 17
+
+- **Throughput.** Only 3 cubes were confirmed in 10 min; the leader lost about half the run being stuck. Run 18 will show how much of that the fixes above recover.
+- **A route that has to pass close to a stuck leader** (a narrow arena) will keep handing the task back; the collector delivers nothing until the leader recovers. Safe, but slow.
+- **The leader's control loop** misses its 20 Hz rate about as often as in earlier runs (median about 16 Hz when it does), with two YOLO containers on the Jetson.
