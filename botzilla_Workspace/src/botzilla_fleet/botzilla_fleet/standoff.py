@@ -108,23 +108,66 @@ def fallback_standoff(cube_xy, robot_xy, dist=STANDOFF_DISTANCES_M[0]):
 # Clear-out: where the collector goes to get out of a stuck leader's way (collector_node
 # CLEAR_OUT_*). Rings around the collector itself; every candidate must be at least
 # min_from_other from the leader, clear in the map and the live costmap, and reachable on
-# a straight line (a short hop, so the line is a fair proxy for Nav2's path). The nearest
-# wins; at that distance from the leader it is on the far side anyway.
+# a straight line (a short hop, so the line is a fair proxy for Nav2's path) that never
+# comes closer to the leader than PASS_OTHER_M, or than the collector already is when it
+# is nearer than that. The nearest ring wins.
+# It must also keep ROUTE_CLEAR_M off the leader's route ahead (avoid_points). In run 21
+# the spot "on the far side of the leader" was AHEAD of it on its route: the leader drove
+# on, caught the collector up, got stuck again, and chased it into a corner across 9
+# clear-outs. Off the route is where the leader is not going. If nothing qualifies, it
+# keeps off only the nearest ROUTE_NEAR_POINTS of the route (the next ~1.5 m, the part
+# that matters first), and only then ignores the route rather than not moving at all.
 CLEAR_OUT_RINGS_M = (0.6, 0.9, 1.2, 1.5)
+ROUTE_CLEAR_M = 0.7
+ROUTE_NEAR_POINTS = 10          # fleet_manager sends a point every 0.15 m
+PASS_OTHER_M = 0.45
+
+
+def _segment_distance(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
 def choose_clear_spot(data, grid_info, robot_xy, other_xy, min_from_other,
                       rings=CLEAR_OUT_RINGS_M, clearance_m=CLEARANCE_M,
-                      n_angles=N_ANGLES, blocked=None):
-    """Return (x, y, yaw) at least min_from_other from other_xy, facing away; or None."""
+                      n_angles=N_ANGLES, blocked=None, avoid_points=(),
+                      avoid_m=ROUTE_CLEAR_M):
+    """Return (x, y, yaw) at least min_from_other from other_xy, facing away; or None.
+
+    avoid_points: the leader's route ahead; spots within avoid_m of it are not used
+    unless no other spot qualifies.
+    """
+    avoid_points = list(avoid_points)
+    tiers = [avoid_points]
+    if len(avoid_points) > ROUTE_NEAR_POINTS:
+        tiers.append(avoid_points[:ROUTE_NEAR_POINTS])
+    if avoid_points:
+        tiers.append([])
+    for avoid in tiers:
+        spot = _clear_spot(data, grid_info, robot_xy, other_xy, min_from_other, rings,
+                           clearance_m, n_angles, blocked, avoid, avoid_m)
+        if spot is not None:
+            return spot
+    return None
+
+
+def _clear_spot(data, grid_info, robot_xy, other_xy, min_from_other, rings, clearance_m,
+                n_angles, blocked, avoid_points, avoid_m):
     rx, ry = robot_xy
     ox, oy = other_xy
+    pass_m = min(PASS_OTHER_M, math.hypot(rx - ox, ry - oy)) - 1e-6
     for ring in rings:
         best = None
         for k in range(n_angles):
             a = 2 * math.pi * k / n_angles
             x, y = rx + ring * math.cos(a), ry + ring * math.sin(a)
             if math.hypot(x - ox, y - oy) < min_from_other:
+                continue
+            if any(math.hypot(x - px, y - py) < avoid_m for px, py in avoid_points):
+                continue
+            if _segment_distance(ox, oy, rx, ry, x, y) < pass_m:
                 continue
             if not _clear(data, grid_info, x, y, clearance_m):
                 continue

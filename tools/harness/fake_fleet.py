@@ -65,7 +65,14 @@ ORBIT_R, ORBIT_W = 0.9, 0.12
 # In every mode the leader stops while /exploration_enabled is False (the fleet manager
 # pausing it for a carrying collector) and publishes its route ahead on
 # /received_global_plan (path sharing).
+# LEADER_MODE=chase: run 21's chase. The leader drives CHASE_PTS (0.15 m/s), a route
+# straight through the collector's HOME, and is blocked (Nav2 recovering, no motion)
+# whenever the collector is within CHASE_BLOCK_M of it. A clear-out that lands ahead of
+# it on its route is caught up with and blocked again; one off the route lets it pass.
 LEADER_MODE = os.environ.get('LEADER_MODE', 'turn')
+CHASE_START = (4.2, 0.6)
+CHASE_PTS = [(0.3, 0.6), (0.3, 3.5), (4.5, 3.5)]
+CHASE_BLOCK_M = 0.55
 STUCKHOME_S = 60.0
 # The fake Nav2 routes around the leader when a straight line would pass this close
 # (FakeFleet.route), standing in for the planner and the leader's halo.
@@ -111,6 +118,12 @@ class FakeFleet(Node):
         self.lxy = INSPECT_POSE if LEADER_MODE == 'inspect' else LEADER_POSE
         if LEADER_MODE == 'stuckhome':
             self.lxy = (COLLECTOR_START[0], COLLECTOR_START[1] + 0.4)
+        if LEADER_MODE == 'chase':
+            self.lxy = CHASE_START
+        self.chase_i = 0
+        self.chase_blocked = False
+        self.blocked_s = 0.0
+        self.blocked_spells = 0
         self.recoveries = 0
         self.enabled = True
         self.paused_s = 0.0
@@ -161,7 +174,9 @@ class FakeFleet(Node):
             carried = self.carried
         self.truth_pub.publish(String(data=f'cubes {s} carried={carried}'))
         self.get_logger().info(f'truth: cubes {s} carried={carried} '
-                               f'leader_paused={self.paused_s:.0f}s')
+                               f'leader_paused={self.paused_s:.0f}s '
+                               f'leader_blocked={self.blocked_s:.0f}s in {self.blocked_spells} '
+                               f'spells, route point {self.chase_i}/{len(CHASE_PTS)}')
 
     def cmd_cb(self, msg):
         with self.lock:
@@ -192,13 +207,20 @@ class FakeFleet(Node):
             pts = [(LEADER_POSE[0] + ORBIT_R * math.cos(orbit + k * 0.05),
                     LEADER_POSE[1] + ORBIT_R * math.sin(orbit + k * 0.05)) for k in range(45)]
         else:
-            target, _ = self.leader_goal(el)
-            if target is None:
-                return
-            d = math.hypot(target[0] - lx, target[1] - ly)
-            n = max(2, int(d / 0.05))
-            pts = [(lx + (target[0] - lx) * k / n, ly + (target[1] - ly) * k / n)
-                   for k in range(n + 1)]
+            if LEADER_MODE == 'chase':
+                corners = [(lx, ly)] + CHASE_PTS[self.chase_i:]
+                if len(corners) < 2:
+                    return
+            else:
+                target, _ = self.leader_goal(el)
+                if target is None:
+                    return
+                corners = [(lx, ly), target]
+            pts = []
+            for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+                n = max(2, int(math.hypot(bx - ax, by - ay) / 0.05))
+                pts += [(ax + (bx - ax) * k / n, ay + (by - ay) * k / n) for k in range(n)]
+            pts.append(corners[-1])
         msg = Path()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -212,6 +234,10 @@ class FakeFleet(Node):
 
     def leader_goal(self, el):
         """(target xy or None, turn rate) for the scripted LEADER_MODE at elapsed el."""
+        if LEADER_MODE == 'chase':
+            if self.chase_blocked or self.chase_i >= len(CHASE_PTS):
+                return None, 0.0
+            return CHASE_PTS[self.chase_i], 0.0
         if LEADER_MODE == 'stuckhome':
             return (None, 0.0) if el < STUCKHOME_S else (LEADER_POSE, LEADER_W)
         if LEADER_MODE == 'inspect':
@@ -222,7 +248,12 @@ class FakeFleet(Node):
 
     def pub_leader_feedback(self):
         el = time.monotonic() - self.t0
-        if LEADER_MODE == 'stuckhome':
+        if LEADER_MODE == 'chase':
+            if self.chase_i >= len(CHASE_PTS):
+                return                                      # route done: no goal
+            if self.chase_blocked:
+                self.recoveries += 1                        # recovering while blocked
+        elif LEADER_MODE == 'stuckhome':
             if el >= STUCKHOME_S:
                 return
             self.recoveries = int(el)                       # one recovery a second
@@ -241,6 +272,18 @@ class FakeFleet(Node):
 
     def step(self):
         dt = 0.05
+        if LEADER_MODE == 'chase':
+            with self.lock:
+                lx, ly = self.lxy
+                blocked = math.hypot(lx - self.x, ly - self.y) < CHASE_BLOCK_M
+                if blocked and not self.chase_blocked:
+                    self.blocked_spells += 1
+                self.chase_blocked = blocked
+                if blocked:
+                    self.blocked_s += dt
+                if (self.chase_i < len(CHASE_PTS) and math.hypot(
+                        lx - CHASE_PTS[self.chase_i][0], ly - CHASE_PTS[self.chase_i][1]) < 0.02):
+                    self.chase_i += 1
         target, w = self.leader_goal(time.monotonic() - self.t0)
         if not self.enabled:                 # paused by the fleet manager: hold still
             target, w = None, 0.0
@@ -252,7 +295,7 @@ class FakeFleet(Node):
                 dx, dy = target[0] - self.lxy[0], target[1] - self.lxy[1]
                 d = math.hypot(dx, dy)
                 if d > 0.01:
-                    step = min(d, 0.2 * dt)
+                    step = min(d, (0.15 if LEADER_MODE == 'chase' else 0.2) * dt)
                     self.lxy = (self.lxy[0] + step * dx / d, self.lxy[1] + step * dy / d)
                     self.lyaw = math.atan2(dy, dx)
                 else:

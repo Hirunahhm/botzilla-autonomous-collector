@@ -44,6 +44,10 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 | 15 | 20261007-101042 | 7996c0e | yes | 2 | 0 | 1 | — | 0 / 24 / 48 / 720 |
 | 16 | 20261007-102125 | b21b2e1 | yes | 2 | 0 | 2 | — | 10 / 34 / 66 / 980 |
 | 17 | 20261007-173130 | 65ec1c0 | yes | 5 | 2 | 0 | 121, 366 | 0 / 19 / 29 / 441 |
+| 18 | 20261007-183105 | 11bc3fb | yes | 1 | 0 | 0 | — | 9 / 1 / 0 / 2 |
+| 19 | 20261007-183841 | 11bc3fb | yes | 1 | 0 | 0 | — | 0 / 0 / 0 / 9 |
+| 20 | 20261007-184342 | 11bc3fb | yes | 6 | 4 | 0 | 100, 246, 333, 481 | 3 / 0 / 0 / 7 |
+| 21 | 20261007-200547 | 11bc3fb | yes | 8 | 2 | 1 | 417, 575 | 6 / 11 / 22 / 357 |
 
 **Totals over runs 3–10, where the collector actually worked:** 60 tasks, 17 cubes delivered, 23 released short.
 **Runs 12–16:** 30 tasks, 4 delivered (7 counting run 12's three releases at HOME), 11 released short. Every run from 13 on lost most of its time to the two robots blocking each other.
@@ -55,6 +59,7 @@ Counts below come from the logs: the leader's `run_logs/<run>/fleet.log` and `na
 - **Run 5** is the second attempt. The first, `20261006-002604`, aborted at start-up when the leader's Nav2 bond timed out.
 - **Runs 11–16:** delivery times are measured from the leader's HOME latch, so they may run a few seconds later than the earlier rows (run 10 recomputed this way gives 84, 180).
 - **Run 15** was killed at 6.6 min and **run 16** at 6.4 min, both with the robots stuck together.
+- **Runs 18 and 19** were stopped after 2.3 and 1.6 min because the collector looked like it was moving too fast (see below); neither got as far as a delivery. **Run 20** and **run 21** ran the full 10 min. Run 21's one release short came as the run ended, mid-delivery, so the leader logged no result for it; its 8 tasks include 3 handed back to a stuck leader.
 - **Run 17** ran the full 10 min. From it on, the collector starts with a **1 m gap** to the leader's left (`--start 0.0 1.34 0.0`, centres 1.34 m apart) instead of 0.3 m, so its HOME is no longer next to the leader's start. 2 of its 5 tasks were handed back to the leader as "gave way to a stuck leader" (collector faults, not cube failures).
 
 Collector-side counters, per collector log:
@@ -78,8 +83,12 @@ Collector-side counters, per collector log:
 | 15 | collector-20261007-101042 | 2 | 0 | 1 | 4 | 16 | 37 | 4 | 0 |
 | 16 | collector-20261007-102126 | 2 | 0 | 2 | 0 | 13 | 15 | 0 | 2 |
 | 17 | collector-20261007-173254 | 2 | 2 | 0 | 0 | 8 | 14 | 0 | 0 |
+| 18 | collector-20261007-183232 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 19 | collector-20261007-183945 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 |
+| 20 | collector-20261007-184445 | 4 | 4 | 0 | 0 | 1 | 1 | 0 | 0 |
+| 21 | collector-20261007-200721 | 3 | 2 | 1 | 1 | 1 | 4 | 0 | 2 |
 
-The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16, 11 in run 17.
+The HOME re-send retry did not exist before run 5. From run 11, "HOME re-sends" counts the stuck-delivery retries ("holding still 3s and trying again"). Yields (leader right of way, from run 14): 2 in run 14, 14 in run 15, 13 in run 16, 11 in run 17, 2 in run 19, 2 in run 20 and 12 in run 21 (of which clear-outs for a STUCK leader: 1 in run 19, 2 in run 20, 9 in run 21). Collector logs before run 18 have no clear-outs: they did not exist yet.
 
 ## What each run found, and what changed after it
 
@@ -260,8 +269,49 @@ Each is in `botzilla_fleet`; the pure logic is unit-tested (62 tests) and every 
 8. **Each robot filtered out of the other's scans** (`fleet_scan_filter_node.py`, `body_filter.py`). In a two-robot run the LiDAR and the camera's virtual scan publish `scan_raw` / `scan_camera_raw` (new `scan_topic` / `scan_camera_topic` arguments in `hardware.launch.py`), and the filter republishes `scan` / `scan_camera` with returns on the other robot's body (+0.10 m) set to NaN, timestamps untouched. RTAB-Map, Nav2 and AMCL are unchanged. On the leader it is started by `run_full_mission.sh --fleet` (log `scan_filter.log`), on the collector by `collector.launch.py` (`scan_filter:=false` turns it off). If the other robot's pose is more than 1 s old, scans pass through unfiltered. The fleet layer is then the only place each robot sees the other: exact, current and uninflated, and the leader no longer maps the collector. **Not yet checked on hardware**: in RViz, the other robot should vanish from `/scan` and the costmaps' obstacle layers and appear only in the fleet layer; the filter logs its removal counts every 30 s. With the filter on, the collision monitor (off by default) would not see the other robot either.
 9. **Harness.** `fake_fleet.py` now: accepts cancels like Nav2 (a cancelled route used to keep driving, which hid chase failures); keeps a just-captured cube visible as a blind-spot detection for 1 s; routes its fake Nav2 around the leader (standing in for the planner and halos); obeys `/exploration_enabled`; publishes the leader's route. New `LEADER_MODE=stuckhome` (run 17's first stall: the leader stuck 0.4 m beside the collector's HOME for 60 s). Results, 200 s each: stuckhome 3/3, orbit 3/3, turn 3/3, inspect 1/1, stuck 1 delivered + 1 held back beside the permanently stuck leader (by design).
 
-## Still open after run 17
+## Runs 18–20 (commit 11bc3fb: the fixes after run 17)
 
-- **Throughput.** Only 3 cubes were confirmed in 10 min; the leader lost about half the run being stuck. Run 18 will show how much of that the fixes above recover.
+Same setup as run 17: 1 m gap, `--start 0.0 1.34 0.0`. From run 18 the Pi resolved the Jetson's `.local` name unreliably, so the collector was started with `--leader 10.156.103.192`.
+
+### Run 18 (stopped at 2.3 min)
+- **Stopped** because the collector seemed to move very fast. It had taken task 1 and was in TARGETING (turning to centre the cube) for 37 s without centring: the detections jumped across the frame (x = −0.84, +0.53, +0.95), possibly two cubes in view.
+- **Scan filter:** the leader removed 254 collector returns from `/scan` in its first full 30 s window. The collector's first window, during start-up, counted only 87 scans (about 3 Hz) passed through unfiltered (no pose yet), which raised the question below.
+
+### Run 19 (stopped at 1.6 min)
+- **Stopped** for the same reason, while the collector was yielding to the leader (0.89 m) on its first task.
+- **Measured on the Pi for the first time** (a load sampler every 5 s and a scan-rate counter):
+  - **The collector's LiDAR is not slow:** 10.1 Hz on `scan_raw` and 10.2 Hz on `scan` after the filter, once running. The 3–4 Hz in runs 18 and 19 was the C1 spinning up.
+  - **The Pi is heavily loaded:** load 0.04 idle, 5.3 one minute after the collector started (4 cores), 23% CPU idle, 60 °C, never throttled, about 2.4 GB free. Top users: `kinect_bridge` 45%, the Kobuki driver 36%, `collector_node` 36%, Nav2's controller 27%, the LiDAR driver 18%, the depth pipeline 18%. The scan filter was not among them.
+
+### Run 20: 4 delivered, the leader barely stuck
+- **Result:** 6 tasks, 4 delivered (at 100, 246, 333 and 481 s), 0 released short; the last two tasks (548 s and 558 s) failed as "Cube lost while approaching" (not yet investigated). 5 cubes confirmed in 10 min (run 17: 3).
+- **The leader was hardly stuck:** 7 footprint hits, 0 back-ups and 0 refused spins all run (run 17: 441 / 19 / 29; run 16: 980 / 34 / 66). No task was handed back to a stuck leader (run 17: 2).
+- **The coordination rules all fired:** the leader paused 4 times for a carrying collector (`leader_gives_way`), the collector cleared out twice for a STUCK leader, there was 1 escape from overlapping, 1 cube was held back near the leader, and the collector never planned past a stuck leader.
+- **Scan filter** worked on both robots (for example, 450 collector returns removed from the leader's `/scan` in one 30 s window).
+- **Pi load** (120 samples): median **6.3**, peak 8.4 on 4 cores; at most 61.5 °C and never throttled.
+- **Collector speed:** a probe logged, every second, the largest commanded speed (`/bz2/cmd_vel`) and wheel-odometry speed. Commands never exceeded **0.20 m/s and 0.40 rad/s**, so nothing upstream (Nav2, the collector's own chase, the yield moves) asked for speed. The odometry maxima reached 0.74 m/s and 1.42 rad/s, but that twist is the driver's raw per-packet `d/dt`, which its own comments describe as spiky, and this run looked normal; so those maxima are noise, not evidence of overshoot.
+- One run; runs vary a lot (compare runs 10 and 16), so this needs repeating before it counts as the new normal.
+
+### Run 21: the leader chased the collector
+- **Setup:** same as run 20 (commit 11bc3fb), after a Pi reboot; NoMachine killed on the Jetson first.
+- **Result:** 8 tasks, 2 delivered (417 s, 575 s), 1 released short as the run ended, 3 handed back as "gave way to a stuck leader" (at 0.38, 0.29 and 0.42 m), 2 other failures ("route to the standoff failed", "cube not seen from the standoff"). Leader footprint hits 357, mostly 20:09–20:11 (about 130 a minute) and 20:14 (62).
+- **The chase.** From about 20:09 to 20:11 the leader followed the collector across the arena: each clear-out put the collector on the far side of the leader's *position*, which was ahead of it on its own route, so the leader drove on, caught up, and got stuck again: leader (0.82, 1.24) → (−0.15, 1.61) → (−0.57, 0.51) → (−1.38, −1.09) while the collector cleared out to (−0.25, 1.46) → (−0.74, 0.60) → (−0.97, −0.50) → (−1.86, −1.85), into a corner; 9 clear-outs in all.
+- **The escape stayed on while the collector drove.** The escape latch (leader not drawn while overlapping) stayed on after the collector had switched back to GOING; with the scan filter also removing the leader from its scans, the collector had no sign of the leader at all, and drove back to 0.32 m from it (20:10:31).
+- **"Leader parked; planning past it" fired 4 times** right after STUCK spells (the sticky STUCK releases after 15 s with no recoveries, and the leader's explorer can sit that long between goals while still boxed in), and each time the collector drove straight back towards it.
+- **Speed (new probe, from odometry position change):** the collector's real speed never exceeded what it was commanded: at most 0.23 m/s (commanded 0.20) and 0.52 rad/s (commanded 0.40); 0 seconds over 0.25 m/s or 0.6 rad/s. No "too fast" this run.
+- **Pi load:** median 6.5, peak 9.4 on 4 cores; at most 64.2 °C, never throttled.
+
+## Fixes made after run 21
+
+1. **Clear-out keeps off the leader's route** (`standoff.choose_clear_spot`, `fleet_manager_node` `ROUTE_FOR_COLLECTOR_M`). The fleet manager sends the next 4 m of the leader's route (DWB's `received_global_plan`, in every state, STUCK included: that is where it will go once free) to the collector on `/bz2/fleet/leader_route`. Clear-out spots must be at least 0.7 m off it; if none qualifies, it keeps off only the next ~1.5 m of route, and only then ignores the route. The straight line to the spot may not come closer to the leader than the collector already is (or 0.45 m).
+2. **Escape only while YIELDING** (`right_of_way.EscapeLatch`). The leader's body is left out of the collector's grid only while the collector is moving off for it; in every other state it is drawn, so a GOING collector always sees it.
+3. **No "planning past" after a clear-out** (`collector_node`). Once the collector has cleared out for a STUCK leader, that yield ends only with the leader clear (over 1.3 m), or by handing the task back ("gave way to a STUCK/PARKED leader"), never by "leader parked".
+4. **Tested:** 67 unit tests; harness scenario `LEADER_MODE=chase` (the leader drives a route through the collector's HOME and is blocked while the collector is within 0.55 m). Against the previous code (11bc3fb): leader blocked 18 s, 3 clear-outs, each further along its route. With the fixes: blocked about 1 s, 2 clear-outs, and the leader completes its route. The other five scenarios are unchanged: stuckhome 3/3, orbit 3/3, turn 3/3, inspect 1/1, stuck 1 delivered + 1 held back.
+
+## Still open after run 21
+
+- **Pi load** (median 6.3–6.5 on 4 cores in runs 20 and 21). `kinect_bridge` publishes 30 fps of full-resolution RGB and depth while the collector uses about 8 fps (remote YOLO) and 5 Hz (local costmap); the depth cloud is 307,000 points a frame. Proposed: Kinect at 12–15 fps on the collector, a decimated depth cloud, higher priority for the Kobuki driver, a lighter Nav2 controller on the collector.
+- **The collector moving "too fast" (runs 18 and 19).** Not reproduced since: in run 21 real speed never exceeded the command. The position-based probe stays in place for the next runs.
+- **"Cube lost while approaching"** ended the last two tasks of run 20.
 - **A route that has to pass close to a stuck leader** (a narrow arena) will keep handing the task back; the collector delivers nothing until the leader recovers. Safe, but slow.
 - **The leader's control loop** misses its 20 Hz rate about as often as in earlier runs (median about 16 Hz when it does), with two YOLO containers on the Jetson.

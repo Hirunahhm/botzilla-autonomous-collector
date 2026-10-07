@@ -13,8 +13,8 @@ manager is the only node that sees both robots, so these live with it:
                     overlap, so the collector can move off. Once a robot's footprint is
                     inside the other's lethal mark every Nav2 move is refused, even moving
                     away (run 16: 13 back-ups refused, "Collision Ahead", for 6 minutes).
-                    Only the COLLECTOR is released: the leader keeps the collector's mark,
-                    so it cannot creep further in.
+                    Only the COLLECTOR is released, and only while it is YIELDING: the
+                    leader keeps the collector's mark, so it cannot creep further in.
   GiveWay           pause the leader's exploration while a collector carrying a cube is
                     close. A carrying collector must not reverse (it would drop the cube)
                     and never yields, and the leader had no rule for that meeting either;
@@ -56,6 +56,7 @@ def path_ahead(path_xy, robot_xy, length_m=PATH_AHEAD_M, step_m=PATH_STEP_M):
 # ---- EscapeLatch ----------------------------------------------------------------------
 # Separation beyond the overlap distance needed before the leader is drawn again.
 ESCAPE_CLEAR_MARGIN_M = 0.10
+YIELDING_STATE = 'YIELDING'     # collector_node Collector.YIELDING
 
 
 def footprint_distance(point_xy, pose, rect):
@@ -71,14 +72,22 @@ def footprint_distance(point_xy, pose, rect):
 
 
 class EscapeLatch:
-    """Decide whether to draw the leader in the collector's grid."""
+    """Decide whether to draw the leader in the collector's grid.
+
+    Only while the collector is YIELDING (moving off for the leader). In run 21 the latch
+    stayed on after the collector had switched back to GOING; with fleet_scan_filter also
+    removing the leader from its scans, the collector then had no sign of the leader at
+    all and drove back to 0.32 m from it. Any other state draws the leader, always.
+    """
 
     def __init__(self):
         self.escaping = False
 
-    def update(self, leader_xy, collector_pose, collector_footprint, leader_radius):
-        """Return True to draw the leader; False while the collector is inside its mark."""
-        if leader_xy is None or collector_pose is None:
+    def update(self, leader_xy, collector_pose, collector_footprint, leader_radius,
+               collector_state=YIELDING_STATE):
+        """Return True to draw the leader; False while a yielding collector is inside it."""
+        if (leader_xy is None or collector_pose is None
+                or collector_state != YIELDING_STATE):
             self.escaping = False
             return True
         d = footprint_distance(leader_xy, collector_pose, collector_footprint)

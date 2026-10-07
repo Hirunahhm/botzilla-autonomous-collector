@@ -46,9 +46,9 @@ rtabmap → /map ────────┼────────────
   - An unladen collector yields (YIELDING state) by backing off 0.3 m when a MOVING or STUCK leader is within 0.9 m, or any leader within 0.6 m.
   - It resumes once the leader is 1.3 m away or has been PARKED for 4 s. It never plans past a STUCK leader: after holding clear it gives the task back instead.
   - The fleet manager doesn't assign a cube while the leader is within 1 m of it, unless the leader has been PARKED there for 30 s.
-  - For a STUCK leader the collector does not just back off: it drives to a clear spot at least 1.4 m away (clear-out), and if the leader is still stuck it hands the task back instead of resuming past it.
+  - For a STUCK leader the collector does not just back off: it drives to a clear spot at least 1.4 m away and 0.7 m off the leader's route ahead (`/bz2/fleet/leader_route`), and if the leader is still stuck or near once it gets there, it hands the task back instead of resuming past it.
   - The other way round, the fleet manager pauses the leader's exploration (`/exploration_enabled`) while a collector carrying a cube is within 1.2 m.
-  - While the collector's footprint overlaps the leader's mark, the leader's body is not drawn in the collector's grid, so it can move off (escape).
+  - While the collector is YIELDING with its footprint overlapping the leader's mark, the leader's body is not drawn in the collector's grid, so it can move off (escape). In every other state the leader is always drawn.
   - The next 1.5 m of the leader's route (`/received_global_plan`) is drawn in the collector's grid as soft cost.
   - The rules live in `right_of_way.py` and `leader_state.py`. Why, and the runs behind each number: `multi_robot_runs.md`, runs 13–17.
 - **Each robot is filtered out of the other's scans** (`fleet_scan_filter_node.py`). In two-robot runs the sensors publish `scan_raw` / `scan_camera_raw` and the filter republishes `scan` / `scan_camera` without the other robot's body, so it appears only in the fleet layer and RTAB-Map no longer maps the collector.

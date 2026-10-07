@@ -177,6 +177,10 @@ ROBOT_POSE_MAX_AGE_S = 1.5
 PATH_COST_RADIUS_M = 0.35
 PATH_COST_VALUE = 35
 PLAN_MAX_AGE_S = 3.0
+# The same route, longer and in every state (STUCK included: that is where it will go once
+# free), sent to the collector on /<ns>/fleet/leader_route, so its clear-out keeps off it
+# (standoff.choose_clear_spot ROUTE_CLEAR_M; run 21's chase).
+ROUTE_FOR_COLLECTOR_M = 4.0
 RIGHT_OF_WAY_HZ = 2.0
 
 # The collector's map: the leader's /map republished on /<ns>/fleet/map with a disc of
@@ -258,6 +262,8 @@ class FleetManagerNode(Node):
             PoseStamped, f'/{self._ns}/fleet/leader_pose', 10)
         self._leader_state_pub = self.create_publisher(
             String, f'/{self._ns}/fleet/leader_state', 10)
+        self._leader_route_pub = self.create_publisher(
+            Path, f'/{self._ns}/fleet/leader_route', 10)
         # The leader's Nav2 feedback (whoever sent the goal: frontier explorer or
         # executor) — its number_of_recoveries is how leader_state.py sees it stuck.
         self.create_subscription(
@@ -542,7 +548,8 @@ class FleetManagerNode(Node):
         # right_of_way.EscapeLatch; the halo always), the leader's route ahead as soft
         # cost, and the cubes other than its target.
         draw_body = self._escape.update(leader[:2] if leader is not None else None,
-                                        collector, COLLECTOR_NAV_FOOTPRINT, LEADER_SHAPE)
+                                        collector, COLLECTOR_NAV_FOOTPRINT, LEADER_SHAPE,
+                                        s.state if s is not None else '')
         if self._escape.escaping != self._escaping_logged:
             self._escaping_logged = self._escape.escaping
             self._event('escape' if self._escape.escaping else 'escape_over',
@@ -554,14 +561,30 @@ class FleetManagerNode(Node):
             leader_marks = [(leader, LEADER_SHAPE if draw_body else None,
                              halo, ROBOT_HALO_VALUE)]
         route = []
-        if (leader is not None and self._plan is not None
-                and self._now_s() - self._plan[0] < PLAN_MAX_AGE_S
-                and self._leader_state_last == MOVING):
+        fresh_plan = (leader is not None and self._plan is not None
+                      and self._now_s() - self._plan[0] < PLAN_MAX_AGE_S)
+        if fresh_plan and self._leader_state_last == MOVING:
             route = [((x, y, 0.0), None, PATH_COST_RADIUS_M, PATH_COST_VALUE)
                      for x, y in path_ahead(self._plan[1], leader[:2])]
+        self._publish_leader_route(
+            path_ahead(self._plan[1], leader[:2], length_m=ROUTE_FOR_COLLECTOR_M)
+            if fresh_plan else [])
         self._collector_grid_pub.publish(self._to_msg(clear_shape(
             shapes_grid(leader_marks + route + cubes_but_target, res),
             res, collector, COLLECTOR_NAV_FOOTPRINT)))
+
+    def _publish_leader_route(self, points):
+        """Send the leader's route ahead to the collector (empty = none known)."""
+        msg = Path()
+        msg.header.frame_id = MAP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for x, y in points:
+            p = PoseStamped()
+            p.header = msg.header
+            p.pose.position.x, p.pose.position.y = x, y
+            p.pose.orientation.w = 1.0
+            msg.poses.append(p)
+        self._leader_route_pub.publish(msg)
 
     def _to_msg(self, raster):
         """Wrap a (data, ox, oy, w, h) raster, or None, as an OccupancyGrid in the map."""

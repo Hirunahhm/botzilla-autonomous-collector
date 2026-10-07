@@ -28,6 +28,15 @@ def test_footprint_distance_rotated():
     assert abs(footprint_distance((1.0, 1.5), pose, RECT) - 0.14) < 1e-9
 
 
+def test_escape_only_while_yielding():
+    # run 21: a latch left on while the collector drove (GOING) hid the leader from it
+    latch = EscapeLatch()
+    pose = (0.0, 0.0, 0.0)
+    assert latch.update((0.0, 0.40), pose, RECT, 0.27, 'YIELDING') is False
+    assert latch.update((0.0, 0.40), pose, RECT, 0.27, 'GOING') is True
+    assert latch.escaping is False
+
+
 def test_escape_latch_hysteresis():
     latch = EscapeLatch()
     pose = (0.0, 0.0, 0.0)

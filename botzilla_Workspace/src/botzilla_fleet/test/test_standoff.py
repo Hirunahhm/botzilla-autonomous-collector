@@ -73,3 +73,40 @@ def test_clear_spot_respects_walls_and_blocked():
     spot = choose_clear_spot(data, info, (0.5, 0.5), (1.1, 0.5), min_from_other=1.4,
                              blocked=lambda x, y: y > 1.0)
     assert spot is None or (spot[1] <= 1.0 and math.hypot(spot[0] - 1.1, spot[1] - 0.5) >= 1.4)
+
+
+def test_clear_spot_keeps_off_the_leaders_route():
+    # run 21: the leader at (2.0, 2.0) heading west (-x) through the collector at (1.5, 2.0);
+    # "far side of the leader" was straight ahead of it on its route
+    from botzilla_fleet.standoff import choose_clear_spot
+    data, info = room()
+    route = [(2.0 - 0.15 * k, 2.0) for k in range(17)]          # 2.5 m west
+    x, y, _ = choose_clear_spot(data, info, (1.5, 2.0), (2.0, 2.0), min_from_other=1.4,
+                                avoid_points=route)
+    assert min(math.hypot(x - px, y - py) for px, py in route) >= 0.7
+    assert math.hypot(x - 2.0, y - 2.0) >= 1.4
+
+
+def test_clear_spot_never_passes_through_the_leader():
+    from botzilla_fleet.standoff import choose_clear_spot
+    data, info = room()
+    x, y, _ = choose_clear_spot(data, info, (2.0, 2.0), (2.3, 2.0), min_from_other=1.4)
+    assert x < 2.3                                       # not across the leader at (2.3, 2)
+
+
+def test_clear_spot_ignores_route_rather_than_staying_put():
+    from botzilla_fleet.standoff import choose_clear_spot
+    data, info = room()
+    everywhere = [(0.1 * i, 0.1 * j) for i in range(41) for j in range(41)]
+    assert choose_clear_spot(data, info, (2.0, 2.0), (2.6, 2.0), min_from_other=1.4,
+                             avoid_points=everywhere) is not None
+
+
+def test_clear_spot_keeps_off_the_near_route_when_the_whole_route_is_impossible():
+    from botzilla_fleet.standoff import choose_clear_spot
+    data, info = room()
+    near = [(2.0 - 0.15 * k, 2.0) for k in range(10)]           # next 1.5 m: west
+    far = [(0.1 * i, 0.1 * j) for i in range(41) for j in range(41)]   # then everywhere
+    x, y, _ = choose_clear_spot(data, info, (1.5, 2.0), (2.0, 2.0), min_from_other=1.4,
+                                avoid_points=near + far)
+    assert min(math.hypot(x - px, y - py) for px, py in near) >= 0.7

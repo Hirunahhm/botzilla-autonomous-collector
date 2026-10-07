@@ -38,7 +38,7 @@ from botzilla_navigation.executor_node import (
 )
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import BackUp, DriveOnHeading, NavigateToPose
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 import numpy as np
 import rclpy
 from rclpy.action import ActionClient
@@ -121,7 +121,9 @@ YIELD_STUCK_CLEAR_S = 5.0
 # leader only got going again 4 s after the collector finally drove off on a task (a
 # 2.7 min stall). So it drives (Nav2) to a clear spot at least CLEAR_OUT_FROM_LEADER_M
 # from the leader (standoff.choose_clear_spot), and only falls back to the step if there
-# is none. This is the collector's half of deadlock resolution.
+# is none. This is the collector's half of deadlock resolution. The spot also keeps off
+# the leader's route ahead (fleet/leader_route): in run 21 every clear-out landed ahead
+# of the leader on its own route, and it chased the collector into a corner.
 CLEAR_OUT_FROM_LEADER_M = 1.4
 CLEAR_OUT_TIMEOUT_S = 25.0
 LEADER_MOVING_M = 0.08             # moved this far in LEADER_MOVING_WINDOW_S = moving
@@ -192,6 +194,13 @@ class CollectorNode(ExecutorNode):
         self._last_yield_end = None
         self.create_subscription(PoseStamped, 'fleet/leader_pose', self._leader_cb, 10)
         self.create_subscription(String, 'fleet/leader_state', self._leader_state_cb, 10)
+        # The leader's route ahead, so a clear-out keeps off it (see CLEAR_OUT_*).
+        self._leader_route = None         # (ros Time, [(x, y), ...])
+        self.create_subscription(
+            Path, 'fleet/leader_route',
+            lambda m: setattr(self, '_leader_route', (
+                self.get_clock().now(),
+                [(p.pose.position.x, p.pose.position.y) for p in m.poses])), 10)
         self._backup_client = ActionClient(self, BackUp, 'backup')
         self._drive_client = ActionClient(self, DriveOnHeading, 'drive_on_heading')
         self._fleet_status_pub = self.create_publisher(CollectorStatus, 'fleet/status', 10)
@@ -439,8 +448,14 @@ class CollectorNode(ExecutorNode):
         pose = self._get_robot_pose()
         if pose is None or self._map is None or self._leader_pose is None:
             return None
+        route = ()
+        if self._leader_route is not None and (
+                self.get_clock().now() - self._leader_route[0]).nanoseconds / 1e9 \
+                <= LEADER_POSE_MAX_AGE_S:
+            route = self._leader_route[1]
         return choose_clear_spot(self._map[0], self._map[1], pose[:2], self._leader_pose,
-                                 CLEAR_OUT_FROM_LEADER_M, blocked=self._costmap_blocked)
+                                 CLEAR_OUT_FROM_LEADER_M, blocked=self._costmap_blocked,
+                                 avoid_points=route)
 
     def _do_yielding(self, now):
         y = self._yield
@@ -465,7 +480,12 @@ class CollectorNode(ExecutorNode):
             y['parked_since'] = None
         elif y['parked_since'] is None:
             y['parked_since'] = now
-        parked = (y['parked_since'] is not None
+        # Never "parked, plan past it" after a clear-out: the leader was STUCK beside us
+        # moments ago, and a PARKED reading then is it between goals, still boxed in. In
+        # run 21 that exit fired 4 times right after STUCK spells and the collector drove
+        # straight back to 0.3-0.4 m from it. After a clear-out the yield ends only once
+        # the leader is clear, or by handing the task back.
+        parked = (not y['cleared_out'] and y['parked_since'] is not None
                   and (now - y['parked_since']).nanoseconds / 1e9 > YIELD_PARKED_S)
         stuck = not clear and status == STUCK
         limit = YIELD_MAX_S
@@ -480,17 +500,17 @@ class CollectorNode(ExecutorNode):
             y['handle'].cancel_goal_async()
         self._yield = None
         self._last_yield_end = now
-        if stuck or (y['cleared_out'] and status == STUCK):
+        if stuck or (y['cleared_out'] and (status == STUCK or not clear)):
             # Never plan past a stuck leader (see YIELD_STUCK_MAX_S): give the task back.
             # Also after a clear-out that got us clear of a leader still stuck: resuming
             # the same route took the collector straight back past it (harness: 28
             # clear-outs in a row), so the leader re-offers the cube after its hold-off.
             if y['resume'] and self._task is not None:
-                self._finish_task(False, f'collector: gave way to a stuck leader '
+                self._finish_task(False, f'collector: gave way to a {status} leader '
                                          f'({d[0]:.2f} m) for {waited:.0f}s' if d else
-                                         'collector: gave way to a stuck leader')
+                                         f'collector: gave way to a {status} leader')
             else:
-                self._transition(Collector.IDLE, 'Yield over (leader still stuck).')
+                self._transition(Collector.IDLE, 'Yield over (leader still stuck or near).')
             return
         reason = ('leader clear' if clear else 'leader parked; planning past it' if parked
                   else f'gave way for {YIELD_MAX_S:.0f}s')
