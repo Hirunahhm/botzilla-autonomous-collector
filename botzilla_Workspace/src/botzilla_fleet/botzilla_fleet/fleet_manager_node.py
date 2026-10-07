@@ -119,6 +119,12 @@ LEADER_NAV_FOOTPRINT = 0.22
 # HOME, and a 0.45 m lethal disc came within ~0.2 m of its own body at the start; its
 # first goals kept failing against it (241 footprint hits in one minute).
 DROP_ZONE_RADIUS_M = 0.25
+# Off (2026-10-07, run 15): the collector's HOME is only 0.64 m from the leader's own
+# start, so whenever the leader came back near its start the drop-zone disc pinned it
+# against the collector — both robots stuck. Its job is covered without it: the collector
+# yields to the leader while unladen, and with a cube in hand a stop within
+# DELIVERY_CLOSE_ENOUGH_M of HOME counts as delivered.
+DROP_ZONE_ENABLED = False
 
 # NO soft halos in the LEADER's grid — bodies only (the collector, the cube cores, the
 # drop zone), lethal. The leader has right of way (collector_node YIELD_TRIGGER_M), so it
@@ -389,7 +395,7 @@ class FleetManagerNode(Node):
         # Empty grids are published too: the layer then repaints, and so clears, wherever
         # the previous grid was.
         drop_zone = []
-        if s is not None and s.home_set:
+        if DROP_ZONE_ENABLED and s is not None and s.home_set:
             drop_zone = [((s.home_x, s.home_y, 0.0), DROP_ZONE_RADIUS_M, 0.0, 0)]
         res = OBSTACLE_GRID_RES
         self._leader_grid_pub.publish(self._to_msg(clear_shape(
