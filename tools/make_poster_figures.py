@@ -4,17 +4,21 @@ make_poster_figures.py — the charts, lab map and diagrams for the A0 exhibitio
 
     python3 tools/make_poster_figures.py            # -> poster/figures/*.png
 
-Each figure is sized to its placeholder on the Canva poster (3179 x 4494 canvas units)
-and rendered at 3x for print. Numbers come from full_cycle_runs.md /
-extended_abstract_v3.tex (Phase 1) and multi_robot_runs.md (Phase 2); the lab map from
-run 27's logs (run_logs/20261007-221643).
+Each figure is sized to its slot on the Canva poster (3179 x 4494 canvas units for
+A0, so 1 unit prints as 0.75 pt) and rendered at 3x for print. Every label is at least
+32 units (24 pt printed): the first version converted units to points with a stray
+0.72 factor and printed its figure text at 9-17 pt.
+
+Numbers: Phase 1 from full_cycle_runs.md / extended_abstract_v3.tex (one 15-min
+hardware run per configuration); Phase 2 from the logs listed in RUNS below (the same
+runs as multi_robot_runs.md); the lab map from run 27 (run_logs/20261007-221643).
 
 Colours are the poster's: teal = Phase 1, orange = Phase 2, grey = context. Checked for
 colour-vision deficiency (OKLab, Machado 2009): every pair >= 13.5 under protan /
 deutan / tritan simulation, >= 23 for normal vision.
 """
 import json
-import math
+import re
 from pathlib import Path
 
 import matplotlib
@@ -25,13 +29,26 @@ import numpy as np  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / 'poster' / 'figures'
-RUN27 = REPO / 'run_logs' / '20261007-221643'
+LOGS = REPO / 'run_logs'
+RUN27 = LOGS / '20261007-221643'
 
 TEAL, ORANGE, GREY = '#1F6F7A', '#C2621B', '#A7B4BF'
 INK, INK2, GRID, NAVY = '#1E2A36', '#5B6B7A', '#E3E8ED', '#042034'
 SCALE = 3            # image px per Canva canvas unit
 DPI = 300
-PT = 0.72 * SCALE * 72 / DPI   # points per Canva canvas unit (so 42 units = poster body text)
+PT = SCALE * 72 / DPI   # figure points per canvas unit (prints as 0.75 pt on A0)
+
+# Two-robot test runs (multi_robot_runs.md): run number -> leader log dir. Run 22 was
+# cancelled before any data.
+RUNS = {1: '20261005-184223', 2: '20261005-212043', 3: '20261005-214048',
+        4: '20261005-221125', 5: '20261006-002941', 6: '20261006-005735',
+        7: '20261006-181824', 8: '20261006-183558', 9: '20261006-190324',
+        10: '20261006-224929', 11: '20261006-232154', 12: '20261007-004945',
+        13: '20261007-010955', 14: '20261007-013717', 15: '20261007-101042',
+        16: '20261007-102125', 17: '20261007-173130', 18: '20261007-183105',
+        19: '20261007-183841', 20: '20261007-184342', 21: '20261007-200547',
+        23: '20261007-210202', 24: '20261007-211701', 25: '20261007-212525',
+        26: '20261007-213304', 27: '20261007-221643'}
 
 plt.rcParams.update({
     'font.family': 'Lato', 'text.color': INK, 'axes.labelcolor': INK2,
@@ -45,7 +62,7 @@ def fig_for(w_units, h_units):
 
 
 def fs(units):
-    """Font size in points for a size in Canva canvas units."""
+    """Font size in figure points for a size in Canva canvas units."""
     return units * PT
 
 
@@ -56,85 +73,95 @@ def save(fig, name):
     print('wrote', OUT / name)
 
 
-# ── Phase 1: coverage AUC by inspection method (placeholder 1448 x 400) ─────────────────
+def leader_blocked_share(run_dir):
+    """Share of a run (HOME latch to end) in which the leader's controller had no safe
+    move: seconds with at least one DWB "ObstacleFootprint/Trajectory Hits Obstacle"
+    rejection (it logs up to ~14 a second while blocked, so raw counts overstate)."""
+    home = None
+    for line in open(run_dir / 'executor.log', errors='replace'):
+        if 'HOME latched' in line:
+            home = float(re.search(r'\[(\d{10}\.\d+)\]', line).group(1))
+            break
+    secs, last = set(), None
+    for line in open(run_dir / 'nav2.log', errors='replace'):
+        m = re.search(r'\[(\d{10}\.\d+)\]', line)
+        if not m:
+            continue
+        t = float(m.group(1))
+        last = t
+        if 'Hits Obstacle' in line or 'ObstacleFootprint' in line:
+            if t >= home:
+                secs.add(int(t))
+    return len(secs) / (last - home)
+
+
+# ── Phase 1: coverage AUC by inspection method (slot 1448 x 340) ─────────────────────────
 def coverage_chart():
-    rows = [  # (label, AUC %, ours?)  region order, 15-min full runs F3/F11/F10/F9, F7
-        ('Viewpoints + turn range (ours)', 36.4, True),
+    rows = [  # (label, AUC %, ours?)  region search order, runs F3/F11/F10/F9, and F7
+        ('Turn-range viewpoints', 36.4, True),
         ('Spin grid', 31.5, False),
         ('One look per stop', 29.6, False),
         ('Lawnmower rows', 23.0, False),
-        ('HEATS-style baseline', 21.1, False),
+        ('HEATS-style', 21.1, False),
     ]
-    fig = fig_for(1448, 400)
-    ax = fig.add_axes([0.30, 0.10, 0.66, 0.70])
+    fig = fig_for(1448, 340)
+    ax = fig.add_axes([0.335, 0.02, 0.58, 0.80])
     y = np.arange(len(rows))[::-1]
     for yi, (label, v, ours) in zip(y, rows):
-        ax.barh(yi, v, height=0.62, color=TEAL if ours else GREY, edgecolor='white',
+        ax.barh(yi, v, height=0.68, color=TEAL if ours else GREY, edgecolor='white',
                 linewidth=2)
-        ax.text(v + 0.6, yi, f'{v:.1f}%', va='center', fontsize=fs(34),
+        ax.text(v + 0.6, yi, f'{v:.1f}%', va='center', fontsize=fs(38),
                 fontweight='bold' if ours else 'normal', color=INK)
-    ax.set_yticks(y, [r[0] for r in rows], fontsize=fs(32))
+    ax.set_yticks(y, [r[0] for r in rows], fontsize=fs(38))
     for t, (_, _, ours) in zip(ax.get_yticklabels(), rows):
         t.set_color(INK if ours else INK2)
         t.set_fontweight('bold' if ours else 'normal')
-    ax.set_xlim(0, 40)
-    ax.set_xticks([0, 10, 20, 30, 40], ['0', '10', '20', '30', '40%'], fontsize=fs(26))
+    ax.set_xlim(0, 41)
+    ax.set_xticks([])
     ax.tick_params(length=0)
-    ax.grid(axis='x', color=GRID, linewidth=1.5)
-    ax.set_axisbelow(True)
     for sp in ax.spines.values():
         sp.set_visible(False)
-    fig.text(0.02, 0.90, 'Floor coverage by inspection method', fontsize=fs(38),
+    fig.text(0.01, 0.88, 'Floor coverage by inspection method (AUC)', fontsize=fs(44),
              fontweight='bold', color=NAVY)
-    fig.text(0.02, 0.83, 'area under the floor-seen curve, 15-min runs, higher is better',
-             fontsize=fs(26), color=INK2)
     save(fig, 'phase1_coverage_by_method.png')
 
 
-# ── Phase 2: leader stuck per run (placeholder 1448 x 270) ──────────────────────────────
-def leader_stuck_chart():
-    hits = {1: 33, 2: 8, 3: 42, 4: 42, 5: 1081, 6: 626, 7: 706, 8: 564, 9: 1018, 10: 399,
-            11: 8, 12: 1144, 13: 1607, 14: 839, 15: 720, 16: 980, 17: 441, 18: 2, 19: 9,
-            20: 7, 21: 357, 23: 139, 24: 26, 25: 5, 26: 2, 27: 130}
-    runs = list(hits)
-    fig = fig_for(1448, 270)
-    ax = fig.add_axes([0.075, 0.19, 0.91, 0.60])
-    x = np.arange(len(runs))
-    first_coord = runs.index(17)
-    ax.axvspan(first_coord - 0.5, len(runs) - 0.5, color='#FBEBDD', zorder=0)
-    ax.bar(x, [hits[r] for r in runs], width=0.72,
-           color=[ORANGE if r >= 17 else GREY for r in runs], edgecolor='white',
-           linewidth=1.5, zorder=2)
-    ax.set_xticks(x, [str(r) for r in runs], fontsize=fs(22))
-    ax.set_xlim(-0.6, len(runs) - 0.4)
-    ax.set_ylim(0, 1750)
-    ax.set_yticks([0, 500, 1000, 1500], ['0', '500', '1000', '1500'], fontsize=fs(22))
+# ── Phase 2: share of each run the leader was blocked (slot 1448 x 300) ─────────────────
+def leader_blocked_chart():
+    share = {r: 100 * leader_blocked_share(LOGS / d) for r, d in RUNS.items()}
+    fig = fig_for(1448, 300)
+    ax = fig.add_axes([0.075, 0.18, 0.915, 0.60])
+    ax.axvspan(16.5, 27.6, color='#FBEBDD', zorder=0)
+    for r, v in share.items():
+        ax.bar(r, v, width=0.72, color=ORANGE if r >= 17 else GREY, edgecolor='white',
+               linewidth=1.5, zorder=2)
+    ax.set_xlim(0.4, 27.6)
+    ax.set_ylim(0, 40)
+    ax.set_xticks([1, 5, 10, 15, 20, 25], ['1', '5', '10', '15', '20', '25'],
+                  fontsize=fs(34))
+    ax.set_yticks([0, 10, 20, 30, 40], ['0', '10', '20', '30', '40%'], fontsize=fs(34))
     ax.tick_params(length=0)
     ax.grid(axis='y', color=GRID, linewidth=1.2, zorder=1)
     for sp in ax.spines.values():
         sp.set_visible(False)
-    ax.text(first_coord - 0.3, 1660, 'coordination rules added', fontsize=fs(26),
-            fontweight='bold', color=ORANGE, va='top')
-    fig.text(0.075, 0.90, 'Leader stuck per test run', fontsize=fs(34),
-             fontweight='bold', color=NAVY)
-    fig.text(0.36, 0.90, '(Nav2 footprint-collision events; runs 15–16, 18–19, 24–26 '
-             'stopped early)', fontsize=fs(22), color=INK2)
-    save(fig, 'phase2_leader_stuck_per_run.png')
+    ax.text(17.0, 38.5, 'coordination rules', fontsize=fs(36), fontweight='bold',
+            color=ORANGE, va='top')
+    fig.text(0.075, 0.875, 'Time the leader was blocked, per test run',
+             fontsize=fs(42), fontweight='bold', color=NAVY)
+    save(fig, 'phase2_leader_blocked_per_run.png')
+    return share
 
 
-# ── Lab map from run 27 (placeholder 760 x 350) ─────────────────────────────────────────
+# ── Lab map from run 27 (slot 900 x 360) ────────────────────────────────────────────────
 def lab_map():
     z = np.load(RUN27 / 'map_final.npz')
     m, s = z['map'], z['swept']
     ox, oy, res = float(z['origin_x']), float(z['origin_y']), float(z['resolution'])
     img = np.ones(m.shape + (3,))
-    unknown = m < 0
-    img[unknown] = matplotlib.colors.to_rgb('#EEF1F4')
-    img[(m == 0)] = (1, 1, 1)
+    img[m < 0] = matplotlib.colors.to_rgb('#EEF1F4')
     img[(s > 0) & (m == 0)] = matplotlib.colors.to_rgb('#CDE4E7')   # camera has seen it
     img[m >= 65] = matplotlib.colors.to_rgb(INK)
 
-    start = None
     xs, ys = [], []
     for line in open(RUN27 / 'metrics.jsonl'):
         r = json.loads(line)
@@ -153,6 +180,8 @@ def lab_map():
         elif e['event'] == 'result' and e['result'] == 'collected':
             delivered.add(e['id'])
 
+    # Crop to the walls (a stray long scan ray would stretch the frame) and rotate 90 deg
+    # clockwise so the map is landscape: a map point (x, y) is drawn at (y, -x).
     walls = np.argwhere(m >= 65)
     (j0, i0), (j1, i1) = np.percentile(walls, 0.5, axis=0), np.percentile(walls, 99.5, axis=0)
     pad = 8
@@ -162,81 +191,78 @@ def lab_map():
     x0, x1 = ox + i0 * res, ox + (i1 + 1) * res
     y0, y1 = oy + j0 * res, oy + (j1 + 1) * res
 
-    # Rotate 90 deg clockwise: a map point (x, y) is drawn at (y, -x). Rows of `crop` run
-    # along y (origin lower); np.rot90(k=1) on the lower-origin image gives exactly that.
     def rot(x, y):
         return y, -x
-    rimg = np.rot90(crop, k=1)
     extent = [y0, y1, -x1, -x0]
 
-    fig = fig_for(760, 350)
-    ax = fig.add_axes([0.0, 0.0, 0.62, 1.0])
-    ax.imshow(rimg, origin='lower', extent=extent, interpolation='nearest')
+    fig = fig_for(900, 360)
+    fig.text(0.012, 0.93, 'Lab map, run 27', fontsize=fs(40), fontweight='bold',
+             color=NAVY, va='top')
+    ax = fig.add_axes([0.0, 0.0, 0.50, 0.80])
+    ax.imshow(np.rot90(crop, k=1), origin='lower', extent=extent, interpolation='nearest')
     px, py = rot(np.array(xs), np.array(ys))
-    ax.plot(px, py, color=NAVY, linewidth=1.6, alpha=0.75, label='leader path')
+    ax.plot(px, py, color=NAVY, linewidth=1.6, alpha=0.75)
     for cid, (cx, cy) in cubes.items():
         got = cid in delivered
-        ax.plot(*rot(cx, cy), 's', markersize=13,
+        ax.plot(*rot(cx, cy), 's', markersize=11,
                 markerfacecolor=ORANGE if got else 'white',
-                markeredgecolor=ORANGE, markeredgewidth=3)
-    ax.plot(*rot(0, 0), '*', markersize=26, color=TEAL, markeredgecolor='white',
-            markeredgewidth=1.5)
+                markeredgecolor=ORANGE, markeredgewidth=2.5)
+    ax.plot(*rot(0, 0), '*', markersize=22, color=TEAL, markeredgecolor='white',
+            markeredgewidth=1.2)
     if chome:
-        ax.plot(*rot(*chome), 'D', markersize=15, color=ORANGE, markeredgecolor='white',
-                markeredgewidth=1.5)
+        ax.plot(*rot(*chome), 'D', markersize=12, color=ORANGE, markeredgecolor='white',
+                markeredgewidth=1.2)
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
     ax.set_aspect('equal')
     ax.axis('off')
-    # Legend on the right, text in ink with the marks beside it.
-    lx = fig.add_axes([0.63, 0.05, 0.36, 0.9])
+    lx = fig.add_axes([0.52, 0.0, 0.48, 1.0])
     lx.axis('off')
     lx.set_xlim(0, 1)
     lx.set_ylim(0, 1)
     items = [
-        ('patch', '#CDE4E7', 'floor the camera has seen'),
+        ('patch', '#CDE4E7', 'camera-seen floor'),
         ('line', NAVY, 'leader path'),
         ('*', TEAL, 'leader start'),
         ('D', ORANGE, 'collector HOME'),
         ('sfill', ORANGE, 'cube delivered'),
-        ('shollow', ORANGE, 'cube found, not delivered'),
+        ('shollow', ORANGE, 'cube not delivered'),
     ]
     for k, (kind, col, text) in enumerate(items):
-        yy = 0.92 - k * 0.165
+        yy = 0.90 - k * 0.158
         if kind == 'patch':
-            lx.add_patch(FancyBboxPatch((0.02, yy - 0.04), 0.09, 0.08,
+            lx.add_patch(FancyBboxPatch((0.02, yy - 0.045), 0.08, 0.09,
                                         boxstyle='round,pad=0,rounding_size=0.01',
                                         color=col))
         elif kind == 'line':
-            lx.plot([0.02, 0.11], [yy, yy], color=col, linewidth=2.5)
+            lx.plot([0.02, 0.10], [yy, yy], color=col, linewidth=2.5)
         elif kind.startswith('s'):
-            lx.plot(0.065, yy, 's', markersize=12,
+            lx.plot(0.06, yy, 's', markersize=11,
                     markerfacecolor=col if kind == 'sfill' else 'white',
-                    markeredgecolor=col, markeredgewidth=3)
+                    markeredgecolor=col, markeredgewidth=2.5)
         else:
-            lx.plot(0.065, yy, kind, markersize=20 if kind == '*' else 13, color=col)
-        lx.text(0.16, yy, text, va='center', fontsize=fs(26), color=INK)
+            lx.plot(0.06, yy, kind, markersize=18 if kind == '*' else 11, color=col)
+        lx.text(0.14, yy, text, va='center', fontsize=fs(32), color=INK)
     save(fig, 'lab_map_run27.png')
 
 
-# ── Phase 1 diagram: one look vs viewpoint with turn range vs rows (1448 x 300) ────────
+# ── Phase 1 diagram: one look vs viewpoint with turn range vs rows (1448 x 250) ────────
 def phase1_diagram():
-    fig = fig_for(1448, 300)
-    titles = ['One look covers about 0.5 m²', 'Viewpoint: stop and turn through a range',
-              'Lawnmower rows: drive past everything']
+    fig = fig_for(1448, 250)
+    titles = ['One look: about 0.5 m²', 'Turn-range viewpoint', 'Lawnmower rows']
     for k in range(3):
-        ax = fig.add_axes([0.01 + k * 0.335, 0.02, 0.31, 0.78])
+        ax = fig.add_axes([0.01 + k * 0.335, 0.0, 0.31, 0.74])
         ax.set_xlim(-1.4, 1.4)
         ax.set_ylim(-0.45, 1.25)
         ax.set_aspect('equal')
         ax.axis('off')
-        fig.text(0.01 + k * 0.335 + 0.155, 0.88, titles[k], ha='center',
-                 fontsize=fs(30), fontweight='bold', color=NAVY)
+        fig.text(0.01 + k * 0.335 + 0.155, 0.84, titles[k], ha='center',
+                 fontsize=fs(40), fontweight='bold', color=NAVY)
         if k == 0:
-            ax.add_patch(Wedge((0, 0), 1.0, 90 - 28.5, 90 + 28.5, width=0.5,
+            ax.add_patch(Wedge((-0.35, 0), 1.0, 90 - 28.5, 90 + 28.5, width=0.5,
                                color=TEAL, alpha=0.85))
-            ax.add_patch(Circle((0, 0), 0.17, color=NAVY))
-            ax.text(0.62, 0.55, '0.5–1.0 m\n57°', fontsize=fs(26), color=INK2,
+            ax.add_patch(Circle((-0.35, 0), 0.17, color=NAVY))
+            ax.text(0.30, 0.62, '0.5–1.0 m\n57° cone', fontsize=fs(34), color=INK2,
                     va='center')
         elif k == 1:
             for a in range(-60, 61, 30):
@@ -261,46 +287,173 @@ def phase1_diagram():
     save(fig, 'phase1_inspection_diagram.png')
 
 
-# ── Phase 2 system diagram (1448 x 300) ─────────────────────────────────────────────────
-def phase2_diagram():
-    fig = fig_for(1448, 300)
+# ── System architecture: both robots and the link between them (slot 2936 x 400) ──────
+def architecture_diagram():
+    W, H = 2936, 400
+    fig = fig_for(W, H)
     ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_xlim(0, 1448)
-    ax.set_ylim(0, 300)
+    ax.set_xlim(-24, W + 24)   # Canva zooms placed images ~1%; keep the borders clear of it
+    ax.set_ylim(-3, H + 3)
     ax.axis('off')
 
-    def box(x, w, colour, title, lines):
-        ax.add_patch(FancyBboxPatch((x, 22), w, 256, boxstyle='round,pad=0,rounding_size=22',
+    def container(x, w, colour, title):
+        ax.add_patch(FancyBboxPatch((x, 4), w, H - 8, boxstyle='round,pad=0,rounding_size=24',
                                     facecolor='white', edgecolor=colour, linewidth=4))
-        ax.add_patch(FancyBboxPatch((x, 210), w, 68, boxstyle='round,pad=0,rounding_size=22',
+        ax.add_patch(FancyBboxPatch((x, H - 72), w, 68,
+                                    boxstyle='round,pad=0,rounding_size=24',
                                     facecolor=colour, edgecolor=colour, linewidth=4))
-        ax.text(x + w / 2, 244, title, ha='center', va='center', fontsize=fs(34),
+        ax.text(x + w / 2, H - 38, title, ha='center', va='center', fontsize=fs(40),
                 fontweight='bold', color='white')
-        for k, ln in enumerate(lines):
-            ax.text(x + 24, 178 - k * 38, ln, va='center', fontsize=fs(27), color=INK)
 
-    box(16, 470, TEAL, 'Leader · Jetson Orin Nano',
-        ['maps the room (RTAB-Map SLAM)', 'searches (Phase 1 method)',
-         'YOLO for both robots (GPU)', 'assigns cubes, sets right of way'])
-    box(962, 470, ORANGE, 'Collector · Raspberry Pi 5',
-        ['localises in the leader\'s map', 'drives to the cube, grabs it',
-         'delivers it HOME', 'steps aside for the leader'])
+    def block(cx, cy, text, colour, w):
+        ax.add_patch(FancyBboxPatch((cx - w / 2, cy - 56), w, 112,
+                                    boxstyle='round,pad=0,rounding_size=14',
+                                    facecolor='#F3F6F8', edgecolor=colour, linewidth=2.5))
+        ax.text(cx, cy, text, ha='center', va='center', fontsize=fs(30), color=INK,
+                linespacing=1.1)
 
-    arrows = [  # (y, direction, label)
-        (205, +1, 'cube task'),
-        (150, -1, 'status + position'),
-        (95, -1, 'camera frames (JPEG)'),
-        (40, +1, 'detections back'),
-    ]
-    for y, d, label in arrows:
-        x0, x1 = (500, 948) if d > 0 else (948, 500)
-        ax.add_patch(FancyArrowPatch((x0, y), (x1, y),
-                                     arrowstyle='-|>,head_length=14,head_width=8',
-                                     color=NAVY, linewidth=3))
-        ax.text(724, y + 13, label, ha='center', va='bottom', fontsize=fs(25), color=INK)
-    ax.text(724, 268, 'Wi-Fi · ROS 2', ha='center', va='center', fontsize=fs(28),
+    def arrow(x0, y0, x1, y1, colour=NAVY):
+        ax.add_patch(FancyArrowPatch((x0, y0), (x1, y1),
+                                     arrowstyle='-|>,head_length=10,head_width=6',
+                                     color=colour, linewidth=2.5, shrinkA=0, shrinkB=0))
+
+    top, bot = 245, 88
+    # Leader: five columns 210 wide.
+    container(4, 1240, TEAL, 'Leader · Jetson Orin Nano')
+    lw = 210
+    lx = [129 + i * 247.5 for i in range(5)]
+    for x, t in zip(lx, ['RPLIDAR\nC1', 'RTAB-Map\nSLAM', 'Search\nplanner', 'Nav2',
+                         'Kobuki\nbase']):
+        block(x, bot, t, TEAL, lw)
+    block(lx[0], top, 'Kinect\nRGB-D', TEAL, lw)
+    block(lx[1], top, 'YOLOv8\n(GPU)', TEAL, lw)
+    block(lx[4], top, 'Fleet\nmanager', TEAL, lw)
+    for i in range(4):
+        arrow(lx[i] + lw / 2, bot, lx[i + 1] - lw / 2, bot)
+    arrow(lx[0] + lw / 2, top, lx[1] - lw / 2, top)
+    arrow(lx[1] + lw / 2, top, lx[4] - lw / 2, top)
+    ax.text((lx[1] + lx[4]) / 2, top + 10, 'cube detections', ha='center', va='bottom',
+            fontsize=fs(30), color=INK2)
+
+    # Collector: four columns 240 wide.
+    container(1692, 1240, ORANGE, 'Collector · Raspberry Pi 5')
+    cw = 240
+    cx = [1832 + i * 320 for i in range(4)]
+    for x, t in zip(cx, ['RPLIDAR\nC1', "AMCL in the\nleader's map", 'Nav2', 'Kobuki\nbase']):
+        block(x, bot, t, ORANGE, cw)
+    block(cx[0], top, 'Kinect\nRGB-D', ORANGE, cw)
+    block(cx[2], top, 'Collector\nFSM', ORANGE, cw)
+    block(cx[3], top, 'Arms', ORANGE, cw)
+    for i in range(3):
+        arrow(cx[i] + cw / 2, bot, cx[i + 1] - cw / 2, bot)
+    arrow(cx[2], top - 56, cx[2], bot + 56)
+    arrow(cx[2] + cw / 2, top, cx[3] - cw / 2, top)
+
+    # The link: discrete goals and status only, never velocities.
+    ax.text(1468, 372, 'Wi-Fi · ROS 2', ha='center', va='center', fontsize=fs(34),
             fontweight='bold', color=INK2)
-    save(fig, 'phase2_system_diagram.png')
+    for y, d, label in [(282, +1, 'map + cube task'), (207, -1, 'status + pose'),
+                        (132, -1, 'camera frames'), (57, +1, 'detections')]:
+        x0, x1 = (1252, 1684) if d > 0 else (1684, 1252)
+        arrow(x0, y, x1, y)
+        ax.text(1468, y + 8, label, ha='center', va='bottom', fontsize=fs(30), color=INK)
+    save(fig, 'system_architecture.png')
+
+
+# ── Related work (slot 2936 x 330) ──────────────────────────────────────────────────────
+def literature_table():
+    W, H = 2936, 330
+    cols = [('Work', 640), ('Platform', 470), ('Camera aimed by', 400),
+            ('Tracks what the camera saw', 760), ('Chooses how to inspect', 666)]
+    rows = [  # extended_abstract_v3.tex, Related Work
+        ('Frontier exploration (Yamauchi 1997)', 'Ground robot', '—',
+         'No: stops once the LiDAR has mapped', 'No'),
+        ('Coverage path planning (Galceran 2013)', 'Any, known map', '—',
+         'Tool width only', 'No: fixed sweep'),
+        ('Star-Searcher (Luo 2024)', 'Drone', 'Yaw', 'Yes', 'No'),
+        ('HEATS (Zhang 2025)', 'Mobile manipulator', 'Arm', 'Yes, region by region', 'No'),
+        ('Gao et al. (2024)', 'Ground, 3D LiDAR', '—', 'No: LiDAR object proposals', 'No'),
+        ('BotZilla (ours)', 'Ground, fixed camera', 'Whole body', 'Yes: camera-footprint map',
+         'Yes: rows or viewpoints'),
+    ]
+    fig = fig_for(W, H)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(-16, W + 16)
+    ax.set_ylim(H + 2, -2)
+    ax.axis('off')
+    rh = H / (len(rows) + 1)
+    ax.add_patch(FancyBboxPatch((0, 0), W, rh, boxstyle='round,pad=0,rounding_size=12',
+                                facecolor=NAVY, edgecolor='none'))
+    for k in range(len(rows)):
+        y = (k + 1) * rh
+        ours = k == len(rows) - 1
+        if ours or k % 2:
+            ax.add_patch(FancyBboxPatch((0, y), W, rh, boxstyle='round,pad=0,rounding_size=8',
+                                        facecolor='#D7EBEE' if ours else '#F3F6F8',
+                                        edgecolor='none'))
+    x = 0
+    for c, (title, w) in enumerate(cols):
+        ax.text(x + 20, rh / 2, title, va='center', fontsize=fs(30), fontweight='bold',
+                color='white')
+        for k, row in enumerate(rows):
+            ours = k == len(rows) - 1
+            ax.text(x + 20, (k + 1.5) * rh, row[c], va='center', fontsize=fs(30),
+                    fontweight='bold' if ours else 'normal', color=TEAL if ours else INK)
+        x += w
+    save(fig, 'literature_table.png')
+
+
+# ── Phase 2 deadlock: before / after (slot 700 x 330) ───────────────────────────────────
+def deadlock_diagram():
+    fig = fig_for(700, 330)
+    titles = [('Before: wedged', NAVY), ('After: steps aside', NAVY)]
+    for k in range(2):
+        ax = fig.add_axes([0.01 + k * 0.5, 0.0, 0.48, 0.80])
+        ax.set_xlim(0, 2.0)
+        ax.set_ylim(0, 1.6)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        ax.add_patch(FancyBboxPatch((0.02, 0.02), 1.96, 1.56,
+                                    boxstyle='round,pad=0,rounding_size=0.08',
+                                    facecolor='#F6F8FA', edgecolor='none'))
+        fig.text(0.01 + k * 0.5 + 0.24, 0.88, titles[k][0], ha='center',
+                 fontsize=fs(36), fontweight='bold', color=titles[k][1])
+        # the leader's route ahead (dashed) and the leader
+        ax.plot([0.15, 1.85], [0.55, 0.55], color=TEAL, linewidth=3, linestyle=(0, (4, 3)))
+        ax.add_patch(Circle((0.55, 0.55), 0.22, facecolor=TEAL, edgecolor='white',
+                            linewidth=2))
+        ax.add_patch(FancyArrowPatch((0.80, 0.55), (1.05, 0.55),
+                                     arrowstyle='-|>,head_length=7,head_width=5',
+                                     color=TEAL, linewidth=2.5))
+        if k == 0:     # collector parked on the route, touching the leader
+            cx, cy = 1.06, 0.62
+            ax.add_patch(FancyBboxPatch((cx - 0.25, cy - 0.21), 0.50, 0.42,
+                                        boxstyle='round,pad=0,rounding_size=0.06',
+                                        facecolor=ORANGE, edgecolor='white', linewidth=2,
+                                        zorder=3))
+            for dy in (-0.21, 0.15):
+                ax.add_patch(FancyBboxPatch((cx - 0.53, cy + dy), 0.30, 0.06,
+                                            boxstyle='round,pad=0,rounding_size=0.01',
+                                            facecolor=ORANGE, edgecolor='none', zorder=3))
+            ax.text(1.0, 1.25, 'no safe move\nfor either', ha='center', va='center',
+                    fontsize=fs(30), color=INK)
+        else:          # collector has cleared out, off the leader's route
+            cx, cy = 1.28, 1.15
+            ax.add_patch(FancyBboxPatch((cx - 0.25, cy - 0.21), 0.50, 0.42,
+                                        boxstyle='round,pad=0,rounding_size=0.06',
+                                        facecolor=ORANGE, edgecolor='white', linewidth=2,
+                                        zorder=3))
+            for dy in (-0.21, 0.15):
+                ax.add_patch(FancyBboxPatch((cx + 0.23, cy + dy), 0.30, 0.06,
+                                            boxstyle='round,pad=0,rounding_size=0.01',
+                                            facecolor=ORANGE, edgecolor='none', zorder=3))
+            ax.add_patch(FancyArrowPatch((0.92, 0.72), (1.08, 0.92),
+                                         arrowstyle='-|>,head_length=7,head_width=5',
+                                         color=ORANGE, linewidth=2.5,
+                                         linestyle=(0, (3, 2))))
+            ax.text(0.42, 1.15, 'route clear', ha='center', va='center',
+                    fontsize=fs(30), color=INK)
+    save(fig, 'phase2_deadlock_before_after.png')
 
 
 # ── "How it works" step icons (placeholders 555 x 215 each) ─────────────────────────────
@@ -394,7 +547,7 @@ def step_icons():
                                 boxstyle='round,pad=0,rounding_size=0.01',
                                 facecolor='none', edgecolor=TEAL, linewidth=3.5,
                                 linestyle=(0, (4, 2))))
-    ax.text(1.11, 0.62, 'cube 0.91', fontsize=fs(30), fontweight='bold', color=TEAL,
+    ax.text(1.11, 0.62, 'cube 0.91', fontsize=fs(36), fontweight='bold', color=TEAL,
             va='bottom')
     save(fig, 'step3_detect.png')
 
@@ -411,7 +564,7 @@ def step_icons():
     ax.add_patch(FancyBboxPatch((1.21, 0.69), 0.08, 0.08,
                                 boxstyle='round,pad=0,rounding_size=0.01',
                                 facecolor=NAVY, edgecolor='none'))
-    ax.text(1.25, 0.32, 'task', ha='center', fontsize=fs(28), color=INK2)
+    ax.text(1.25, 0.32, 'task', ha='center', fontsize=fs(36), color=INK2)
     save(fig, 'step4_assign.png')
 
     # 5 Collect: the collector carries the cube HOME.
@@ -429,7 +582,7 @@ def step_icons():
     ax.add_patch(FancyBboxPatch((hx - 0.05, hy), 0.10, 0.15,
                                 boxstyle='round,pad=0,rounding_size=0.01',
                                 facecolor=STEP_BG, edgecolor='none'))
-    ax.text(hx, hy - 0.09, 'HOME', ha='center', va='center', fontsize=fs(26),
+    ax.text(hx, hy - 0.09, 'HOME', ha='center', va='center', fontsize=fs(32),
             fontweight='bold', color=NAVY)
     save(fig, 'step5_collect.png')
 
@@ -437,7 +590,13 @@ def step_icons():
 if __name__ == '__main__':
     step_icons()
     coverage_chart()
-    leader_stuck_chart()
+    share = leader_blocked_chart()
+    before = sorted(share[r] for r in (12, 13, 14, 15, 16))
+    after = sorted(share[r] for r in (20, 21, 23, 27))
+    print('leader blocked, median %%: runs 12-16 %.1f -> full runs 20-27 %.1f'
+          % (before[2], (after[1] + after[2]) / 2))
     lab_map()
     phase1_diagram()
-    phase2_diagram()
+    architecture_diagram()
+    literature_table()
+    deadlock_diagram()
