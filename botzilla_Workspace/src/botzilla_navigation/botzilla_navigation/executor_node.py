@@ -179,6 +179,27 @@ DELIVERY_TIMEOUT_S = 300.0
 # until 609 s. 45 s leaves room for a normal replan plus one spin recovery.
 DELIVERY_NO_PROGRESS_S = 45.0
 DELIVERY_PROGRESS_M = 0.15
+# A HOME goal that fails within DELIVERY_QUICK_FAIL_S never really ran (Nav2 could not
+# even start it), so it is re-sent, up to DELIVERY_RETRIES goals in all, before the cube
+# is given up — giving up means DETACHING, which reverses to release the cube. Seen on
+# the collector robot (2026-10-05): bt_navigator timed out waiting 20 ms for the planner
+# to acknowledge, the delivery "failed" 30 ms after capture and the cube was released
+# on the spot.
+DELIVERY_QUICK_FAIL_S = 2.0
+DELIVERY_RETRIES = 3
+# A HOME goal that genuinely ran and then failed (no route, recovery spin refused) is
+# tried again up to DELIVERY_STUCK_RETRIES more times after holding still for
+# DELIVERY_STUCK_WAIT_S, instead of releasing the cube at once: in a cluster of cubes,
+# or with the other robot alongside, the way is often clear a few seconds later. Every
+# release short of HOME also costs a cube-in-hand and leaves it somewhere new; run 10 of
+# multi_robot_runs.md released the same two cubes four times in one spot.
+DELIVERY_STUCK_RETRIES = 2
+DELIVERY_STUCK_WAIT_S = 3.0
+# A HOME goal that fails with the robot already this close to HOME is a delivery: the
+# cube is in the drop zone. Nav2 can fail the last few centimetres when HOME itself is
+# crowded (earlier cubes, the other robot); in run 12 of multi_robot_runs.md three cubes
+# were left 0.1-0.2 m from HOME and counted as "released short".
+DELIVERY_CLOSE_ENOUGH_M = 0.5
 
 # Per-spot limit on cubes the robot cannot collect. A spot where a cube has failed
 # SPOT_FAIL_LIMIT times (a chase lost while targeting/approaching, or a cube released
@@ -228,8 +249,9 @@ class State:
 
 
 class ExecutorNode(Node):
-    def __init__(self):
-        super().__init__('executor_node')
+    def __init__(self, node_name='executor_node'):
+        # node_name: botzilla_fleet's collector_node subclasses this FSM.
+        super().__init__(node_name)
 
         # ── Tunables exposed as ROS parameters ──────────────────────────────
         # Defaults are exactly the module constants they shadow, so an unparameterised
@@ -286,6 +308,17 @@ class ExecutorNode(Node):
         self._nav_goal_handle = None
         self._nav_result = None      # None while in flight; GoalStatus once finished
         self._nav_sent_time = None
+        # Bumped on every goal sent or cancelled. Callbacks carry the value they were
+        # made with and are dropped if it has moved on, so the late CANCELED result of
+        # an abandoned goal can never be read as the result of the next one.
+        self._nav_token = 0
+        # True when Nav2 refused the last goal outright (not accepted), as opposed to
+        # accepting it and then failing. botzilla_fleet's collector_node tells "Nav2 is
+        # not up" from "no route" by this.
+        self._nav_rejected = False
+        self._delivery_attempts = 0      # HOME goals sent for the current cube
+        self._delivery_stuck_retries = 0  # see DELIVERY_STUCK_RETRIES
+        self._delivery_resend_at = None
         # Delivery progress watchdog — see DELIVERY_NO_PROGRESS_S.
         self._home_best_dist = None
         self._home_progress_time = None
@@ -295,20 +328,22 @@ class ExecutorNode(Node):
 
         self._cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
+        # Topic names are relative so the node can run under a namespace (the collector
+        # robot, /bz2/...). Un-namespaced they resolve to the same absolute names.
         # Latched: frontier_explorer_node must see the current value even if it
         # starts after us, otherwise it would happily explore while we chase a cube.
         enable_qos = QoSProfile(depth=1)
         enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self._explore_pub = self.create_publisher(
-            Bool, '/exploration_enabled', enable_qos
+            Bool, 'exploration_enabled', enable_qos
         )
         # See "Who owns cmd_vel" above — mutes velocity_smoother whenever this node
         # is the one driving the base, so the two never race on the same topic.
         self._smoother_enable_pub = self.create_publisher(
             Bool, 'velocity_smoother_enabled', enable_qos
         )
-        self._status_pub = self.create_publisher(String, '/mission/status', 10)
-        self._abandoned_pub = self.create_publisher(PointStamped, '/cube_abandoned', 10)
+        self._status_pub = self.create_publisher(String, 'mission/status', 10)
+        self._abandoned_pub = self.create_publisher(PointStamped, 'cube_abandoned', 10)
 
         self.create_subscription(Point, 'detected_cube', self._cube_cb, 10)
 
@@ -446,15 +481,18 @@ class ExecutorNode(Node):
         elif self._state == State.DETACHING:
             self._do_detaching(cmd, now)
 
+        self._drive(cmd)
+        self._publish_status()
+
+    def _drive(self, cmd):
+        """Slew-limit and publish a command from this node — see MAX_LINEAR_ACCEL."""
         max_dv = MAX_LINEAR_ACCEL * CONTROL_PERIOD_S
         max_dw = MAX_ANGULAR_ACCEL * CONTROL_PERIOD_S
         cmd.linear.x = self._slew_limit(cmd.linear.x, self._last_cmd_linear, max_dv)
         cmd.angular.z = self._slew_limit(cmd.angular.z, self._last_cmd_angular, max_dw)
         self._last_cmd_linear = cmd.linear.x
         self._last_cmd_angular = cmd.angular.z
-
         self._cmd_pub.publish(cmd)
-        self._publish_status()
 
     # ------------------------------------------------------------------ #
     # States
@@ -558,9 +596,38 @@ class ExecutorNode(Node):
             status = self._nav_result
             self._nav_result = None
             self._nav_goal_handle = None
+            took = ((now - self._nav_sent_time).nanoseconds / 1e9
+                    if self._nav_sent_time is not None else float('inf'))
+            pose = self._get_robot_pose()
+            near_home = (pose is not None and self._home is not None and math.hypot(
+                pose[0] - self._home[0], pose[1] - self._home[1]) < DELIVERY_CLOSE_ENOUGH_M)
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self._delivery_arrived = True
                 self._transition(State.DETACHING, 'Arrived HOME.')
+            elif near_home:
+                self._delivery_arrived = True
+                self._transition(
+                    State.DETACHING,
+                    f'HOME goal ended with status {status} within '
+                    f'{DELIVERY_CLOSE_ENOUGH_M} m of HOME; delivering here.')
+            elif took < DELIVERY_QUICK_FAIL_S and self._delivery_attempts < DELIVERY_RETRIES:
+                self.get_logger().warn(
+                    f'HOME goal failed after {took:.2f}s (status {status}) — Nav2 never '
+                    f'really started it; re-sending ({self._delivery_attempts + 1}/'
+                    f'{DELIVERY_RETRIES}) instead of releasing the cube.'
+                )
+                self._send_home_goal()
+            elif (took >= DELIVERY_QUICK_FAIL_S
+                    and self._delivery_stuck_retries < DELIVERY_STUCK_RETRIES):
+                self._delivery_stuck_retries += 1
+                self._delivery_resend_at = now + Duration(seconds=DELIVERY_STUCK_WAIT_S)
+                self._nav_sent_time = None
+                self.get_logger().warn(
+                    f'HOME goal failed after {took:.0f}s (status {status}); holding still '
+                    f'{DELIVERY_STUCK_WAIT_S:.0f}s and trying again '
+                    f'({self._delivery_stuck_retries}/{DELIVERY_STUCK_RETRIES}) before '
+                    f'giving up the cube.'
+                )
             else:
                 # Releasing here is deliberate. The robot is somewhere short of HOME,
                 # but dropping the cube and carrying on beats wedging the whole
@@ -576,6 +643,11 @@ class ExecutorNode(Node):
                 self._transition(State.DETACHING, 'Delivery failed; releasing anyway.')
             return
 
+        if self._delivery_resend_at is not None:
+            if now >= self._delivery_resend_at:
+                self._delivery_resend_at = None
+                self._send_home_goal()
+            return
         if self._nav_sent_time is None:
             return
         elapsed = (now - self._nav_sent_time).nanoseconds / 1e9
@@ -598,10 +670,7 @@ class ExecutorNode(Node):
                 f'cancelling the delivery and releasing the cube here rather than '
                 f'waiting on Nav2.'
             )
-            if self._nav_goal_handle is not None:
-                self._nav_goal_handle.cancel_goal_async()
-                self._nav_goal_handle = None
-            self._nav_sent_time = None
+            self._cancel_nav_goal()
             self._transition(State.DETACHING, 'Delivery made no progress; releasing.')
             return
 
@@ -610,10 +679,7 @@ class ExecutorNode(Node):
                 f'Delivery exceeded {DELIVERY_TIMEOUT_S:.0f}s; giving up on the route '
                 f'and releasing the cube here.'
             )
-            if self._nav_goal_handle is not None:
-                self._nav_goal_handle.cancel_goal_async()
-                self._nav_goal_handle = None
-            self._nav_sent_time = None
+            self._cancel_nav_goal()
             self._transition(State.DETACHING, 'Delivery timed out.')
         else:
             self.get_logger().info(
@@ -671,12 +737,33 @@ class ExecutorNode(Node):
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
-        self._nav_sent_time = self.get_clock().now()
         self._delivery_arrived = False
         self._home_best_dist = None
-        self._home_progress_time = self._nav_sent_time
+        self._delivery_attempts += 1
         self.get_logger().info(f'Sending NavigateToPose to HOME ({x:.2f}, {y:.2f}).')
-        self._nav_client.send_goal_async(goal).add_done_callback(self._goal_response_cb)
+        self._send_nav_goal(goal)
+        self._home_progress_time = self._nav_sent_time
+
+    def _send_nav_goal(self, goal):
+        """Send a NavigateToPose goal; its result lands in self._nav_result."""
+        self._nav_token += 1
+        token = self._nav_token
+        self._nav_rejected = False
+        self._nav_result = None
+        self._nav_goal_handle = None
+        self._nav_sent_time = self.get_clock().now()
+        self._nav_client.send_goal_async(goal).add_done_callback(
+            lambda future: self._goal_response_cb(future, token)
+        )
+
+    def _cancel_nav_goal(self):
+        """Cancel the goal in flight (if any) and forget it, including its late result."""
+        self._nav_token += 1
+        if self._nav_goal_handle is not None:
+            self._nav_goal_handle.cancel_goal_async()
+        self._nav_goal_handle = None
+        self._nav_sent_time = None
+        self._nav_result = None
 
     def _set_nav2_reverse_allowed(self, allowed: bool):
         """Push FollowPath.min_vel_x to 0.0 (or restore it) — see NAV2_MIN_VEL_X_DEFAULT."""
@@ -685,18 +772,28 @@ class ExecutorNode(Node):
             [Parameter('FollowPath.min_vel_x', Parameter.Type.DOUBLE, value)]
         )
 
-    def _goal_response_cb(self, future):
+    def _goal_response_cb(self, future, token):
+        if token != self._nav_token:
+            handle = future.result()
+            if handle.accepted:
+                handle.cancel_goal_async()   # superseded before Nav2 even accepted it
+            return
         handle = future.result()
         if not handle.accepted:
-            self.get_logger().warn('Nav2 rejected the HOME goal.')
+            self.get_logger().warn('Nav2 rejected the goal.')
+            self._nav_rejected = True
             self._nav_result = GoalStatus.STATUS_ABORTED
             return
         self._nav_goal_handle = handle
-        handle.get_result_async().add_done_callback(self._result_cb)
+        handle.get_result_async().add_done_callback(
+            lambda result_future: self._result_cb(result_future, token)
+        )
 
-    def _result_cb(self, future):
+    def _result_cb(self, future, token):
         # Recorded rather than acted on directly: the state machine owns transitions,
         # and this fires on an executor thread.
+        if token != self._nav_token:
+            return
         self._nav_result = future.result().status
 
     # ------------------------------------------------------------------ #
@@ -819,6 +916,10 @@ class ExecutorNode(Node):
                     pose[1] + HELD_CUBE_OFFSET_M * math.sin(pose[2]),
                     'released short of HOME',
                 )
+        if new_state == State.DELIVERING:
+            self._delivery_attempts = 0
+            self._delivery_stuck_retries = 0
+            self._delivery_resend_at = None
         if new_state == State.DETACHING:
             # Covers every DELIVERING exit (arrived, failed, timed out) uniformly,
             # and is a harmless no-op on paths that never lowered it in the first

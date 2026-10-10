@@ -45,16 +45,27 @@ Usage:
 """
 
 import os
+import xml.etree.ElementTree as ET
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.descriptions import ComposableNode
 
 _NORESET = os.path.join(
     os.path.expanduser('~'), 'Desktop/Projects/sem5/final-project-botzilla/noreset.so'
 )
+
+
+def _without_arms(urdf_text):
+    """The URDF minus every link and joint named arm_* (the grabber arms)."""
+    root = ET.fromstring(urdf_text)
+    for el in list(root):
+        if el.tag in ('link', 'joint') and el.get('name', '').startswith('arm_'):
+            root.remove(el)
+    return ET.tostring(root, encoding='unicode')
 
 
 def generate_launch_description():
@@ -71,6 +82,32 @@ def generate_launch_description():
     # ------------------------------------------------------------------ #
     # Launch arguments
     # ------------------------------------------------------------------ #
+    # Topic names in this file are relative, so the whole stack can be pushed under a
+    # namespace (the collector robot runs it as /bz2/...). Without a namespace they
+    # resolve to exactly the absolute names they used to be.
+    noreset_arg = DeclareLaunchArgument(
+        'noreset_path', default_value=_NORESET,
+        description='LD_PRELOAD shim for the Kinect (see repo-root noreset.so)',
+    )
+    arms_arg = DeclareLaunchArgument(
+        'arms', default_value='false',
+        description='true for the robot with the grabber arms (the collector); the '
+                    'leader is a bare Kobuki',
+    )
+    depth_registered_arg = DeclareLaunchArgument(
+        'depth_registered', default_value='false',
+        description='Kinect depth aligned to RGB, 16UC1 mm (see kinect_bridge); the '
+                    'collector robot needs it, the leader keeps raw disparity',
+    )
+    camera_fps_arg = DeclareLaunchArgument(
+        'camera_fps', default_value='30',
+        description='Kinect frames processed and published per second (kinect_bridge fps); '
+                    'the collector robot runs 15 to save CPU on its Pi',
+    )
+    ekf_params_arg = DeclareLaunchArgument(
+        'ekf_params_file', default_value=ekf_config_file,
+        description='robot_localization params; the collector passes a namespaced copy',
+    )
     serial_port_arg = DeclareLaunchArgument(
         'serial_port',
         default_value=(
@@ -78,6 +115,17 @@ def generate_launch_description():
             'usb-Yujin_Robot_iClebo_Kobuki_kobuki_AI02MTI8-if00-port0'
         ),
         description='Serial port for the Kobuki base',
+    )
+    # Two-robot runs rename the scans so botzilla_fleet's fleet_scan_filter can sit in
+    # between and republish them as scan / scan_camera without the other robot in them.
+    scan_topic_arg = DeclareLaunchArgument(
+        'scan_topic', default_value='scan',
+        description="RPLIDAR output topic; 'scan_raw' when fleet_scan_filter runs",
+    )
+    scan_camera_topic_arg = DeclareLaunchArgument(
+        'scan_camera_topic', default_value='scan_camera',
+        description="depth camera virtual scan topic; 'scan_camera_raw' when "
+                    'fleet_scan_filter runs',
     )
     lidar_port_arg = DeclareLaunchArgument(
         'lidar_port',
@@ -92,16 +140,25 @@ def generate_launch_description():
     # ------------------------------------------------------------------ #
     # 1. Robot State Publisher (publishes /tf tree for hardware sensors)
     # ------------------------------------------------------------------ #
-    robot_state_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='screen',
-        parameters=[{
-            'robot_description': robot_description,
-            'use_sim_time': False,
-        }],
-    )
+    # arms:=false (the default) removes the grabber arms from the model: since 2026-10-06
+    # the leader is a bare circular Kobuki and only the collector robot carries the arms
+    # (botzilla_fleet's collector.launch.py passes arms:=true). Only the published model
+    # changes — RViz and the TF tree; Nav2's footprints are set separately.
+    def _robot_state_publisher(context, *_args, **_kwargs):
+        description = robot_description
+        if LaunchConfiguration('arms').perform(context).lower() not in ('true', '1', 'yes'):
+            description = _without_arms(robot_description)
+        return [Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='screen',
+            parameters=[{
+                'robot_description': description,
+                'use_sim_time': False,
+            }],
+        )]
+    robot_state_publisher = OpaqueFunction(function=_robot_state_publisher)
 
     # ------------------------------------------------------------------ #
     # 2. Kinect Bridge — publishes:
@@ -114,8 +171,13 @@ def generate_launch_description():
         executable='kinect_bridge',
         name='kinect_bridge',
         output='screen',
-        parameters=[{'use_sim_time': False}],
-        additional_env={'LD_PRELOAD': _NORESET},
+        parameters=[{
+            'use_sim_time': False,
+            'depth_registered': ParameterValue(
+                LaunchConfiguration('depth_registered'), value_type=bool),
+            'fps': ParameterValue(LaunchConfiguration('camera_fps'), value_type=float),
+        }],
+        additional_env={'LD_PRELOAD': LaunchConfiguration('noreset_path')},
     )
 
     # ------------------------------------------------------------------ #
@@ -141,6 +203,7 @@ def generate_launch_description():
         executable='rplidar_node',
         name='rplidar_node',
         output='screen',
+        remappings=[('scan', LaunchConfiguration('scan_topic'))],
         parameters=[{
             'use_sim_time': False,
             'port': LaunchConfiguration('lidar_port'),
@@ -167,7 +230,7 @@ def generate_launch_description():
         executable='ekf_node',
         name='ekf_filter_node',
         output='screen',
-        parameters=[ekf_config_file, {'use_sim_time': False}],
+        parameters=[LaunchConfiguration('ekf_params_file'), {'use_sim_time': False}],
     )
 
     # ------------------------------------------------------------------ #
@@ -186,7 +249,7 @@ def generate_launch_description():
                 plugin='depth_image_proc::PointCloudXyzNode',
                 name='point_cloud_xyz_node',
                 remappings=[
-                    ('image_rect', '/camera/depth/image_meters'),
+                    ('image_rect', 'camera/depth/image_meters'),
                     # image_transport::CameraSubscriber derives the info topic from the
                     # image topic's own namespace (here: /camera/depth/camera_info), NOT
                     # from a remap targeting the generic 'camera_info' name — confirmed
@@ -195,8 +258,8 @@ def generate_launch_description():
                     # kinect_bridge only publishes /camera/camera_info) and silently
                     # produced zero synchronized pairs. Must remap the actual resolved
                     # topic name.
-                    ('/camera/depth/camera_info', '/camera/camera_info'),
-                    ('points', '/camera/points'),
+                    ('camera/depth/camera_info', 'camera/camera_info'),
+                    ('points', 'camera/points'),
                 ],
                 parameters=[{'use_sim_time': False}],
             )
@@ -218,8 +281,8 @@ def generate_launch_description():
         name='pointcloud_to_laserscan',
         output='screen',
         remappings=[
-            ('cloud_in', '/camera/points'),
-            ('scan', '/scan_camera'),
+            ('cloud_in', 'camera/points'),
+            ('scan', LaunchConfiguration('scan_camera_topic')),
         ],
         parameters=[{
             'use_sim_time': False,
@@ -237,8 +300,15 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        noreset_arg,
+        arms_arg,
+        depth_registered_arg,
+        camera_fps_arg,
+        ekf_params_arg,
         serial_port_arg,
         lidar_port_arg,
+        scan_topic_arg,
+        scan_camera_topic_arg,
         robot_state_publisher,
         kinect_bridge,
         kobuki_base_node,

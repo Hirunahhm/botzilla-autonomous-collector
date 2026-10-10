@@ -15,6 +15,7 @@
   <depend>std_msgs</depend>
 
   <!-- Python serial dependency for rplidar_driver -->
+  <exec_depend>botzilla_interfaces</exec_depend>
   <exec_depend>python3-serial</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

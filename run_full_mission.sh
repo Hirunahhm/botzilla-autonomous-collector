@@ -41,6 +41,10 @@
 #                                  grid. 'interleaved' uses --sweep-area as trigger.
 #   --detect-only                  never chase a detected cube; keep searching. Every
 #                                  counted research run uses this.
+#   --fleet [NS]                   two-robot run: this robot only searches (implies
+#                                  --detect-only) and fleet_manager_node sends the cubes
+#                                  it finds to the collector robot /NS (default bz2),
+#                                  started on the Pi with ./run_collector.sh.
 #   --floor-area M2                measured arena floor area, the fixed coverage
 #                                  denominator (overrides floor_area_m2 in --layout).
 #   --row-planner SweepStraight|GridBased
@@ -98,6 +102,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/robot_stop.sh
+source "$REPO_ROOT/tools/robot_stop.sh"
 WS="${REPO_ROOT}/botzilla_Workspace"
 ROS_SETUP=/opt/ros/jazzy/setup.bash
 
@@ -118,6 +124,7 @@ SWEEP_AREA=""      # empty => launch default (3.0)
 DETECT_ONLY=0
 STRATEGY=""        # empty => launch default (sweep)
 INSPECTION=""      # empty => launch default (mixed)
+FLEET_NS=""        # empty => single robot; else the collector's namespace
 FLOOR_AREA=""      # empty => take floor_area_m2 from the layout, if any
 
 # Printed by --help: the contiguous comment block at the top of this file. Derived
@@ -145,6 +152,8 @@ while [ $# -gt 0 ]; do
         --sweep-area)  SWEEP_AREA="${2:-}"; shift ;;
         --sweep-area=*) SWEEP_AREA="${1#*=}" ;;
         --detect-only) DETECT_ONLY=1 ;;
+        --fleet)       FLEET_NS="bz2"
+                       if [ -n "${2:-}" ] && [[ "${2}" != --* ]]; then FLEET_NS="$2"; shift; fi ;;
         --strategy)    STRATEGY="${2:-}"; shift ;;
         --strategy=*)  STRATEGY="${1#*=}" ;;
         --inspection)  INSPECTION="${2:-}"; shift ;;
@@ -184,6 +193,11 @@ if [ -n "$INSPECTION" ] && [ "$STRATEGY" != "region" ] && [ "$STRATEGY" != "inte
 fi
 if [ -n "$POLICY" ] && [ -n "$STRATEGY" ] && [ "$STRATEGY" != "sweep" ]; then
     echo "WARNING: --policy only affects --strategy sweep; it is ignored here." >&2
+fi
+# In a two-robot run the leader only searches: a chase here would compete with the
+# collector for the same cube.
+if [ -n "$FLEET_NS" ]; then
+    DETECT_ONLY=1
 fi
 # Positive decimals only: rclpy would reject a non-number at launch, but only after
 # the whole stack is up.
@@ -267,32 +281,36 @@ source_ros() {
 cleanup() {
     [ "$CLEANED" = 1 ] && return
     CLEANED=1
+    # Ignore further INT/TERM until done. Otherwise a second signal (timed_run.sh's
+    # timer and an operator's stop landing together, 2026-10-05) re-enters the trap,
+    # which sees CLEANED=1 and exits on the spot, abandoning this cleanup halfway and
+    # leaving the stack running.
+    trap '' INT TERM
     echo
     step "shutting down"
 
-    # Stop the base first, while the graph is still alive to carry the message.
-    # Reported honestly: if the graph is already gone this cannot get through, and
-    # claiming otherwise would hide a robot that is still driving.
-    if ( source_ros
-         export ROS_DISCOVERY_SERVER="127.0.0.1:${DISCOVERY_PORT}"
-         export ROS_SUPER_CLIENT=True
-         timeout 8 ros2 topic pub -1 /cmd_vel geometry_msgs/msg/Twist "{}" ) >/dev/null 2>&1
-    then ok "sent zero /cmd_vel"
-    else warn "could not publish zero /cmd_vel (graph already down?)"
-    fi
+    # The robot first, before anything that could stall: see tools/robot_stop.sh.
+    ok "$(stop_robot_motion)"
 
     # Reverse start order: consumers before producers.
     for (( i=${#PIDS[@]}-1 ; i>=0 ; i-- )); do
         kill -INT "${PIDS[i]}" 2>/dev/null
     done
 
+    # Bounded and in parallel: an unbounded `docker stop` once held up the rest of this
+    # cleanup with Nav2 and the base driver still alive.
+    local dpids=()
     if [ -n "${YOLO_CID:-}" ]; then
-        docker stop "$YOLO_CID" >/dev/null 2>&1 && ok "stopped YOLO container"
+        timeout 20 docker stop -t 5 "$YOLO_CID" >/dev/null 2>&1 & dpids+=("$!")
     fi
+    if [ -n "${FLEET_YOLO_NAME:-}" ]; then
+        timeout 20 docker stop -t 5 "$FLEET_YOLO_NAME" >/dev/null 2>&1 & dpids+=("$!")
+    fi
+    [ ${#dpids[@]} -gt 0 ] && wait "${dpids[@]}" && ok "stopped YOLO container(s)"
 
     # ros2 launch forwards SIGINT to its children, but they need a moment.
     for _ in $(seq 1 10); do
-        pgrep -f "$LAUNCH_PATTERN" >/dev/null 2>&1 || break
+        [ -z "$(pattern_pids "$LAUNCH_PATTERN")" ] && break
         sleep 1
     done
 
@@ -301,15 +319,15 @@ cleanup() {
     # without a TERM stage it would always need killing, and a KILL denies every node
     # the chance to shut its hardware down tidily.
     local survivors
-    survivors=$(pgrep -f "$LAUNCH_PATTERN" 2>/dev/null | grep -v "^$$\$" || true)
+    survivors=$(pattern_pids "$LAUNCH_PATTERN")
     if [ -n "$survivors" ]; then
         echo "$survivors" | while read -r p; do kill -TERM "$p" 2>/dev/null; done
         for _ in $(seq 1 5); do
-            pgrep -f "$LAUNCH_PATTERN" >/dev/null 2>&1 || break
+            [ -z "$(pattern_pids "$LAUNCH_PATTERN")" ] && break
             sleep 1
         done
     fi
-    survivors=$(pgrep -f "$LAUNCH_PATTERN" 2>/dev/null | grep -v "^$$\$" || true)
+    survivors=$(pattern_pids "$LAUNCH_PATTERN")
     if [ -n "$survivors" ]; then
         warn "forcing (SIGKILL): $(echo "$survivors" | tr '\n' ' ')"
         echo "$survivors" | while read -r p; do kill -9 "$p" 2>/dev/null; done
@@ -319,7 +337,7 @@ cleanup() {
     ( source_ros; ros2 daemon stop ) >/dev/null 2>&1
     rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
 
-    if pgrep -f "$LAUNCH_PATTERN" >/dev/null 2>&1; then
+    if [ -n "$(pattern_pids "$LAUNCH_PATTERN")" ]; then
         warn "some processes survived — check: pgrep -fa '$LAUNCH_PATTERN'"
     else
         ok "all processes stopped"
@@ -332,7 +350,7 @@ cleanup() {
     echo "logs: $LOG_DIR"
 }
 # Everything this script starts, for pgrep-based checks and forced cleanup.
-LAUNCH_PATTERN="fast-discovery-server|fastdds discovery|ros2 launch botzilla|kobuki_base_node|kinect_bridge|rplidar_node|ekf_node|odom_covariance_relay|pointcloud_to_laserscan|robot_state_publisher|component_container|rtabmap|controller_server|planner_server|behavior_server|bt_navigator|velocity_smoother|lifecycle_manager|executor_node|frontier_explorer_node|mission_metrics_node"
+LAUNCH_PATTERN="fast-discovery-server|fastdds discovery|ros2 launch botzilla|kobuki_base_node|kinect_bridge|rplidar_node|ekf_node|odom_covariance_relay|pointcloud_to_laserscan|robot_state_publisher|component_container|rtabmap|controller_server|planner_server|behavior_server|bt_navigator|velocity_smoother|lifecycle_manager|executor_node|frontier_explorer_node|mission_metrics_node|fleet_manager_node|fleet_scan_filter"
 # Ctrl+C must exit outright. With a bare `trap cleanup INT` the shell resumes the
 # interrupted `sleep` afterwards, the watch loop then notices the processes cleanup
 # just stopped, and reports them as an unexpected crash — alarming and untrue.
@@ -373,8 +391,9 @@ start_bg() {   # <logfile> <cmd...>
 # ── step numbering ───────────────────────────────────────────────────────────
 # The metrics node adds a stage, so the denominator is computed rather than written
 # into six separate strings that would disagree with each other the moment one moved.
-TOTAL_STEPS=6
-[ "$RUN_METRICS" = 1 ] && TOTAL_STEPS=7
+TOTAL_STEPS=6   # +1 each for --metrics and --fleet (fleet manager + collector YOLO)
+[ "$RUN_METRICS" = 1 ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ -n "$FLEET_NS" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 STEP_N=0
 next_step() { STEP_N=$((STEP_N + 1)); step "${STEP_N}/${TOTAL_STEPS}  $*"; }
 
@@ -388,10 +407,10 @@ step "preflight"
 # common cause of a broken bringup: the new kobuki_base_node starts, its serial
 # reader thread dies with "device reports readiness to read but returned no data",
 # and the node then sits there alive but publishing nothing.
-stale=$(pgrep -f "$LAUNCH_PATTERN" 2>/dev/null | grep -v "^$$\$" || true)
+stale=$(pattern_pids "$LAUNCH_PATTERN")
 if [ -n "$stale" ]; then
     echo "  processes from a previous run are still alive:"
-    pgrep -af "$LAUNCH_PATTERN" | grep -v "^$$ " | sed 's/^/    /'
+    for p in $stale; do echo "    $p $(ps -o args= -p "$p" | cut -c1-120)"; done
     if [ "$FORCE_CLEAN" = 1 ]; then
         echo "  --yes given, clearing them"
     elif [ -t 0 ]; then
@@ -459,6 +478,7 @@ fi
     echo "  \"inspection\": \"${INSPECTION:-mixed}\","
     echo "  \"floor_area_m2\": ${FLOOR_AREA:-null},"
     echo "  \"mission\": $([ "$RUN_MISSION" = 1 ] && echo true || echo false),"
+    echo "  \"fleet\": $([ -n "$FLEET_NS" ] && echo "\"$FLEET_NS\"" || echo null),"
     echo "  \"git_commit\": \"$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)\","
     echo "  \"git_dirty\": $(git -C "$REPO_ROOT" diff --quiet 2>/dev/null && echo false || echo true),"
     echo "  \"host\": \"$(hostname)\""
@@ -515,8 +535,20 @@ clear_line; ok "listening on 0.0.0.0:$DISCOVERY_PORT"
 
 # ── 2. hardware ──────────────────────────────────────────────────────────────
 next_step "hardware (Kobuki, Kinect, RPLIDAR, EKF)"
-start_bg "$LOG_DIR/hardware.log" ros2 launch botzilla_bringup hardware.launch.py
+HW_ARGS=()
+# Two-robot run: the sensors publish scan_raw / scan_camera_raw and fleet_scan_filter
+# republishes scan / scan_camera without the collector in them, so RTAB-Map does not
+# map it and the costmaps do not mark and inflate it (botzilla_fleet body_filter.py).
+[ -n "$FLEET_NS" ] && HW_ARGS+=("scan_topic:=scan_raw" "scan_camera_topic:=scan_camera_raw")
+start_bg "$LOG_DIR/hardware.log" ros2 launch botzilla_bringup hardware.launch.py "${HW_ARGS[@]}"
 wait_for_log "$LOG_DIR/hardware.log" "Gyro bias calibrated" 60 "Kobuki base + gyro calibrated"
+if [ -n "$FLEET_NS" ]; then
+    start_bg "$LOG_DIR/scan_filter.log" \
+        ros2 run botzilla_fleet fleet_scan_filter --ros-args \
+            -p use_sim_time:=false -p other:=collector -p "collector_ns:=$FLEET_NS"
+    wait_for_log "$LOG_DIR/scan_filter.log" "fleet_scan_filter: removing" 30 \
+        "scan filter up (scan_raw -> scan, collector removed)"
+fi
 
 # ── 3. SLAM ──────────────────────────────────────────────────────────────────
 next_step "RTAB-Map SLAM"
@@ -585,6 +617,37 @@ else
     next_step "mission executor SKIPPED (--no-mission)"
 fi
 
+# ── 8. fleet manager (optional) ──────────────────────────────────────────────
+if [ -n "$FLEET_NS" ]; then
+    next_step "fleet manager (cubes found here -> collector /$FLEET_NS)"
+    start_bg "$LOG_DIR/fleet.log" \
+        ros2 run botzilla_fleet fleet_manager_node --ros-args \
+            -p use_sim_time:=false -p "collector_ns:=$FLEET_NS"
+    wait_for_log "$LOG_DIR/fleet.log" "fleet_manager_node: leader searches" 30 "fleet manager up"
+
+    # The collector's camera is detected here, on this GPU: its Pi sends JPEG frames on
+    # /$FLEET_NS/camera/rgb/compressed and gets pixel boxes back on /$FLEET_NS/yolo/boxes
+    # (botzilla_fleet remote_detection_node). A second container, not a second node in
+    # the first, so either can be restarted without the other.
+    FLEET_YOLO_NAME="botzilla_yolo_${FLEET_NS}"
+    # 0.6, not the leader's 0.8: from the collector's camera the cube scored a steady
+    # 0.79-0.81 (detected in 105/105 frames at 0.3, but only 34 cleared 0.8), while
+    # background noise has measured at most 0.14 (executor_node CUBE_MAX_RANGE_M
+    # notes). The collector also only acts on boxes within 0.7 m of its task.
+    FLEET_YOLO_CONFIDENCE=0.6
+    docker rm -f "$FLEET_YOLO_NAME" >/dev/null 2>&1 || true
+    ( cd "$REPO_ROOT"
+      export ROS_DISCOVERY_SERVER="127.0.0.1:${DISCOVERY_PORT}"
+      export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+      export CONTAINER_NAME="$FLEET_YOLO_NAME"
+      exec ./docker/yolo/run_yolo_container.sh \
+          ros2 run botzilla_perception yolo_node --ros-args \
+              -r "__ns:=/$FLEET_NS" -p mode:=boxes -p confidence:=$FLEET_YOLO_CONFIDENCE ) \
+        > "$LOG_DIR/fleet_yolo.log" 2>&1 &
+    PIDS+=("$!")
+    wait_for_log "$LOG_DIR/fleet_yolo.log" "mode=boxes" 120 "YOLO for the collector's camera (boxes mode)"
+fi
+
 # ── ready ────────────────────────────────────────────────────────────────────
 cat <<EOF
 
@@ -624,6 +687,17 @@ ${C_OK}================ STACK IS UP ================${C_0}
   Watch from here:
     tail -f $LOG_DIR/executor.log
     ros2 topic echo /mission/status
+$( [ -n "$FLEET_NS" ] && cat <<FLEET
+
+  ${C_INF}Two-robot run${C_0}: start the collector on the Pi now (same hotspot):
+    ssh groot@groot.local
+    cd ~/hiruna/botzilla-autonomous-collector
+    ./run_collector.sh --leader $(hostname).local --ns $FLEET_NS --start X Y YAW
+  (X Y YAW = the collector's start spot relative to this robot's start, metres/rad)
+    tail -f $LOG_DIR/fleet.log | grep FLEET
+    RViz: add MarkerArray /fleet/cubes
+FLEET
+)
 $( [ "$RUN_METRICS" = 1 ] && cat <<METRICS
 
   ${C_INF}Recording${C_0} to $LOG_DIR/metrics.jsonl

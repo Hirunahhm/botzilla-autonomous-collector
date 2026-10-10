@@ -503,8 +503,13 @@ local_costmap:
       # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
       # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
       # margin; not rederived here since only the values below are load-bearing.
-      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      # LEADER IS NOW CIRCULAR (2026-10-06): the grabber arms were taken off this robot and
+      # moved to the collector, so the leader is a bare Kobuki — body radius 0.17 m
+      # (botzilla_qbot.urdf base_link cylinder), symmetric. 0.22 = 0.17 + the same 0.05 m
+      # padding the polygon carried. The arm polygon documented above now belongs to the
+      # collector: botzilla_fleet's params_rewrite.py puts it back for that robot only.
+      robot_radius: 0.22
+      plugins: ["voxel_layer", "inflation_layer", "fleet_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -518,6 +523,20 @@ local_costmap:
         # barely manoeuvre". This does NOT narrow any passage: only cells within
         # inscribed_radius are lethal-equivalent.
         inflation_radius: 0.45
+      fleet_layer:
+        # Two-robot runs: the other robot and the cubes already detected, from
+        # botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ there): exact shapes
+        # as lethal cells with a fading soft halo. AFTER inflation_layer on purpose — not
+        # inflated. Lethal already stops the footprint check overlapping them; inflating
+        # the other robot by 0.45 m deadlocked both robots once they were side by side,
+        # and inflated cubes blocked corridors (2026-10-06). Repainted wholesale on every
+        # message, so a moved robot or a collected cube is gone at the next update. Inert
+        # in single-robot runs. The collector's copy reads /<ns>/fleet/obstacle_grid.
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /fleet/obstacle_grid
+        lethal: True
+        max_age_s: 2.0
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -633,7 +652,12 @@ global_costmap:
       # than relying on ObstacleFootprint to catch it per-trajectory at execution time.
       # Derivation above (inscribed 0.165/circumscribed 0.351) is now stale by this
       # margin; not rederived here since only the values below are load-bearing.
-      footprint: "[[0.36, 0.215], [0.36, -0.215], [-0.22, -0.215], [-0.22, 0.215]]"
+      # LEADER IS NOW CIRCULAR (2026-10-06): the grabber arms were taken off this robot and
+      # moved to the collector, so the leader is a bare Kobuki — body radius 0.17 m
+      # (botzilla_qbot.urdf base_link cylinder), symmetric. 0.22 = 0.17 + the same 0.05 m
+      # padding the polygon carried. The arm polygon documented above now belongs to the
+      # collector: botzilla_fleet's params_rewrite.py puts it back for that robot only.
+      robot_radius: 0.22
       # static_layer = rtabmap's /map; obstacle_layer = live /scan (added so the planner
       # isn't blind while rtabmap's map is still forming — see header comment).
       # coverage_layer = soft penalty on floor the camera has already inspected, so
@@ -642,14 +666,29 @@ global_costmap:
       # only — in the local costmap DWB would start steering around inspected floor.
       # A no-op unless the explorer runs with coverage_cost > 0 (--coverage-cost), and
       # max-combined below inscribed cost, so no threshold anywhere else moves.
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "coverage_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "fleet_layer", "coverage_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan
+        observation_sources: scan scan_camera
+        # scan_camera here as well as in the local costmap (2026-10-06): the depth camera's
+        # low scan is the only sensor that sees a cube (the LiDAR scans above them). With it
+        # only in the local costmap the planner kept routing the leader through a cube the
+        # controller then refused, and the leader stayed stuck against it
+        # (multi_robot_runs.md, run 9). Same settings as the local costmap's source.
+        scan_camera:
+          topic: /scan_camera
+          max_obstacle_height: 0.30
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.55
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -667,6 +706,20 @@ global_costmap:
         # planner and controller costmaps consistent so DWB doesn't reject the
         # global planner's route as infeasible.
         inflation_radius: 0.45
+      fleet_layer:
+        # Two-robot runs: the other robot and the cubes already detected, from
+        # botzilla_fleet's fleet_manager_node (see OBSTACLE_GRID_HZ there): exact shapes
+        # as lethal cells with a fading soft halo. AFTER inflation_layer on purpose — not
+        # inflated. Lethal already stops the footprint check overlapping them; inflating
+        # the other robot by 0.45 m deadlocked both robots once they were side by side,
+        # and inflated cubes blocked corridors (2026-10-06). Repainted wholesale on every
+        # message, so a moved robot or a collected cube is gone at the next update. Inert
+        # in single-robot runs. The collector's copy reads /<ns>/fleet/obstacle_grid.
+        plugin: "botzilla_coverage_layer::CoverageCostLayer"
+        enabled: True
+        topic: /fleet/obstacle_grid
+        lethal: True
+        max_age_s: 2.0
       coverage_layer:
         plugin: "botzilla_coverage_layer::CoverageCostLayer"
         enabled: True

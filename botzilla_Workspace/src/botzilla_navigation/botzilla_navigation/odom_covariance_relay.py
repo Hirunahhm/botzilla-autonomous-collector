@@ -35,8 +35,8 @@ TWIST_VARIANCE = [0.02, 1e-6, 1e6, 1e6, 1e6, 0.50]
 class OdomCovarianceRelay(Node):
     def __init__(self):
         super().__init__('odom_covariance_relay')
-        self.declare_parameter('input_topic', '/odom')
-        self.declare_parameter('output_topic', '/odom_cov')
+        self.declare_parameter('input_topic', 'odom')
+        self.declare_parameter('output_topic', 'odom_cov')
         in_topic = self.get_parameter('input_topic').value
         out_topic = self.get_parameter('output_topic').value
 

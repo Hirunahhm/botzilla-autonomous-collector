@@ -1,3 +1,4 @@
+from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
@@ -5,6 +6,7 @@ from rclpy.qos import qos_profile_sensor_data
 import freenect
 import numpy as np
 import threading
+import time
 
 # Pi 5 / RP1 USB controller fix: launch this node with
 #   LD_PRELOAD=/path/to/noreset.so
@@ -69,17 +71,50 @@ class KinectBridge(Node):
     def __init__(self):
         super().__init__('kinect_bridge')
 
-        self.publisher_rgb = self.create_publisher(Image, '/camera/rgb/image_raw', qos_profile_sensor_data)
+        # depth_registered: ask the Kinect for depth already aligned to the RGB camera,
+        # in millimetres (libfreenect DEPTH_REGISTERED), instead of raw 11-bit disparity
+        # from the IR camera's own viewpoint. Needed on the collector robot: there the
+        # unregistered depth of a cube 0.9 m away sat ~30 px right of the cube in RGB,
+        # so the box centre sampled the shadow beside it and every detection came back
+        # z = 0 (measured with a cube on the floor in front of it; registered, all 25
+        # pixels of the same box read 910 mm). Off by default so the leader's depth
+        # pipeline, and every research run recorded with it, is unchanged.
+        #   off: camera/depth/image_raw = mono8 rescaled disparity (as always)
+        #   on:  camera/depth/image_raw = 16UC1 millimetres, 0 = no data
+        # camera/depth/image_meters is 32FC1 metres either way. cube_depth.depth_at
+        # branches on the encoding, so its consumers need no change.
+        self.declare_parameter('depth_registered', False)
+        self._registered = bool(self.get_parameter('depth_registered').value)
+
+        # fps: how many frames a second of each stream to process and publish. The Kinect
+        # itself always streams 30, and every frame used to be copied and converted in the
+        # callbacks (RGB 0.9 MB, depth to 16-bit and to float metres, 1.8 MB) whether or
+        # not anything would publish it. On the collector's Raspberry Pi kinect_bridge was
+        # the biggest CPU user (about 45%, Pi load median 6.3 on 4 cores, runs 19-21 of
+        # multi_robot_runs.md) while its consumers there use about 8 fps (remote YOLO) and
+        # 5 Hz (the local costmap, via the depth cloud). Surplus frames are now dropped in
+        # the callbacks BEFORE any conversion. 30 (the default) keeps every frame, as before.
+        # dynamic typing: fps:=15 (an integer on the command line) must work as well as 15.0
+        self.declare_parameter('fps', 30.0, ParameterDescriptor(dynamic_typing=True))
+        fps = float(self.get_parameter('fps').value)
+        # A frame is kept once at least this long after the last kept one; the slack
+        # absorbs the Kinect's own frame jitter, so 15 fps really keeps every other frame.
+        self._min_period = 0.0 if fps >= 30.0 else 0.9 / fps
+        self._last_rgb_kept = 0.0
+        self._last_depth_kept = 0.0
+        self._frames_dropped = 0
+
+        self.publisher_rgb = self.create_publisher(Image, 'camera/rgb/image_raw', qos_profile_sensor_data)
         # mono8, 0-255 rescaled from the raw 11-bit disparity — kept exactly as-is for
         # yolo_node.py's get_depth_at(), which reverses this specific scaling.
-        self.publisher_depth = self.create_publisher(Image, '/camera/depth/image_raw', qos_profile_sensor_data)
+        self.publisher_depth = self.create_publisher(Image, 'camera/depth/image_raw', qos_profile_sensor_data)
         # 32FC1, real metric depth — for RTAB-Map/SLAM consumers, which need actual
         # depth values, not a compact rescaled preview image.
         self.publisher_depth_meters = self.create_publisher(
-            Image, '/camera/depth/image_meters', qos_profile_sensor_data
+            Image, 'camera/depth/image_meters', qos_profile_sensor_data
         )
         self.publisher_camera_info = self.create_publisher(
-            CameraInfo, '/camera/camera_info', qos_profile_sensor_data
+            CameraInfo, 'camera/camera_info', qos_profile_sensor_data
         )
         self._camera_info_msg = _build_camera_info()
 
@@ -102,11 +137,26 @@ class KinectBridge(Node):
         self.kinect_thread.start()
 
         self.timer = self.create_timer(1.0 / 30.0, self.publish_frames)
-        self.get_logger().info('Decoupled 30FPS Kinect Bridge Started!')
+        self.get_logger().info(
+            f'Decoupled Kinect Bridge Started at {min(fps, 30.0):.0f} fps! depth: '
+            + ('registered to RGB, 16UC1 mm' if self._registered else 'raw disparity, mono8'))
+
+    def _keep(self, last_attr):
+        """Return True if a frame arriving now should be processed (see the fps param)."""
+        if self._min_period == 0.0:
+            return True
+        now = time.monotonic()
+        if now - getattr(self, last_attr) < self._min_period:
+            self._frames_dropped += 1
+            return False
+        setattr(self, last_attr, now)
+        return True
 
     # --- CAMERA THREAD (Producer) ---
 
     def video_cb(self, dev, data, timestamp):
+        if not self._keep('_last_rgb_kept'):
+            return
         self.latest_rgb = data.tobytes()
         self.latest_rgb_stamp = self.get_clock().now()
         self.new_rgb_available = True
@@ -117,6 +167,8 @@ class KinectBridge(Node):
         # Frames arriving during USB stream re-sync (Stream 70 "Invalid magic") are
         # nearly all-zero and would overwrite the last good frame, causing z=0.00m
         # forever. Drop any frame where fewer than 5% of pixels carry valid depth.
+        if not self._keep('_last_depth_kept'):
+            return
         valid_px = int(np.count_nonzero((data > 0) & (data < 2040)))
         if valid_px < 15000:  # 15k / 307200 ≈ 5%
             return
@@ -126,6 +178,38 @@ class KinectBridge(Node):
         self.latest_depth_stamp = self.get_clock().now()
         self.new_depth_available = True
 
+    def depth_cb_registered(self, dev, data, timestamp):
+        # data is uint16 millimetres aligned to RGB; 0 = no data. Same stream re-sync
+        # guard as depth_cb.
+        if not self._keep('_last_depth_kept'):
+            return
+        if int(np.count_nonzero(data)) < 15000:
+            return
+        self.latest_depth = data.astype(np.uint16).tobytes()
+        self.latest_depth_meters = (data.astype(np.float32) / 1000.0).tobytes()
+        self.latest_depth_stamp = self.get_clock().now()
+        self.new_depth_available = True
+
+    def _registered_runloop(self):
+        """freenect.runloop with registered depth; runloop itself hard-codes 11-bit."""
+        ctx = freenect.init()
+        dev = freenect.open_device(ctx, 0)
+        try:
+            freenect.set_depth_mode(dev, freenect.RESOLUTION_MEDIUM, freenect.DEPTH_REGISTERED)
+            freenect.set_video_mode(dev, freenect.RESOLUTION_MEDIUM, freenect.VIDEO_RGB)
+            freenect.set_depth_callback(dev, self.depth_cb_registered)
+            freenect.set_video_callback(dev, self.video_cb)
+            freenect.start_depth(dev)
+            freenect.start_video(dev)
+            while rclpy.ok():
+                if freenect.process_events(ctx) < 0:
+                    break
+            freenect.stop_depth(dev)
+            freenect.stop_video(dev)
+        finally:
+            freenect.close_device(dev)
+            freenect.shutdown(ctx)
+
     def run_camera_loop(self):
         import time
         MAX_RETRIES = 10
@@ -133,7 +217,10 @@ class KinectBridge(Node):
             try:
                 self._frames_received = 0
                 self.get_logger().info(f'Kinect: starting runloop (attempt {attempt + 1}/{MAX_RETRIES})…')
-                freenect.runloop(video=self.video_cb, depth=self.depth_cb)
+                if self._registered:
+                    self._registered_runloop()
+                else:
+                    freenect.runloop(video=self.video_cb, depth=self.depth_cb)
                 if self._frames_received > 0:
                     # Runloop ended after real streaming — reconnect
                     self.get_logger().warn('Kinect runloop exited. Reconnecting in 2 s…')
@@ -207,8 +294,12 @@ class KinectBridge(Node):
                 msg = Image()
                 msg.header.stamp = stamp
                 msg.header.frame_id = CAMERA_OPTICAL_FRAME
-                msg.height, msg.width, msg.step = 480, 640, 640
-                msg.encoding = 'mono8'
+                if self._registered:
+                    msg.height, msg.width, msg.step = 480, 640, 640 * 2
+                    msg.encoding = '16UC1'
+                else:
+                    msg.height, msg.width, msg.step = 480, 640, 640
+                    msg.encoding = 'mono8'
                 msg.data = self.latest_depth
                 self.publisher_depth.publish(msg)
 

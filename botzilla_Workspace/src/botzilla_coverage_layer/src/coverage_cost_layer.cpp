@@ -4,6 +4,8 @@
 #include <cmath>
 
 #include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/layered_costmap.hpp"
+#include "tf2/exceptions.h"
 #include "pluginlib/class_list_macros.hpp"
 
 namespace botzilla_coverage_layer
@@ -18,7 +20,20 @@ void CoverageCostLayer::onInitialize()
 
   declareParameter("enabled", rclcpp::ParameterValue(true));
   declareParameter("topic", rclcpp::ParameterValue(std::string("/coverage_cost_map")));
+  // lethal: the grid holds obstacles, not preferences. Cells >= 50 become LETHAL and
+  // nothing is capped or skipped; cells 1..49 are a soft cost halo. botzilla_fleet uses a second instance of this layer
+  // ('fleet_layer') for the other robot's footprint and the known cubes: they move or
+  // disappear, and this layer repaints its whole previous extent on every message, so
+  // an old footprint is gone at the next update. As marking points in an obstacle
+  // layer they lingered until a LiDAR ray happened to pass through each cell.
+  declareParameter("lethal", rclcpp::ParameterValue(false));
+  // max_age_s > 0: drop the grid if no message arrived for this long (measured on this
+  // machine's clock, at receipt), so a dead publisher cannot leave obstacles behind.
+  declareParameter("max_age_s", rclcpp::ParameterValue(0.0));
   node->get_parameter(name_ + ".enabled", enabled_);
+  node->get_parameter(name_ + ".lethal", lethal_);
+  node->get_parameter(name_ + ".max_age_s", max_age_s_);
+  clock_ = node->get_clock();
   std::string topic;
   node->get_parameter(name_ + ".topic", topic);
 
@@ -36,8 +51,9 @@ void CoverageCostLayer::onInitialize()
     std::bind(&CoverageCostLayer::coverageCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(
-    logger_, "CoverageCostLayer '%s': %s, listening on %s",
-    name_.c_str(), enabled_ ? "enabled" : "disabled", topic.c_str());
+    logger_, "CoverageCostLayer '%s': %s, listening on %s%s",
+    name_.c_str(), enabled_ ? "enabled" : "disabled", topic.c_str(),
+    lethal_ ? " (lethal obstacles)" : "");
 }
 
 void CoverageCostLayer::reset()
@@ -61,6 +77,35 @@ CoverageCostLayer::Extent CoverageCostLayer::extentOf(const nav_msgs::msg::Occup
   e.max_y = e.min_y + grid.info.height * grid.info.resolution;
   e.valid = true;
   return e;
+}
+
+bool CoverageCostLayer::gridToCostmap(const std::string & grid_frame, Rigid2D & out)
+{
+  // The grid may be in another frame than this costmap: botzilla_fleet's obstacle grids
+  // are in 'map', while a local costmap works in 'odom'. Applying map coordinates as if
+  // they were odom ones drew the other robot shifted by the whole map->odom correction
+  // (seen 2026-10-06 in the collector's local costmap). The global costmap is in 'map'
+  // itself, so it was right and the coverage grid never showed this.
+  const std::string costmap_frame = layered_costmap_->getGlobalFrameID();
+  if (grid_frame.empty() || grid_frame == costmap_frame) {
+    out = Rigid2D();
+    return true;
+  }
+  try {
+    const auto t = tf_->lookupTransform(costmap_frame, grid_frame, tf2::TimePointZero);
+    const auto & q = t.transform.rotation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    out.x = t.transform.translation.x;
+    out.y = t.transform.translation.y;
+    out.c = std::cos(yaw);
+    out.s = std::sin(yaw);
+    return true;
+  } catch (const tf2::TransformException & e) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 5000, "CoverageCostLayer '%s': no transform %s -> %s yet: %s",
+      name_.c_str(), grid_frame.c_str(), costmap_frame.c_str(), e.what());
+    return false;
+  }
 }
 
 void CoverageCostLayer::coverageCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg)
@@ -89,6 +134,8 @@ void CoverageCostLayer::coverageCallback(nav_msgs::msg::OccupancyGrid::ConstShar
     }
   }
   grid_ = msg;
+  dirty_frame_ = msg->header.frame_id;
+  received_ = clock_->now();
 }
 
 void CoverageCostLayer::updateBounds(
@@ -96,17 +143,62 @@ void CoverageCostLayer::updateBounds(
   double * min_x, double * min_y, double * max_x, double * max_y)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (max_age_s_ > 0.0 && grid_ && (clock_->now() - received_).seconds() > max_age_s_) {
+    // Stale: forget it, and repaint where it was so its cells are cleared.
+    Extent old = extentOf(*grid_);
+    if (old.valid) {
+      if (dirty_.valid) {
+        dirty_.min_x = std::min(dirty_.min_x, old.min_x);
+        dirty_.min_y = std::min(dirty_.min_y, old.min_y);
+        dirty_.max_x = std::max(dirty_.max_x, old.max_x);
+        dirty_.max_y = std::max(dirty_.max_y, old.max_y);
+      } else {
+        dirty_ = old;
+      }
+    }
+    grid_.reset();
+  }
   if (!dirty_.valid) {
     return;
   }
+  // dirty_ is in the grid's frame: take its corners into this costmap's frame.
+  Rigid2D g2c;
+  if (!gridToCostmap(dirty_frame_, g2c)) {
+    return;   // keep dirty_ for the next cycle
+  }
+  Extent window;
+  for (double gx : {dirty_.min_x, dirty_.max_x}) {
+    for (double gy : {dirty_.min_y, dirty_.max_y}) {
+      const double wx = g2c.x + g2c.c * gx - g2c.s * gy;
+      const double wy = g2c.y + g2c.s * gx + g2c.c * gy;
+      if (!window.valid) {
+        window = Extent{wx, wy, wx, wy, true};
+      } else {
+        window.min_x = std::min(window.min_x, wx);
+        window.min_y = std::min(window.min_y, wy);
+        window.max_x = std::max(window.max_x, wx);
+        window.max_y = std::max(window.max_y, wy);
+      }
+    }
+  }
+  // Also repaint where the previous grid was drawn in THIS frame: if map->odom moved
+  // since, the new window alone could leave a sliver of the old drawing behind.
+  const Extent drawn = window;
+  if (last_window_.valid) {
+    window.min_x = std::min(window.min_x, last_window_.min_x);
+    window.min_y = std::min(window.min_y, last_window_.min_y);
+    window.max_x = std::max(window.max_x, last_window_.max_x);
+    window.max_y = std::max(window.max_y, last_window_.max_y);
+  }
+  last_window_ = drawn;
   // Grow the update window over the whole coverage grid when it changes. Everything
   // inside the window is reset and repainted by every layer, so this is also what
   // removes a penalty the new grid no longer carries. Between messages this layer
   // adds nothing and just repaints whatever window the other layers asked for.
-  *min_x = std::min(*min_x, dirty_.min_x);
-  *min_y = std::min(*min_y, dirty_.min_y);
-  *max_x = std::max(*max_x, dirty_.max_x);
-  *max_y = std::max(*max_y, dirty_.max_y);
+  *min_x = std::min(*min_x, window.min_x);
+  *min_y = std::min(*min_y, window.min_y);
+  *max_x = std::max(*max_x, window.max_x);
+  *max_y = std::max(*max_y, window.max_y);
   dirty_.valid = false;
 }
 
@@ -131,9 +223,49 @@ void CoverageCostLayer::updateCosts(
   const double oy = grid->info.origin.position.y;
   const int gw = static_cast<int>(grid->info.width);
   const int gh = static_cast<int>(grid->info.height);
+  Rigid2D g2c;
+  if (!gridToCostmap(grid->header.frame_id, g2c)) {
+    return;
+  }
+  // Costmap world (wx, wy) -> grid frame: the inverse of g2c.
+  auto toGrid = [&g2c](double wx, double wy, double & gx_m, double & gy_m) {
+      const double dx = wx - g2c.x, dy = wy - g2c.y;
+      gx_m = g2c.c * dx + g2c.s * dy;
+      gy_m = -g2c.s * dx + g2c.c * dy;
+    };
   // Published 0..100 -> internal 0..252. Capped one below INSCRIBED so this layer
   // can never, by itself, make a cell a collision.
   constexpr int kMaxInternal = nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE - 1;
+
+  if (lethal_) {
+    for (int j = min_j; j < max_j; ++j) {
+      for (int i = min_i; i < max_i; ++i) {
+        double wx, wy, px, py;
+        master_grid.mapToWorld(i, j, wx, wy);
+        toGrid(wx, wy, px, py);
+        const int gx = static_cast<int>(std::floor((px - ox) / res));
+        const int gy = static_cast<int>(std::floor((py - oy) / res));
+        if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
+          continue;
+        }
+        const int8_t value = grid->data[gy * gw + gx];
+        if (value >= 50) {
+          master_grid.setCost(i, j, nav2_costmap_2d::LETHAL_OBSTACLE);
+        } else if (value > 0) {
+          // Soft halo (1..49 -> cost 2..123): a preference to keep clear, never a
+          // collision, and never lowering what other layers put there. Lets a cube be
+          // passed close by when this layer sits after the inflation layer (the cube
+          // itself still lethal, but no 0.45 m inflated disc around it).
+          const unsigned char current = master_grid.getCost(i, j);
+          const int cost = static_cast<int>(std::lround(value * 2.52));
+          if (current != nav2_costmap_2d::NO_INFORMATION && cost > current) {
+            master_grid.setCost(i, j, static_cast<unsigned char>(cost));
+          }
+        }
+      }
+    }
+    return;
+  }
 
   for (int j = min_j; j < max_j; ++j) {
     for (int i = min_i; i < max_i; ++i) {
@@ -143,10 +275,11 @@ void CoverageCostLayer::updateCosts(
       {
         continue;
       }
-      double wx, wy;
+      double wx, wy, px, py;
       master_grid.mapToWorld(i, j, wx, wy);
-      const int gx = static_cast<int>(std::floor((wx - ox) / res));
-      const int gy = static_cast<int>(std::floor((wy - oy) / res));
+      toGrid(wx, wy, px, py);
+      const int gx = static_cast<int>(std::floor((px - ox) / res));
+      const int gy = static_cast<int>(std::floor((py - oy) / res));
       if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) {
         continue;
       }

@@ -191,13 +191,23 @@ class RPLidar:
         self._ser.dtr = True
 
     def iter_scans(self):
-        """Start scanning; yield ScanPoints until stop_scan() is called.
+        """Start scanning; yield valid ScanPoints until stop_scan() is called.
 
-        Raises RPLidarError if no complete packet arrives for DATA_TIMEOUT_S. Without
+        Raises RPLidarError if no valid packet arrives for DATA_TIMEOUT_S. Without
         that check a device which accepted CMD_SCAN but then stopped streaming (motor
         not spinning, or the link left mid-stream by an unclean shutdown) makes this
         loop spin on read timeouts forever: no data, no exception, so the caller's
         reconnect path never runs and the node hangs silently with /scan simply absent.
+
+        Invalid packets are never yielded; instead the stream is resynchronised by
+        dropping one byte and re-checking. On the CH340 adapter at 460800 baud on the
+        Raspberry Pi the link loses a byte roughly once a second; reading fixed 5-byte
+        chunks without resync left every later packet misaligned (validity fell from
+        100% to ~16% about 1.5s into the scan and never recovered, and ~1 in 4
+        misaligned packets still passed the check bits, leaking garbage points). With
+        resync a 10s soak gave ~4000 valid points/s at ~8.5 Hz with 12 resync events.
+        (Measured on the collector robot's Pi with ~/hiruna/lidar-check; ported here
+        so the ROS node gets the same fix.)
         """
         self._ser.reset_input_buffer()
         self._ser.write(CMD_SCAN)
@@ -206,18 +216,23 @@ class RPLidar:
         self._scanning = True
 
         last_packet_at = time.monotonic()
+        buf = bytearray()
         while self._scanning:
-            packet = self._ser.read(5)
-            if len(packet) < 5:
-                stalled_for = time.monotonic() - last_packet_at
-                if stalled_for > DATA_TIMEOUT_S:
-                    raise RPLidarError(
-                        f'no scan data for {stalled_for:.1f}s after CMD_SCAN — '
-                        f'device stalled or stream desynchronised'
-                    )
-                continue
-            last_packet_at = time.monotonic()
-            yield parse_scan_point(packet)
+            buf += self._ser.read(max(5, self._ser.in_waiting))
+            while len(buf) >= 5 and self._scanning:
+                point = parse_scan_point(bytes(buf[:5]))
+                if not point.valid:
+                    del buf[0]
+                    continue
+                del buf[:5]
+                last_packet_at = time.monotonic()
+                yield point
+            stalled_for = time.monotonic() - last_packet_at
+            if stalled_for > DATA_TIMEOUT_S:
+                raise RPLidarError(
+                    f'no valid scan data for {stalled_for:.1f}s after CMD_SCAN — '
+                    f'device stalled or stream desynchronised'
+                )
 
     def stop_scan(self):
         self._scanning = False

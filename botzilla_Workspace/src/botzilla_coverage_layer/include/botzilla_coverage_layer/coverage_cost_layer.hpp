@@ -64,6 +64,14 @@ private:
     bool valid{false};
   };
   static Extent extentOf(const nav_msgs::msg::OccupancyGrid & grid);
+  // Grid frame -> costmap frame, as a 2-D rigid transform (rotation c, s; translation).
+  struct Rigid2D
+  {
+    double x{0.0}, y{0.0}, c{1.0}, s{0.0};
+  };
+  bool gridToCostmap(const std::string & grid_frame, Rigid2D & out);
+  std::string dirty_frame_;
+  Extent last_window_;   // costmap-frame window of the last repaint
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_;
   std::mutex mutex_;
@@ -72,6 +80,10 @@ private:
   // the new grid's extent, so a grid that shrank, moved, or went all-zero clears
   // the stale penalty it used to cover.
   Extent dirty_;
+  bool lethal_{false};
+  double max_age_s_{0.0};
+  rclcpp::Clock::SharedPtr clock_;
+  rclcpp::Time received_{0, 0, RCL_ROS_TIME};
 };
 
 }  // namespace botzilla_coverage_layer

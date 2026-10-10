@@ -1,0 +1,667 @@
+"""
+fleet_manager_node.py — the leader's task allocator: turn detections into collector tasks.
+
+Runs on the leader (the Jetson), un-namespaced, next to its normal mission stack with
+detect_only set, so the leader only searches and never chases. It
+
+  1. projects every ranged /detected_cube into the map from the leader's own pose and
+     merges it into a CubeRegistry (cube_registry.py: confirmation, HOME and
+     collector exclusion zones, failure limits);
+  2. whenever the collector reports IDLE, publishes the nearest confirmed cube to it as
+     a CubeTask on /<ns>/fleet/task (latched, re-sent until the collector takes it);
+  3. records the collector's COLLECTED / FAILED reports back into the registry.
+
+Discrete goals only, never velocities (PROJECT.md §6): if the network drops the
+collector finishes or fails its current task on its own, and a collector that goes
+silent for STATUS_TIMEOUT_S has its task returned to the pool.
+
+Also publishes an obstacle grid per robot (the other robot and the known cubes, see
+OBSTACLE_GRID_HZ), the collector's cleaned map, and /fleet/cubes (MarkerArray)
+for RViz, and logs a one-line summary every SUMMARY_PERIOD_S, plus one JSON line per
+event to the run log for analysis.
+"""
+import json
+import math
+
+from botzilla_fleet.cube_registry import CubeRegistry
+from botzilla_fleet.leader_state import LeaderStateTracker, MOVING, PARKED, STUCK
+from botzilla_fleet.map_tools import (
+    clear_discs, clear_shape, shapes_grid,
+)
+from botzilla_fleet.right_of_way import EscapeLatch, GiveWay, path_ahead
+from botzilla_interfaces.msg import CollectorStatus, CubeTask
+from botzilla_navigation.cube_detections import project_detection
+from geometry_msgs.msg import Point, PoseStamped
+from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import OccupancyGrid, Path
+import numpy as np
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import Bool, String
+import tf2_ros
+from tf2_ros import TransformException
+from visualization_msgs.msg import Marker, MarkerArray
+
+CUBE_MAX_RANGE_M = 1.0              # = executor_node.CUBE_MAX_RANGE_M
+COLLECTOR_HOME_EXCLUSION_M = 1.0    # = executor_node.HOME_CUBE_SUPPRESS_RADIUS_M
+# Around the collector itself: the cube it is pushing sits ~0.3-0.6 m ahead of base_link.
+COLLECTOR_BODY_EXCLUSION_M = 0.8
+STATUS_TIMEOUT_S = 10.0
+# After the collector reports its own failure ('collector:' detail, e.g. Nav2 not up),
+# wait this long before assigning again; the cube goes back without a failure mark.
+COLLECTOR_FAULT_HOLDOFF_S = 15.0
+ALLOCATE_PERIOD_S = 1.0
+# A cube is not assigned while the leader is within this of it. In run 16
+# (multi_robot_runs.md) the leader confirmed a cube while standing 0.4 m from it, turning
+# to inspect it, and it was assigned one second later: the collector drove in to grab it
+# right beside the leader and wedged the two together for the rest of the run. The cube
+# stays pending and is offered once the leader has moved on — or after
+# LEADER_DEFER_MAX_S anyway if the leader is PARKED there (leader_state.py): the leader
+# only confirms cubes it sees within 1 m (CUBE_MAX_RANGE_M), so a leader that stops for
+# good near some (exploration over) would otherwise hold them back for ever (the fake
+# harness's default scenario delivered nothing). The collector's own right-of-way rules
+# (collector_node YIELD_TRIGGER_M) then handle the proximity. Never while the leader is
+# MOVING (turning to inspect) or STUCK there: that is exactly run 16's collision, and a
+# plain time cap released the cube to a leader still spinning beside it in the harness.
+LEADER_CUBE_CLEAR_M = 1.0
+LEADER_DEFER_MAX_S = 30.0
+SUMMARY_PERIOD_S = 30.0
+MAP_FRAME = 'map'
+ROBOT_FRAME = 'base_link'
+
+# Obstacles for each robot's costmaps, as one small OccupancyGrid per robot drawn by the
+# 'fleet_layer' (botzilla_coverage_layer in lethal mode, nav2_params.yaml, placed AFTER
+# the inflation layer). It repaints its whole previous extent on every message, so a
+# robot that moved, or a cube that was collected, is gone at the next update:
+#   /fleet/obstacle_grid        for the leader:    the collector + known cubes
+#   /<ns>/fleet/obstacle_grid   for the collector: the leader + known cubes other than
+#                               the one it is collecting
+# Why each is needed:
+# - cubes: the leader drove into cubes it had detected. The RPLIDAR scans at 0.24 m (URDF
+#   laser_joint), above a cube, the depth camera's low scan only sees from 0.55 m out, and
+#   in detect-only mode the executor deliberately ignores detections.
+# - robots: neither LiDAR sees the other robot's 0.09 m Kobuki body; at 0.24 m there is
+#   only a slim LiDAR housing and camera mount, so returns come and go as they close in —
+#   the leader drove into the collector on 2026-10-05.
+# Each shape is drawn exactly (a cell is lethal when its centre lies inside the shape, no
+# margin) with a soft halo around it, and NOT inflated: lethal is enough to stop either
+# robot's footprint (DWB) from ever overlapping it, and the halo makes the planners keep
+# their distance when there is room. Inflating the other robot's footprint by 0.45 m
+# deadlocked both robots on 2026-10-06: once they were 0.36 m apart each stood inside the
+# other's inflated zone, so neither could plan out (16 failed plans, 29 back-ups, 32
+# spins on the leader; every delivery released short). Inflated cubes likewise turned a
+# cube in a corridor into a wall.
+OBSTACLE_GRID_HZ = 5.0
+OBSTACLE_GRID_RES = 0.05
+CUBE_OBSTACLE_HALF_M = 0.05        # a 0.10 m square per cube
+# Halos fade linearly from the value at the shape's edge to a quarter of it at the radius
+# (halo 45 -> costmap cost ~113). Never lethal or inscribed: a narrow pass stays possible.
+# Cube: 0.35 m, enough that the planner's centre line keeps the ~0.22 m half-width of the
+# robot off it when there is room.
+CUBE_HALO_RADIUS_M = 0.35
+CUBE_HALO_VALUE = 40
+# Robots, as measured and unpadded (the 0.05 m padding in their Nav2 footprints is each
+# robot's own safety margin, not part of the other robot's body):
+# - leader: a bare circular Kobuki since 2026-10-06 (arms moved to the collector),
+#   body radius 0.17 m (botzilla_qbot.urdf base_link cylinder);
+# - collector: Kobuki with the grabber arms, 0.48 m from arm tips to the back of the
+#   chassis and 0.33 m across, base_link at the body centre (nav2_params.yaml's measured
+#   derivation): x -0.17..+0.31, y +-0.165.
+# 0.5 m halo: the robots give each other room without ever being trapped by it.
+# The leader is drawn with LEADER_PADDING_M around its 0.17 m body and a longer halo:
+# the leader has right of way (collector_node YIELD_TRIGGER_M), so the collector's
+# planner should keep well clear of it in the first place.
+LEADER_BODY_RADIUS_M = 0.17
+LEADER_PADDING_M = 0.10
+LEADER_SHAPE = LEADER_BODY_RADIUS_M + LEADER_PADDING_M   # circle radius, m
+LEADER_HALO_RADIUS_M = 0.7
+# A STUCK leader gets a wider halo in the collector's grid, so the collector's planner
+# keeps out of its recovery room when there is space: the collector gives way to a STUCK
+# leader inside collector_node YIELD_TRIGGER_M (0.9 m), and a route passing at 0.7-0.9 m
+# kept setting that off in the harness (yield, clear out, resume, yield again).
+LEADER_STUCK_HALO_RADIUS_M = 1.1
+COLLECTOR_SHAPE = ((-0.17, 0.31), (-0.165, 0.165))   # (x min/max, y min/max), base_link
+# Each robot's OWN Nav2 footprint (padded): nav2_params.yaml robot_radius for the leader,
+# params_rewrite.COLLECTOR_FOOTPRINT for the collector. Nothing in a robot's own grid is
+# drawn inside it. A robot cannot be standing on a cube, so a cube mark there is a wrong
+# estimate — and a lethal cell inside a robot's footprint makes Nav2 refuse every move,
+# even moving away. On 2026-10-06 a cube estimate ended up under the leader (RViz showed
+# it on a pink cube it was in reality only next to) and it stayed stuck for 4 minutes.
+# The mark stays in the other robot's grid, and comes back in this one once it moves off.
+LEADER_NAV_FOOTPRINT = 0.22
+# The collector's drop zone is kept out of the LEADER's way: a lethal disc of this radius
+# (the collector's footprint reaches 0.35 m from base_link) around the collector's HOME,
+# with a soft halo, in the leader's grid only. In run 12 of multi_robot_runs.md the
+# leader spent the whole second half within 0.2-0.35 m of that HOME, among the cubes
+# already dropped there: the collector's deliveries then failed in the last few
+# centimetres, and the leader itself was hemmed in (~220 footprint hits a minute). The
+# leader starts 0.64 m from it, outside. If ever caught inside, its own footprint is
+# still cleared (LEADER_NAV_FOOTPRINT) so it can drive out.
+# 0.25, not 0.45 (run 14, 2026-10-07): the leader starts 0.64 m from the collector's
+# HOME, and a 0.45 m lethal disc came within ~0.2 m of its own body at the start; its
+# first goals kept failing against it (241 footprint hits in one minute).
+DROP_ZONE_RADIUS_M = 0.25
+# Off for run 16 (2026-10-07, run 15): the collector's HOME was only 0.64 m from the
+# leader's own start, so whenever the leader came back near its start the drop-zone disc
+# pinned it against the collector — both robots stuck. Back on from run 18: the collector
+# now starts (so its HOME is) 1.34 m from the leader's start (run 17), and the disc is
+# not drawn while the leader is within LEADER_STATIC_CLEAR_M of it, so it can never trap
+# the leader again; it only keeps the leader from wandering onto the delivered cubes.
+DROP_ZONE_ENABLED = True
+# Cube marks and the drop zone are not drawn in the leader's grid within this of the
+# leader's centre (0.22 m footprint + ~0.13 m). Clearing only the cells under the
+# footprint (LEADER_NAV_FOOTPRINT) was not enough: in run 17 the leader ended 0.25 m from
+# a cube estimate, so the 0.10 m mark overlapped its 0.22 m footprint by 2 cm, and every
+# move was refused for the last 2.5 minutes. An estimate is only good to ~0.1 m anyway,
+# and the leader's own sensors still see the real cube. The COLLECTOR's mark is not
+# relaxed like this: it moves, and the leader must not creep into it.
+LEADER_STATIC_CLEAR_M = 0.35
+
+# NO soft halos in the LEADER's grid — bodies only (the collector, the cube cores, the
+# drop zone), lethal. The leader has right of way (collector_node YIELD_TRIGGER_M), so it
+# only needs to avoid what is actually there; DWB's footprint check still stops it
+# touching any of it. With halos the leader kept getting stuck inside them, near the
+# collector and near cubes, moving in short bursts (run 14). The collector's grid keeps
+# its halos: it is the one meant to keep its distance.
+COLLECTOR_NAV_FOOTPRINT = ((-0.22, 0.36), (-0.215, 0.215))
+ROBOT_HALO_RADIUS_M = 0.5
+ROBOT_HALO_VALUE = 45
+# A pose older than this is not drawn: a stale footprint would block empty floor.
+ROBOT_POSE_MAX_AGE_S = 1.5
+# The leader's route ahead, as soft cost in the collector's grid (right_of_way.path_ahead):
+# a soft disc every 0.15 m along the next 1.5 m. Only while the leader is MOVING and the
+# route is fresh. From DWB's received_global_plan — the path the leader is actually
+# following — not /plan, which also carries the explorer's candidate-frontier queries.
+PATH_COST_RADIUS_M = 0.35
+PATH_COST_VALUE = 35
+PLAN_MAX_AGE_S = 3.0
+# The same route, longer and in every state (STUCK included: that is where it will go once
+# free), sent to the collector on /<ns>/fleet/leader_route, so its clear-out keeps off it
+# (standoff.choose_clear_spot ROUTE_CLEAR_M; run 21's chase).
+ROUTE_FOR_COLLECTOR_M = 4.0
+RIGHT_OF_WAY_HZ = 2.0
+
+# The collector's map: the leader's /map republished on /<ns>/fleet/map with a disc of
+# this radius forced free around the collector's HOME and its current pose. The leader's
+# LiDAR maps the parked collector itself as an obstacle; on the raw /map the collector
+# started inside a lethal blob (every plan from its start failed, 11 back-up recoveries)
+# and its HOME was that same blob, so every delivery failed (2026-10-05). The robot is
+# physically there, so that floor cannot be an obstacle for it. 0.5 m covers the
+# footprint's farthest corner (0.42 m from base_link) with margin.
+COLLECTOR_MAP_CLEAR_M = 0.5
+# Republish it at most this often. RTAB-Map updates /map about once a second, and every
+# copy makes the collector's global costmap redo its static layer and re-inflate the
+# whole map — heavy on the Pi, whose planner then answered too slowly (12 acknowledgement
+# time-outs in run 8 of multi_robot_runs.md). The floor plan changes far slower than that.
+COLLECTOR_MAP_PERIOD_S = 5.0
+
+COLOURS = {
+    'unconfirmed': (0.6, 0.6, 0.6),
+    'pending': (1.0, 0.8, 0.0),
+    'assigned': (0.0, 0.6, 1.0),
+    'collected': (0.0, 0.9, 0.0),
+    'failed': (0.9, 0.0, 0.0),
+}
+
+
+class FleetManagerNode(Node):
+    def __init__(self):
+        super().__init__('fleet_manager_node')
+        self.declare_parameter('collector_ns', 'bz2')
+        self.declare_parameter('cube_max_range_m', CUBE_MAX_RANGE_M)
+        self.declare_parameter('home_exclusion_m', COLLECTOR_HOME_EXCLUSION_M)
+        self.declare_parameter('leader_home_exclusion_m', 0.0)
+        self.declare_parameter('confirm_sightings', 2)
+        self._ns = self.get_parameter('collector_ns').value.strip('/')
+        self._max_range = self.get_parameter('cube_max_range_m').value
+        self._home_excl = self.get_parameter('home_exclusion_m').value
+        self._leader_home_excl = self.get_parameter('leader_home_exclusion_m').value
+        self._registry = CubeRegistry(
+            confirm_sightings=int(self.get_parameter('confirm_sightings').value)
+        )
+
+        self._leader_home = None
+        self._status = None          # latest CollectorStatus
+        self._status_time = None
+        # Task ids are per ASSIGNMENT, not per cube: a cube that failed once is assigned
+        # again later, and reusing its id would let the collector's report of the first
+        # attempt (still in its status as last_task_id) close the second one at once.
+        self._task_seq = 0
+        self._holdoff_until = 0.0
+        self._current = None         # (task_id, cube_id) assigned and not yet reported
+        self._assigned_time = None
+        self._home_zone_applied = False
+        self._collector_map_sent = None   # see COLLECTOR_MAP_PERIOD_S
+        self._leader_state = LeaderStateTracker()   # see leader_state.py
+        self._leader_state_last = None
+        self._deferred = {}          # cube id -> when LEADER_CUBE_CLEAR_M first held it
+        self._plan = None            # (time_s, [(x, y), ...]) the leader's route
+        self._escape = EscapeLatch()     # see right_of_way.py
+        self._give_way = GiveWay()
+        self._escaping_logged = False
+
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        latched = QoSProfile(depth=1)
+        latched.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        latched.reliability = QoSReliabilityPolicy.RELIABLE
+        self._task_pub = self.create_publisher(CubeTask, f'/{self._ns}/fleet/task', latched)
+        self._marker_pub = self.create_publisher(MarkerArray, '/fleet/cubes', 10)
+        # Latched (transient local, reliable): the layer subscribes that way, and a
+        # volatile publisher is QoS-incompatible with it — DDS then delivers nothing,
+        # with only a warning on the publisher's side.
+        self._leader_grid_pub = self.create_publisher(
+            OccupancyGrid, '/fleet/obstacle_grid', latched)                 # for the leader
+        self._collector_grid_pub = self.create_publisher(
+            OccupancyGrid, f'/{self._ns}/fleet/obstacle_grid', latched)     # for the collector
+
+        self._leader_pose_pub = self.create_publisher(
+            PoseStamped, f'/{self._ns}/fleet/leader_pose', 10)
+        self._leader_state_pub = self.create_publisher(
+            String, f'/{self._ns}/fleet/leader_state', 10)
+        self._leader_route_pub = self.create_publisher(
+            Path, f'/{self._ns}/fleet/leader_route', 10)
+        # The leader's Nav2 feedback (whoever sent the goal: frontier explorer or
+        # executor) — its number_of_recoveries is how leader_state.py sees it stuck.
+        self.create_subscription(
+            NavigateToPose.Impl.FeedbackMessage, '/navigate_to_pose/_action/feedback',
+            lambda m: self._leader_state.feedback(
+                self._now_s(), m.feedback.number_of_recoveries),
+            10)
+        self._collector_map_pub = self.create_publisher(
+            OccupancyGrid, f'/{self._ns}/fleet/map', latched)
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, latched)
+        self.create_timer(1.0 / OBSTACLE_GRID_HZ, self._publish_obstacles)
+        self.create_subscription(Point, '/detected_cube', self._cube_cb, 10)
+        self.create_subscription(
+            CollectorStatus, f'/{self._ns}/fleet/status', self._status_cb, 10
+        )
+        self.create_subscription(Path, '/received_global_plan', self._plan_cb, 10)
+        # Same latched QoS as executor_node's publisher, which frontier_explorer_node
+        # subscribes to; see GiveWay.
+        self._explore_pub = self.create_publisher(Bool, '/exploration_enabled', latched)
+        self.create_timer(1.0 / RIGHT_OF_WAY_HZ, self._right_of_way)
+        self.create_timer(ALLOCATE_PERIOD_S, self._allocate)
+        self.create_timer(SUMMARY_PERIOD_S, self._summary)
+        self.get_logger().info(
+            f'fleet_manager_node: leader searches, collector /{self._ns} collects. '
+            f'Tasks on /{self._ns}/fleet/task.'
+        )
+
+    # ------------------------------------------------------------------ #
+
+    def _now_s(self):
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _event(self, kind, **fields):
+        fields.update(event=kind, t=round(self._now_s(), 2))
+        self.get_logger().info('FLEET ' + json.dumps(fields))
+
+    def _leader_pose(self):
+        try:
+            tf = self._tf_buffer.lookup_transform(MAP_FRAME, ROBOT_FRAME, rclpy.time.Time())
+        except TransformException:
+            return None
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return t.x, t.y, yaw
+
+    def _exclusions(self):
+        zones = []
+        if self._leader_home is not None and self._leader_home_excl > 0:
+            zones.append((*self._leader_home, self._leader_home_excl))
+        s = self._status
+        if s is not None and s.home_set:
+            zones.append((s.home_x, s.home_y, self._home_excl))
+        if s is not None and s.localised and self._status_fresh():
+            zones.append((s.x, s.y, COLLECTOR_BODY_EXCLUSION_M))
+        return zones
+
+    def _status_fresh(self):
+        return (self._status_time is not None
+                and self._now_s() - self._status_time < STATUS_TIMEOUT_S)
+
+    # ------------------------------------------------------------------ #
+
+    def _cube_cb(self, msg):
+        if msg.z <= 0.0 or msg.z > self._max_range:
+            return
+        pose = self._leader_pose()
+        if pose is None:
+            return
+        if self._leader_home is None:
+            self._leader_home = pose[:2]
+        x, y = project_detection(pose[0], pose[1], pose[2], msg.x, msg.z)
+        before = len(self._registry.cubes)
+        cube = self._registry.observe(x, y, self._now_s(), self._exclusions())
+        if cube is None:
+            return
+        if len(self._registry.cubes) > before:
+            self._event('new_cube', id=cube.id, x=round(x, 2), y=round(y, 2))
+        elif cube.sightings == self._registry.confirm_sightings:
+            self._event('confirmed', id=cube.id, x=round(cube.x, 2), y=round(cube.y, 2))
+
+    def _status_cb(self, msg):
+        first = self._status is None
+        self._status = msg
+        self._status_time = self._now_s()
+        if first:
+            self._event('collector_up', robot=msg.robot, state=msg.state)
+        # A restarted manager must not reuse ids the collector has already seen.
+        self._task_seq = max(self._task_seq, msg.task_id, msg.last_task_id)
+        if msg.home_set and not self._home_zone_applied:
+            self._home_zone_applied = True
+            self._collector_map_sent = None   # republish now, with its HOME cleared
+            gone = self._registry.drop_inside([(msg.home_x, msg.home_y, self._home_excl)])
+            self._event('collector_home', x=round(msg.home_x, 2), y=round(msg.home_y, 2),
+                        dropped=gone)
+        if (self._current is not None and msg.last_task_id == self._current[0]
+                and msg.task_id != self._current[0]
+                and msg.last_result != CollectorStatus.RESULT_NONE):
+            collected = msg.last_result == CollectorStatus.RESULT_COLLECTED
+            task_id, cube_id = self._current
+            if not collected and msg.last_detail.startswith('collector:'):
+                self._registry.unassign(cube_id)
+                self._holdoff_until = self._now_s() + COLLECTOR_FAULT_HOLDOFF_S
+                self._event('collector_fault', id=cube_id, task=task_id,
+                            detail=msg.last_detail)
+                self._current = None
+                return
+            cube = self._registry.report(cube_id, collected, self._now_s(),
+                                         msg.last_detail)
+            if not collected and msg.last_released:
+                in_home_zone = msg.home_set and math.hypot(
+                    msg.release_x - msg.home_x, msg.release_y - msg.home_y) < self._home_excl
+                if in_home_zone:
+                    # Left in the drop zone: that is a delivery, whatever the collector
+                    # called it. Relocating it there made it an obstacle ON HOME, which
+                    # blocked the next deliveries, and kept it pending, so the collector
+                    # was sent to look for cubes at its own drop zone (run 12).
+                    self._registry.mark_collected(cube_id)
+                    self._event('collected_in_home_zone', id=cube_id,
+                                x=round(msg.release_x, 2), y=round(msg.release_y, 2))
+                else:
+                    # The cube is no longer where it was estimated: the collector carried
+                    # it and left it here. Without this the registry kept the old
+                    # estimate, the obstacle mark stayed on empty floor and the next
+                    # attempt went to the wrong spot (multi_robot_runs.md, run 10).
+                    self._registry.relocate(cube_id, msg.release_x, msg.release_y)
+                    self._event('relocated', id=cube_id, x=round(msg.release_x, 2),
+                                y=round(msg.release_y, 2))
+            self._event('result', id=cube_id, task=task_id,
+                        result='collected' if collected else 'failed',
+                        detail=msg.last_detail, delivered=msg.delivered,
+                        status=cube.status if cube else None,
+                        took_s=round(self._now_s() - self._assigned_time, 1))
+            self._current = None
+
+    def _allocate(self):
+        self._publish_markers()
+        s = self._status
+        if s is None:
+            return
+        if not self._status_fresh():
+            if self._current is not None:
+                self._event('collector_silent', id=self._current[1], task=self._current[0])
+                self._registry.unassign(self._current[1])
+                self._current = None
+            return
+        if self._current is not None or s.state != 'IDLE' or not s.localised:
+            return
+        if self._now_s() < self._holdoff_until:
+            return
+        cube = self._registry.next_task((s.x, s.y), self._now_s(), self._held_back())
+        if cube is None:
+            return
+        self._registry.assign(cube.id)
+        self._task_seq += 1
+        self._current = (self._task_seq, cube.id)
+        self._assigned_time = self._now_s()
+        task = CubeTask(task_id=self._task_seq, cube_id=cube.id, sightings=cube.sightings)
+        task.target.x, task.target.y = cube.x, cube.y
+        self._task_pub.publish(task)
+        self._event('assign', id=cube.id, task=self._task_seq,
+                    x=round(cube.x, 2), y=round(cube.y, 2), sightings=cube.sightings,
+                    dist=round(math.hypot(cube.x - s.x, cube.y - s.y), 2))
+
+    def _held_back(self):
+        """Return the ids of cubes not to offer yet, see LEADER_CUBE_CLEAR_M."""
+        leader = self._leader_pose()
+        if leader is None:
+            return set()
+        now = self._now_s()
+        parked = self._leader_state.state(now) == PARKED
+        held = set()
+        for c in self._registry.cubes.values():
+            if c.status != 'pending' or not self._registry.confirmed(c):
+                continue
+            dist = math.hypot(c.x - leader[0], c.y - leader[1])
+            if dist >= LEADER_CUBE_CLEAR_M:
+                continue
+            if c.id not in self._deferred:
+                self._deferred[c.id] = now
+                self._event('deferred', id=c.id, reason='leader near cube',
+                            leader_dist=round(dist, 2))
+            if not parked or now - self._deferred[c.id] < LEADER_DEFER_MAX_S:
+                held.add(c.id)
+        return held
+
+    def _plan_cb(self, msg):
+        if msg.header.frame_id and msg.header.frame_id != MAP_FRAME:
+            return
+        self._plan = (self._now_s(), [(p.pose.position.x, p.pose.position.y)
+                                      for p in msg.poses])
+
+    def _collector_pose(self):
+        s = self._status
+        if (s is not None and s.localised and self._status_time is not None
+                and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
+            return (s.x, s.y, s.yaw)
+        return None
+
+    def _right_of_way(self):
+        """Pause the leader's exploration for a carrying collector (right_of_way.GiveWay)."""
+        leader, collector = self._leader_pose(), self._collector_pose()
+        dist = (math.hypot(leader[0] - collector[0], leader[1] - collector[1])
+                if leader is not None and collector is not None else None)
+        state = self._status.state if self._status is not None else ''
+        action = self._give_way.update(self._now_s(), state, dist)
+        if action is None:
+            return
+        self._explore_pub.publish(Bool(data=action == 'resume'))
+        self._event('leader_gives_way' if action == 'pause' else 'leader_resumes',
+                    collector_state=state, dist=round(dist, 2) if dist is not None else None)
+
+    def release_leader(self):
+        """Re-enable the leader's exploration if this node paused it (on shutdown)."""
+        if self._give_way.paused:
+            self._explore_pub.publish(Bool(data=True))
+
+    def _summary(self):
+        c = self._registry.counts()
+        s = self._status
+        coll = (f'{s.robot} {s.state} delivered={s.delivered}' if s is not None
+                else 'no collector status yet')
+        self.get_logger().info(
+            f'cubes: {c["unconfirmed"]} unconfirmed, {c["pending"]} pending, '
+            f'{c["assigned"]} assigned, {c["collected"]} collected, {c["failed"]} failed '
+            f'| {coll}'
+        )
+
+    def _publish_obstacles(self):
+        """Publish each robot's obstacle grid (see OBSTACLE_GRID_HZ)."""
+        assigned = self._current[1] if self._current is not None else None
+        h = CUBE_OBSTACLE_HALF_M
+        cubes, cubes_but_target = [], []
+        for cube in self._registry.cubes.values():
+            if cube.status == 'collected' or not self._registry.confirmed(cube):
+                continue
+            core = ((cube.x, cube.y, 0.0), ((-h, h), (-h, h)))
+            cubes.append(core + (0.0, 0))                                  # leader
+            if cube.id != assigned:
+                cubes_but_target.append(core + (CUBE_HALO_RADIUS_M, CUBE_HALO_VALUE))
+        s = self._status
+        collector = self._collector_pose()
+        leader = self._leader_pose()
+        if leader is not None:
+            # See LEADER_STATIC_CLEAR_M: no cube mark right next to the leader.
+            cubes = [c for c in cubes
+                     if math.hypot(c[0][0] - leader[0], c[0][1] - leader[1])
+                     >= LEADER_STATIC_CLEAR_M]
+
+        def robot(pose, shape, halo=ROBOT_HALO_RADIUS_M):
+            return ([(pose, shape, halo, ROBOT_HALO_VALUE)]
+                    if pose is not None else [])
+        # Empty grids are published too: the layer then repaints, and so clears, wherever
+        # the previous grid was.
+        drop_zone = []
+        if (DROP_ZONE_ENABLED and s is not None and s.home_set and (
+                leader is None or math.hypot(s.home_x - leader[0], s.home_y - leader[1])
+                >= DROP_ZONE_RADIUS_M + LEADER_STATIC_CLEAR_M)):
+            drop_zone = [((s.home_x, s.home_y, 0.0), DROP_ZONE_RADIUS_M, 0.0, 0)]
+        res = OBSTACLE_GRID_RES
+        self._leader_grid_pub.publish(self._to_msg(clear_shape(
+            shapes_grid(robot(collector, COLLECTOR_SHAPE, halo=0.0) + cubes + drop_zone, res),
+            res, leader, LEADER_NAV_FOOTPRINT)))
+        # The leader's pose and state for the collector's right-of-way rule
+        # (collector_node YIELD_TRIGGER_M); the collector has no other view of the leader.
+        if leader is not None:
+            now = self._now_s()
+            self._leader_state.pose(now, *leader)
+            state = self._leader_state.state(now)
+            self._leader_state_pub.publish(String(data=state))
+            if state != self._leader_state_last:
+                self._leader_state_last = state
+                self._event('leader_state', state=state, x=round(leader[0], 2),
+                            y=round(leader[1], 2))
+            msg = PoseStamped()
+            msg.header.frame_id = MAP_FRAME
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.pose.position.x, msg.pose.position.y = leader[0], leader[1]
+            msg.pose.orientation.z = math.sin(leader[2] / 2.0)
+            msg.pose.orientation.w = math.cos(leader[2] / 2.0)
+            self._leader_pose_pub.publish(msg)
+        # The collector's grid: the leader (its body only while they do not overlap, see
+        # right_of_way.EscapeLatch; the halo always), the leader's route ahead as soft
+        # cost, and the cubes other than its target.
+        draw_body = self._escape.update(leader[:2] if leader is not None else None,
+                                        collector, COLLECTOR_NAV_FOOTPRINT, LEADER_SHAPE,
+                                        s.state if s is not None else '')
+        if self._escape.escaping != self._escaping_logged:
+            self._escaping_logged = self._escape.escaping
+            self._event('escape' if self._escape.escaping else 'escape_over',
+                        collector=[round(v, 2) for v in collector] if collector else None)
+        leader_marks = []
+        if leader is not None:
+            halo = (LEADER_STUCK_HALO_RADIUS_M if self._leader_state_last == STUCK
+                    else LEADER_HALO_RADIUS_M)
+            leader_marks = [(leader, LEADER_SHAPE if draw_body else None,
+                             halo, ROBOT_HALO_VALUE)]
+        route = []
+        fresh_plan = (leader is not None and self._plan is not None
+                      and self._now_s() - self._plan[0] < PLAN_MAX_AGE_S)
+        if fresh_plan and self._leader_state_last == MOVING:
+            route = [((x, y, 0.0), None, PATH_COST_RADIUS_M, PATH_COST_VALUE)
+                     for x, y in path_ahead(self._plan[1], leader[:2])]
+        self._publish_leader_route(
+            path_ahead(self._plan[1], leader[:2], length_m=ROUTE_FOR_COLLECTOR_M)
+            if fresh_plan else [])
+        self._collector_grid_pub.publish(self._to_msg(clear_shape(
+            shapes_grid(leader_marks + route + cubes_but_target, res),
+            res, collector, COLLECTOR_NAV_FOOTPRINT)))
+
+    def _publish_leader_route(self, points):
+        """Send the leader's route ahead to the collector (empty = none known)."""
+        msg = Path()
+        msg.header.frame_id = MAP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for x, y in points:
+            p = PoseStamped()
+            p.header = msg.header
+            p.pose.position.x, p.pose.position.y = x, y
+            p.pose.orientation.w = 1.0
+            msg.poses.append(p)
+        self._leader_route_pub.publish(msg)
+
+    def _to_msg(self, raster):
+        """Wrap a (data, ox, oy, w, h) raster, or None, as an OccupancyGrid in the map."""
+        msg = OccupancyGrid()
+        msg.header.frame_id = MAP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = OBSTACLE_GRID_RES
+        msg.info.origin.orientation.w = 1.0
+        if raster is not None:
+            data, ox, oy, w, h = raster
+            msg.info.origin.position.x, msg.info.origin.position.y = ox, oy
+            msg.info.width, msg.info.height = w, h
+            msg.data = data.ravel().tolist()
+        return msg
+
+    def _map_cb(self, msg):
+        """Republish the leader's map for the collector, its own floor cleared."""
+        now = self._now_s()
+        if (self._collector_map_sent is not None
+                and now - self._collector_map_sent < COLLECTOR_MAP_PERIOD_S):
+            return
+        self._collector_map_sent = now
+        out = OccupancyGrid()
+        out.header = msg.header
+        out.info = msg.info
+        grid = np.array(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
+        s = self._status
+        spots = []
+        if s is not None and s.home_set:
+            spots.append((s.home_x, s.home_y))
+        if (s is not None and s.localised and self._status_time is not None
+                and self._now_s() - self._status_time < ROBOT_POSE_MAX_AGE_S):
+            spots.append((s.x, s.y))
+        clear_discs(grid, (msg.info.origin.position.x, msg.info.origin.position.y),
+                    msg.info.resolution, spots, COLLECTOR_MAP_CLEAR_M)
+        out.data = grid.flatten().tolist()
+        self._collector_map_pub.publish(out)
+
+    def _publish_markers(self):
+        arr = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        for cube in self._registry.cubes.values():
+            key = cube.status
+            if key == 'pending' and not self._registry.confirmed(cube):
+                key = 'unconfirmed'
+            m = Marker()
+            m.header.frame_id = MAP_FRAME
+            m.header.stamp = stamp
+            m.ns = 'fleet_cubes'
+            m.id = cube.id
+            m.type = Marker.CUBE
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = cube.x, cube.y, 0.05
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.12
+            m.color.r, m.color.g, m.color.b = COLOURS[key]
+            m.color.a = 0.9
+            arr.markers.append(m)
+        if arr.markers:
+            self._marker_pub.publish(arr)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FleetManagerNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        try:
+            node.release_leader()   # never leave the leader paused (GiveWay)
+        except Exception:   # noqa: B902 — the context may already be shut down
+            pass
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

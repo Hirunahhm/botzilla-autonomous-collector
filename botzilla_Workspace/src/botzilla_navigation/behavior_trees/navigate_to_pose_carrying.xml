@@ -54,6 +54,11 @@
           <Sequence name="CarryingRecovery">
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            <!-- Wait before the spin: the costmaps were just cleared, and the sensors (and the
+                 other robot, which may be what is in the way) get 2 s to repopulate or move.
+                 Spinning straight away was refused as "Collision Ahead" in cube clusters and
+                 the cube was released (multi_robot_runs.md, run 10). -->
+            <Wait wait_duration="2.0"/>
             <Spin spin_dist="1.57" error_code_id="{spin_error_code}"/>
           </Sequence>
         </ReactiveFallback>

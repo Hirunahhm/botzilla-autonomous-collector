@@ -201,6 +201,11 @@ def _launch_nav2(context, *_args, **_kwargs):
             'use_sim_time': use_sim_time,
             'autostart': autostart,
             'node_names': lifecycle_nodes,
+            # The default 4 s is too short when the Jetson is busy at bring-up:
+            # bt_navigator took 1.4 s to activate and its bond was not up within 4 s,
+            # so the manager aborted the whole Nav2 bring-up (run_logs/20261006-002604).
+            # Only bring-up tolerance; nothing about how the robot drives changes.
+            'bond_timeout': 20.0,
         }],
     ))
     return nodes

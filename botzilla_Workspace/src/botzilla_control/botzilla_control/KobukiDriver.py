@@ -102,7 +102,11 @@ class Kobuki:
 
     def __init__(self):
         Kobuki.__getKobukiPort()
-        __th1 = threading.Thread(target=Kobuki.read_data)
+        # daemon: read_data loops forever, and as a normal thread it kept the interpreter
+        # alive after kobuki_base_node.main() had zeroed the motors and returned, so every
+        # shutdown had to SIGKILL the driver (both robots, every run up to 2026-10-06).
+        # It only reads sensor packets; nothing is lost by stopping it at exit.
+        __th1 = threading.Thread(target=Kobuki.read_data, daemon=True)
         __th1.start()
 
     def play_on_sound(self):
